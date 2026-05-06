@@ -802,6 +802,19 @@ class TaskSupervisor:
 supervisor = TaskSupervisor()
 
 
+CONSOLE_PASSWORD = os.getenv("GROK_REGISTER_CONSOLE_PASSWORD", "")
+
+
+def check_auth(request: Request):
+    if not CONSOLE_PASSWORD:
+        return
+    auth = request.headers.get("Authorization", "")
+    cookie = request.cookies.get("console_password", "")
+    if auth == f"Bearer {CONSOLE_PASSWORD}" or cookie == CONSOLE_PASSWORD:
+        return
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
@@ -816,8 +829,30 @@ app = FastAPI(title="Grok Register Console", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
 
 
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request) -> HTMLResponse:
+    if not CONSOLE_PASSWORD:
+        return HTMLResponse(status_code=302, headers={"Location": "/"})
+    return TEMPLATES.TemplateResponse(request, "login.html", {"request": request})
+
+
+@app.post("/login")
+def login_submit(request: Request):
+    import asyncio
+    body = asyncio.run(request.body())
+    from urllib.parse import parse_qs
+    params = parse_qs(body.decode())
+    password = params.get("password", [""])[0]
+    if password == CONSOLE_PASSWORD:
+        response = HTMLResponse(status_code=302, headers={"Location": "/"})
+        response.set_cookie("console_password", password, httponly=True)
+        return response
+    return HTMLResponse(status_code=401, content="密码错误")
+
+
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> HTMLResponse:
+    check_auth(request)
     return TEMPLATES.TemplateResponse(
         request,
         "index.html",
@@ -831,7 +866,8 @@ def index(request: Request) -> HTMLResponse:
 
 
 @app.get("/api/meta")
-def api_meta() -> dict[str, Any]:
+def api_meta(request: Request) -> dict[str, Any]:
+    check_auth(request)
     return {
         "defaults": merged_defaults(),
         "settings": read_settings(),
