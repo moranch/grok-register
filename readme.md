@@ -55,6 +55,13 @@ docker compose up -d --build
 - `temp_mail_admin_password`: 可留空；如果你要用 DuckMail 私有域名，再填 API Key
 - `temp_mail_domain`: 可留空；留空时执行器会自动挑一个 DuckMail 公开可用域名
 
+TMail 的推荐填法是：
+
+- `temp_mail_api_base`: `https://mail.nnioj.com`
+- `temp_mail_admin_password`: 填你的 API Key（如 `sk_xxx`）
+- `temp_mail_domain`: 留空（TMail 会自动分配域名）
+- `temp_mail_provider`: 填 `tmail`（可选，代码会自动检测）
+
 默认情况下：
 
 - `browser_proxy` 和 `proxy` 已经预设为容器内的 `warp`
