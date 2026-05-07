@@ -336,6 +336,11 @@ body {
 .status-failed,
 .status-stopped { background: #f7d9d3; color: var(--danger); }
 
+.phase-success { color: var(--success); font-weight: 500; }
+.phase-error { color: var(--danger); font-weight: 500; }
+.phase-running { color: #2857b5; font-weight: 500; }
+.phase-pending { color: var(--warn); }
+
 .summary-grid {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));

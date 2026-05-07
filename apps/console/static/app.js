@@ -50,6 +50,15 @@
     return `status-pill status-${status || "unknown"}`;
   }
 
+  function phaseClass(phase) {
+    if (!phase || phase === "-") return "meta-item-value";
+    const p = phase.toLowerCase();
+    if (p.includes("success") || p.includes("pushed")) return "meta-item-value phase-success";
+    if (p.includes("error")) return "meta-item-value phase-error";
+    if (p.includes("running") || p.includes("starting")) return "meta-item-value phase-running";
+    return "meta-item-value phase-pending";
+  }
+
   function healthClass(ok) {
     return ok ? "health-pill health-ok" : "health-pill health-bad";
   }
@@ -142,7 +151,7 @@
     ].map(([label, value]) => `
       <div class="summary-item">
         <div class="meta-item-label">${escapeHtml(label)}</div>
-        <div class="meta-item-value">${escapeHtml(value)}</div>
+        <div class="${label === "当前阶段" ? phaseClass(value) : "meta-item-value"}">${escapeHtml(value)}</div>
       </div>
     `).join("");
 
