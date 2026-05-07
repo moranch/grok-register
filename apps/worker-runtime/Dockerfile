@@ -33,6 +33,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxfixes3 \
     libxrandr2 \
     xdg-utils \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装 Node.js
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 RUN wget -qO- https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor >/usr/share/keyrings/google-linux.gpg && \
@@ -46,5 +53,13 @@ COPY requirements.txt /tmp/requirements.txt
 COPY apps/console/requirements.txt /tmp/console-requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/console-requirements.txt
+
+# 拉取并构建前端
+RUN git clone https://github.com/moranch/grok-register-frontend.git /tmp/frontend \
+    && cd /tmp/frontend \
+    && npm install \
+    && npm run build \
+    && cp dist/index.html /workspace/apps/console/static/index.html \
+    && rm -rf /tmp/frontend /root/.npm
 
 CMD ["bash"]

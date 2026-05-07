@@ -853,6 +853,10 @@ def login_submit(request: Request):
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> HTMLResponse:
     check_auth(request)
+    # 检查是否有新的React前端
+    new_frontend = APP_DIR / "static" / "index.html"
+    if new_frontend.exists():
+        return HTMLResponse(content=new_frontend.read_text(encoding="utf-8"))
     return TEMPLATES.TemplateResponse(
         request,
         "index.html",
