@@ -831,41 +831,56 @@ app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="stati
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request) -> HTMLResponse:
+    # 兼容旧链接：统一重定向到新前端的 /sign-in 路由
+    return HTMLResponse(status_code=302, headers={"Location": "/sign-in"})
+
+
+@app.post("/api/login")
+def api_login(payload: dict):
+    """
+    新前端登录接口。
+    请求体：{"password": "xxx"}
+    成功返回：{"success": true}
+    失败返回：401
+    未启用密码时：直接 success
+    """
     if not CONSOLE_PASSWORD:
-        return HTMLResponse(status_code=302, headers={"Location": "/"})
-    return TEMPLATES.TemplateResponse(request, "login.html", {"request": request})
-
-
-@app.post("/login")
-def login_submit(request: Request):
-    import asyncio
-    body = asyncio.run(request.body())
-    from urllib.parse import parse_qs
-    params = parse_qs(body.decode())
-    password = params.get("password", [""])[0]
+        return {"success": True}
+    password = str(payload.get("password", "")).strip()
     if password == CONSOLE_PASSWORD:
-        response = HTMLResponse(status_code=302, headers={"Location": "/"})
-        response.set_cookie("console_password", password, httponly=True)
-        return response
-    return HTMLResponse(status_code=401, content="密码错误")
+        return {"success": True}
+    raise HTTPException(status_code=401, detail="Invalid password")
+
+
+@app.get("/api/auth/status")
+def api_auth_status(request: Request):
+    """
+    检查当前会话是否已认证。
+    前端用来启动时判断是否需要跳登录页。
+    """
+    if not CONSOLE_PASSWORD:
+        return {"auth_required": False, "authenticated": True}
+    auth = request.headers.get("Authorization", "")
+    cookie = request.cookies.get("console_password", "")
+    authenticated = auth == f"Bearer {CONSOLE_PASSWORD}" or cookie == CONSOLE_PASSWORD
+    return {"auth_required": True, "authenticated": authenticated}
 
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> HTMLResponse:
-    check_auth(request)
-    # 检查是否有新的React前端
+    # 新 React 前端自己处理登录重定向（通过 /api/auth/status 检查）
+    # 所以 "/" 不做 check_auth，直接返回 HTML 骨架
     new_frontend = APP_DIR / "static" / "index.html"
     if new_frontend.exists():
         return HTMLResponse(content=new_frontend.read_text(encoding="utf-8"))
-    return TEMPLATES.TemplateResponse(
-        request,
-        "index.html",
-        {
-            "request": request,
-            "defaults": json.dumps(merged_defaults(), ensure_ascii=False),
-            "max_concurrent_tasks": MAX_CONCURRENT_TASKS,
-            "source_project": str(SOURCE_PROJECT),
-        },
+    # 未找到前端产物（通常说明镜像构建时前端 build 失败），返回明确提示
+    return HTMLResponse(
+        status_code=503,
+        content=(
+            "<h1>前端资源未就绪</h1>"
+            "<p>未在 <code>apps/console/static/index.html</code> 发现前端产物，"
+            "请检查 Dockerfile 中 <code>grok-register-ui</code> 的构建步骤是否成功。</p>"
+        ),
     )
 
 
@@ -973,3 +988,23 @@ if __name__ == "__main__":
     host = os.getenv("GROK_REGISTER_CONSOLE_HOST", "127.0.0.1")
     port = int(os.getenv("GROK_REGISTER_CONSOLE_PORT", "18600"))
     uvicorn.run("app:app", host=host, port=port, reload=False)
+
+
+# ---------- SPA Fallback ----------
+# React 前端使用客户端路由（如 /sign-in、/dashboard、/tasks），
+# 直接访问这些路径时 FastAPI 会找不到路由。
+# 把所有未匹配到的 GET 请求都指向 index.html，让前端路由接管。
+# 注意：这个必须放在所有 /api/* 路由之后定义。
+@app.get("/{full_path:path}", response_class=HTMLResponse)
+def spa_fallback(full_path: str) -> HTMLResponse:
+    new_frontend = APP_DIR / "static" / "index.html"
+    if new_frontend.exists():
+        return HTMLResponse(content=new_frontend.read_text(encoding="utf-8"))
+    return HTMLResponse(
+        status_code=503,
+        content=(
+            "<h1>前端资源未就绪</h1>"
+            "<p>未在 <code>apps/console/static/index.html</code> 发现前端产物，"
+            "请检查 Dockerfile 中 <code>grok-register-ui</code> 的构建步骤是否成功。</p>"
+        ),
+    )
