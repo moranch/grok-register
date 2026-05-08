@@ -55,11 +55,16 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/console-requirements.txt
 
 # 拉取并构建前端
-RUN git clone https://github.com/moranch/grok-register-frontend.git /tmp/frontend \
+# rsbuild 产物结构：dist/index.html + dist/static/js/*.js + dist/static/css/*.css
+# 后端 FastAPI 挂载 /static → apps/console/static/，HTML 里引用 /static/js/... 和 /static/css/...
+# 所以需要把 dist/static/* 扁平化到 apps/console/static/，同时把 index.html 也拷过去
+RUN git clone https://github.com/moranch/grok-register-ui.git /tmp/frontend \
     && cd /tmp/frontend \
-    && npm install \
+    && npm install --legacy-peer-deps \
     && npm run build \
+    && mkdir -p /workspace/apps/console/static \
     && cp dist/index.html /workspace/apps/console/static/index.html \
+    && if [ -d dist/static ]; then cp -r dist/static/. /workspace/apps/console/static/; fi \
     && rm -rf /tmp/frontend /root/.npm
 
 CMD ["bash"]
