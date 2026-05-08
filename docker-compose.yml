@@ -47,6 +47,7 @@ services:
     working_dir: /workspace
     command: python /workspace/apps/console/app.py
     environment:
+      TZ: Asia/Shanghai
       GROK_REGISTER_SOURCE_DIR: /workspace
       GROK_REGISTER_PYTHON: /usr/local/bin/python
       GROK_REGISTER_CONSOLE_HOST: 0.0.0.0
