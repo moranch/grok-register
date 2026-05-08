@@ -58,13 +58,36 @@ RUN pip install --no-cache-dir -r /tmp/console-requirements.txt
 # rsbuild 产物结构：dist/index.html + dist/static/js/*.js + dist/static/css/*.css
 # 后端 FastAPI 挂载 /static → apps/console/static/，HTML 里引用 /static/js/... 和 /static/css/...
 # 所以需要把 dist/static/* 扁平化到 apps/console/static/，同时把 index.html 也拷过去
-RUN git clone https://github.com/moranch/grok-register-ui.git /tmp/frontend \
-    && cd /tmp/frontend \
-    && npm install --legacy-peer-deps \
-    && npm run build \
-    && mkdir -p /workspace/apps/console/static \
-    && cp dist/index.html /workspace/apps/console/static/index.html \
-    && if [ -d dist/static ]; then cp -r dist/static/. /workspace/apps/console/static/; fi \
-    && rm -rf /tmp/frontend /root/.npm
+#
+# 自动探测网络环境选择最快的源：
+#   - GitHub：curl 5 秒内能通则直连，否则走 gh-proxy.com 镜像
+#   - npm：curl 3 秒内能通官方源则用官方源，否则切换到 npmmirror
+RUN set -eux; \
+    echo "===== probe GitHub ====="; \
+    if curl -fsS --max-time 5 -o /dev/null https://github.com/ 2>/dev/null; then \
+      GH_URL="https://github.com/moranch/grok-register-ui.git"; \
+      echo "→ GitHub direct reachable"; \
+    else \
+      GH_URL="https://gh-proxy.com/https://github.com/moranch/grok-register-ui.git"; \
+      echo "→ GitHub unreachable, using gh-proxy.com mirror"; \
+    fi; \
+    echo "===== probe npm ====="; \
+    if curl -fsS --max-time 3 -o /dev/null https://registry.npmjs.org/ 2>/dev/null; then \
+      NPM_REG="https://registry.npmjs.org"; \
+      echo "→ using npm official"; \
+    else \
+      NPM_REG="https://registry.npmmirror.com"; \
+      echo "→ npm official unreachable, using npmmirror"; \
+    fi; \
+    echo "===== building frontend ====="; \
+    git clone --depth 1 "$GH_URL" /tmp/frontend; \
+    cd /tmp/frontend; \
+    npm config set registry "$NPM_REG"; \
+    npm install --legacy-peer-deps --prefer-offline --no-audit --no-fund; \
+    npm run build; \
+    mkdir -p /workspace/apps/console/static; \
+    cp dist/index.html /workspace/apps/console/static/index.html; \
+    if [ -d dist/static ]; then cp -r dist/static/. /workspace/apps/console/static/; fi; \
+    rm -rf /tmp/frontend /root/.npm
 
 CMD ["bash"]
