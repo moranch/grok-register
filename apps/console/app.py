@@ -905,29 +905,34 @@ def api_meta(request: Request) -> dict[str, Any]:
 
 
 @app.get("/api/health")
-def api_health() -> dict[str, Any]:
+def api_health(request: Request) -> dict[str, Any]:
+    check_auth(request)
     return run_health_checks()
 
 
 @app.get("/api/settings")
-def get_settings() -> dict[str, Any]:
+def get_settings(request: Request) -> dict[str, Any]:
+    check_auth(request)
     return {"settings": read_settings(), "defaults": merged_defaults()}
 
 
 @app.post("/api/settings")
-def save_settings(payload: SystemSettings) -> dict[str, Any]:
+def save_settings(request: Request, payload: SystemSettings) -> dict[str, Any]:
+    check_auth(request)
     saved = write_settings(payload)
     return {"settings": saved, "defaults": merged_defaults()}
 
 
 @app.get("/api/tasks")
-def list_tasks() -> dict[str, Any]:
+def list_tasks(request: Request) -> dict[str, Any]:
+    check_auth(request)
     rows = fetch_all("SELECT * FROM tasks ORDER BY id DESC")
     return {"tasks": [serialize_task(row) for row in rows]}
 
 
 @app.post("/api/tasks")
-def create_task(payload: TaskCreate) -> dict[str, Any]:
+def create_task(request: Request, payload: TaskCreate) -> dict[str, Any]:
+    check_auth(request)
     if not SOURCE_PROJECT.exists():
         raise HTTPException(status_code=500, detail=f"Source project not found: {SOURCE_PROJECT}")
     if not SOURCE_VENV_PYTHON.exists():
@@ -962,25 +967,33 @@ def create_task(payload: TaskCreate) -> dict[str, Any]:
 
 
 @app.get("/api/tasks/{task_id}")
-def get_task(task_id: int) -> dict[str, Any]:
+def get_task(request: Request, task_id: int) -> dict[str, Any]:
+    check_auth(request)
     return {"task": serialize_task(task_row(task_id))}
 
 
 @app.get("/api/tasks/{task_id}/logs")
-def get_task_logs(task_id: int, limit: int = Query(200, ge=20, le=1000)) -> dict[str, Any]:
+def get_task_logs(
+    request: Request,
+    task_id: int,
+    limit: int = Query(200, ge=20, le=1000),
+) -> dict[str, Any]:
+    check_auth(request)
     row = task_row(task_id)
     console_path = Path(row["console_path"])
     return {"lines": read_log_lines(console_path, limit=limit)}
 
 
 @app.post("/api/tasks/{task_id}/stop")
-def stop_task(task_id: int) -> dict[str, Any]:
+def stop_task(request: Request, task_id: int) -> dict[str, Any]:
+    check_auth(request)
     supervisor.stop_task(task_id)
     return {"ok": True}
 
 
 @app.delete("/api/tasks/{task_id}")
-def delete_task(task_id: int) -> dict[str, Any]:
+def delete_task(request: Request, task_id: int) -> dict[str, Any]:
+    check_auth(request)
     row = task_row(task_id)
     managed = supervisor._processes.get(task_id)
     if managed and managed.process.poll() is None:
