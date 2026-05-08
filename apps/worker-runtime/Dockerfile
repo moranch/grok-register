@@ -85,9 +85,12 @@ RUN set -eux; \
     npm config set registry "$NPM_REG"; \
     npm install --legacy-peer-deps --prefer-offline --no-audit --no-fund; \
     npm run build; \
-    mkdir -p /workspace/apps/console/static; \
-    cp dist/index.html /workspace/apps/console/static/index.html; \
-    if [ -d dist/static ]; then cp -r dist/static/. /workspace/apps/console/static/; fi; \
+    mkdir -p /opt/webui; \
+    cp dist/index.html /opt/webui/index.html; \
+    if [ -d dist/static ]; then cp -r dist/static/. /opt/webui/; fi; \
     rm -rf /tmp/frontend /root/.npm
+
+# 告诉 app.py 从这个路径读取前端资源（不会被 docker-compose volume 覆盖）
+ENV WEBUI_DIR=/opt/webui
 
 CMD ["bash"]

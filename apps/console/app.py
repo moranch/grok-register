@@ -826,7 +826,15 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Grok Register Console", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
+
+# 前端资源目录：
+# - 优先读取 WEBUI_DIR 环境变量（Dockerfile 中构建时注入，默认 /opt/webui，
+#   这个路径不会被 docker-compose 的 ./:/workspace volume 覆盖）
+# - 如果没有就 fallback 到 apps/console/static（宿主机开发时可手动放前端产物）
+WEBUI_DIR = Path(os.getenv("WEBUI_DIR", "")).expanduser() if os.getenv("WEBUI_DIR") else (APP_DIR / "static")
+if not WEBUI_DIR.exists():
+    WEBUI_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(WEBUI_DIR)), name="static")
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -870,7 +878,7 @@ def api_auth_status(request: Request):
 def index(request: Request) -> HTMLResponse:
     # 新 React 前端自己处理登录重定向（通过 /api/auth/status 检查）
     # 所以 "/" 不做 check_auth，直接返回 HTML 骨架
-    new_frontend = APP_DIR / "static" / "index.html"
+    new_frontend = WEBUI_DIR / "index.html"
     if new_frontend.exists():
         return HTMLResponse(content=new_frontend.read_text(encoding="utf-8"))
     # 未找到前端产物（通常说明镜像构建时前端 build 失败），返回明确提示
@@ -878,7 +886,7 @@ def index(request: Request) -> HTMLResponse:
         status_code=503,
         content=(
             "<h1>前端资源未就绪</h1>"
-            "<p>未在 <code>apps/console/static/index.html</code> 发现前端产物，"
+            f"<p>未在 <code>{WEBUI_DIR}/index.html</code> 发现前端产物，"
             "请检查 Dockerfile 中 <code>grok-register-ui</code> 的构建步骤是否成功。</p>"
         ),
     )
@@ -997,14 +1005,14 @@ if __name__ == "__main__":
 # 注意：这个必须放在所有 /api/* 路由之后定义。
 @app.get("/{full_path:path}", response_class=HTMLResponse)
 def spa_fallback(full_path: str) -> HTMLResponse:
-    new_frontend = APP_DIR / "static" / "index.html"
+    new_frontend = WEBUI_DIR / "index.html"
     if new_frontend.exists():
         return HTMLResponse(content=new_frontend.read_text(encoding="utf-8"))
     return HTMLResponse(
         status_code=503,
         content=(
             "<h1>前端资源未就绪</h1>"
-            "<p>未在 <code>apps/console/static/index.html</code> 发现前端产物，"
+            f"<p>未在 <code>{WEBUI_DIR}/index.html</code> 发现前端产物，"
             "请检查 Dockerfile 中 <code>grok-register-ui</code> 的构建步骤是否成功。</p>"
         ),
     )
