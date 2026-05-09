@@ -62,23 +62,89 @@ class BridgeMailbox(BaseMailbox):
 
         session = self._session()
 
-        if provider_type in ("tmail", "moemail", "duckmail"):
-            # TMail 兼容接口：POST /api/accounts/create
+        if provider_type in ("tmail", "moemail"):
+            # TMail (cloudflare_temp_email): POST /admin/new_address
+            admin_password = provider.get("admin_password", "") or ""
+            domain = provider.get("domain", "") or ""
+            payload = {}
+            if domain:
+                payload["domain"] = domain
+            headers = {}
+            if admin_password:
+                headers["x-admin-password"] = admin_password
+
             resp = session.post(
-                f"{api_base}/api/accounts/create",
-                json={},
+                f"{api_base}/admin/new_address",
+                json=payload,
+                headers=headers,
                 timeout=15,
             )
+            if resp.status_code == 405 or resp.status_code == 404:
+                # 备选路径：有些版本用 /api/generate
+                resp = session.post(
+                    f"{api_base}/api/generate",
+                    json=payload,
+                    headers=headers,
+                    timeout=15,
+                )
             resp.raise_for_status()
             data = resp.json()
-            email = data.get("email") or data.get("data", {}).get("email", "")
-            account_id = str(data.get("id") or data.get("data", {}).get("id", ""))
+            email = (
+                data.get("email")
+                or data.get("data", {}).get("email", "")
+                or data.get("address", "")
+            )
+            account_id = str(
+                data.get("id")
+                or data.get("data", {}).get("id", "")
+                or data.get("jwt", "")
+                or ""
+            )
             if not email:
-                raise RuntimeError(f"邮箱创建返回无 email: {data}")
+                raise RuntimeError(f"TMail 邮箱创建返回无 email: {data}")
             return MailboxAccount(email=email, account_id=account_id, extra={
                 "provider_id": provider["id"],
                 "api_base": api_base,
                 "provider_type": provider_type,
+                "admin_password": admin_password,
+            })
+
+        elif provider_type == "duckmail":
+            # DuckMail: POST /accounts
+            site_password = provider.get("site_password", "") or ""
+            domain = provider.get("domain", "") or ""
+            if not domain:
+                # 先拉 domains
+                dr = session.get(f"{api_base}/domains", timeout=10)
+                dr.raise_for_status()
+                domains = dr.json()
+                if isinstance(domains, list) and domains:
+                    domain = domains[0] if isinstance(domains[0], str) else domains[0].get("domain", "")
+
+            import random, string
+            username = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+            password = "".join(random.choices(string.ascii_letters + string.digits, k=12))
+            payload = {"address": f"{username}@{domain}", "password": password}
+            headers = {}
+            if site_password:
+                headers["x-site-password"] = site_password
+
+            resp = session.post(
+                f"{api_base}/accounts",
+                json=payload,
+                headers=headers,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            email = data.get("address", "") or f"{username}@{domain}"
+            token = data.get("token", "") or ""
+            return MailboxAccount(email=email, account_id=token, extra={
+                "provider_id": provider["id"],
+                "api_base": api_base,
+                "provider_type": provider_type,
+                "token": token,
+                "password": password,
             })
         else:
             raise RuntimeError(
