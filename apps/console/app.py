@@ -172,7 +172,8 @@ def load_source_defaults() -> dict[str, Any]:
     }
     for key, env_name in env_map.items():
         value = os.getenv(env_name)
-        if value is not None:
+        # 只要未设置或显式空字符串，都不覆盖配置文件里的默认值
+        if value:
             base[key] = value
 
     api_base = dict(base.get("api") or {})
@@ -182,7 +183,7 @@ def load_source_defaults() -> dict[str, Any]:
     }
     for key, env_name in api_env_map.items():
         value = os.getenv(env_name)
-        if value is not None:
+        if value:
             api_base[key] = value
     append_env = os.getenv("GROK_REGISTER_DEFAULT_API_APPEND")
     if append_env is not None:
@@ -857,7 +858,34 @@ def api_login(payload: dict):
     password = str(payload.get("password", "")).strip()
     if password == CONSOLE_PASSWORD:
         return {"success": True}
+    # 调试信息（不会暴露真实密码，只帮助定位问题）
+    import logging
+    logging.getLogger("uvicorn").warning(
+        "[api_login] password mismatch: input_len=%d, expected_len=%d, "
+        "input_first_char=%r, expected_first_char=%r",
+        len(password),
+        len(CONSOLE_PASSWORD),
+        password[:1] if password else "",
+        CONSOLE_PASSWORD[:1] if CONSOLE_PASSWORD else "",
+    )
     raise HTTPException(status_code=401, detail="Invalid password")
+
+
+@app.get("/api/auth/debug")
+def api_auth_debug(request: Request):
+    """
+    临时调试接口：返回后端实际使用的密码长度和首尾字符，
+    帮助定位"密码不对"问题。不暴露真实密码明文。
+    上线后应移除此接口。
+    """
+    pw = CONSOLE_PASSWORD or ""
+    return {
+        "password_configured": bool(pw),
+        "password_length": len(pw),
+        "password_first_char": pw[:1] if pw else None,
+        "password_last_char": pw[-1:] if pw else None,
+        "env_var_name": "GROK_REGISTER_CONSOLE_PASSWORD",
+    }
 
 
 @app.get("/api/auth/status")
