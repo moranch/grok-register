@@ -377,17 +377,41 @@ class TaskSupervisor:
                     from core._vendor_aar.base_platform import RegisterConfig
                     proxy_url = task_config.get("proxy", "") or task_config.get("browser_proxy", "")
 
-                    # 确定执行器类型：优先 protocol，如果 vendor 不支持则用 headless
-                    executor_type = "protocol"
+                    # 确定执行器类型：
+                    #   1. 读用户在前端选择的（tasks.executor_type 列 或 config_json.executor）
+                    #   2. 回退到 protocol（协议模式，适合大多数有 API 的平台）
+                    #   3. 最后用 vendor 支持列表的第一个
                     vendor_supported = getattr(vendor_cls, "supported_executors", []) or []
-                    if vendor_supported and executor_type not in vendor_supported:
-                        executor_type = "headless" if "headless" in vendor_supported else (vendor_supported[0] if vendor_supported else "headless")
+
+                    _row_keys_inner = set(row.keys())
+                    user_exec = (
+                        (row["executor_type"] if "executor_type" in _row_keys_inner else "")
+                        or task_config.get("executor", "")
+                        or task_config.get("executor_type", "")
+                    )
+                    user_exec = str(user_exec or "").strip().lower()
+
+                    if user_exec and (not vendor_supported or user_exec in vendor_supported):
+                        executor_type = user_exec
+                    elif "protocol" in vendor_supported or not vendor_supported:
+                        executor_type = "protocol"
+                    else:
+                        executor_type = "headless" if "headless" in vendor_supported else vendor_supported[0]
 
                     config = RegisterConfig(
                         proxy=proxy_url,
                         executor_type=executor_type,
                         extra={},
                     )
+                    # 让用户在 console.log 里看到实际生效的 executor
+                    try:
+                        with console_path.open("a", encoding="utf-8") as _flog:
+                            _flog.write(
+                                f"[{now_iso()}] 使用执行器: {executor_type} "
+                                f"(vendor 支持: {vendor_supported or '<unknown>'})\n"
+                            )
+                    except Exception:
+                        pass
                     # 注入我们的邮箱桥接
                     from platforms._shared.mailbox_bridge import BridgeMailbox
                     mailbox = BridgeMailbox(proxy=proxy_url, stop_event=stop_event)
