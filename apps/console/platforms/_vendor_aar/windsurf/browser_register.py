@@ -436,7 +436,7 @@ def _handle_turnstile(
     return True
 
 
-def _headers(*, content_type: str, referer: str, account_id: str = "", org_id: str = "") -> dict[str, str]:
+def _headers(*, content_type: str, referer: str, account_id: str = "", org_id: str = "", auth1_token: str = "") -> dict[str, str]:
     headers = {
         "accept": "*/*",
         "content-type": content_type,
@@ -452,6 +452,9 @@ def _headers(*, content_type: str, referer: str, account_id: str = "", org_id: s
         headers["x-devin-account-id"] = account_id
     if org_id:
         headers["x-devin-primary-org-id"] = org_id
+    if auth1_token:
+        # WindsurfPostAuth 需要这个 header 来用 email/complete 返回的 token 换 session_token
+        headers["x-devin-auth1-token"] = auth1_token
     return headers
 
 
@@ -481,6 +484,7 @@ class WindsurfBrowserApi:
         account_id: str = "",
         org_id: str = "",
         referer: str = "/profile",
+        auth1_token: str = "",
     ) -> bytes:
         response = self.page.request.post(
             f"{WINDSURF_BASE}{SEAT_SERVICE}/{method}",
@@ -489,6 +493,7 @@ class WindsurfBrowserApi:
                 referer=referer,
                 account_id=account_id,
                 org_id=org_id,
+                auth1_token=auth1_token,
             ),
             data=body,
         )
@@ -531,7 +536,12 @@ class WindsurfBrowserApi:
 
     def post_auth(self, auth_token: str) -> dict[str, str]:
         self.log("Step3: 兑换 Windsurf session")
-        content = self._proto_post("WindsurfPostAuth", _field_string(1, auth_token), referer="/account/register")
+        content = self._proto_post(
+            "WindsurfPostAuth",
+            _field_string(1, auth_token),
+            referer="/account/register",
+            auth1_token=auth_token,
+        )
         data = parse_post_auth_response(content)
         if not data.get("session_token"):
             raise RuntimeError("Windsurf 未返回 session_token")
