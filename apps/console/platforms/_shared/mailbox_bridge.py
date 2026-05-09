@@ -60,8 +60,11 @@ class BridgeMailbox(BaseMailbox):
 
         session = self._session()
 
-        if provider_type in ("tmail", "moemail"):
-            # TMail (cloudflare_temp_email): GET /api/generate?ttl=3600
+        if provider_type in ("tmail", "moemail", "freemail"):
+            # Freemail (github.com/idinging/freemail) 自建 CF Worker 邮箱：
+            #   GET /api/generate → 生成邮箱
+            #   GET /api/emails?mailbox=<email>&limit=20 → 拉邮件列表
+            # 认证：Authorization: Bearer <admin_token>  或  POST /api/login {username,password}
             admin_password = provider.get("admin_password", "") or ""
             headers = {}
             if admin_password:
@@ -69,18 +72,17 @@ class BridgeMailbox(BaseMailbox):
 
             resp = session.get(
                 f"{api_base}/api/generate",
-                params={"ttl": 3600},
                 headers=headers,
                 timeout=20,
             )
             if resp.status_code != 200:
                 raise RuntimeError(
-                    f"TMail 邮箱创建失败: {resp.status_code} - {resp.text[:200]}"
+                    f"Freemail 邮箱创建失败: {resp.status_code} - {resp.text[:200]}"
                 )
             data = resp.json()
             email = data.get("email", "")
             if not email:
-                raise RuntimeError(f"TMail 创建邮箱未返回 email: {data}")
+                raise RuntimeError(f"Freemail 创建邮箱未返回 email: {data}")
             return MailboxAccount(email=email, account_id=admin_password, extra={
                 "provider_id": provider["id"],
                 "api_base": api_base,
@@ -132,20 +134,26 @@ class BridgeMailbox(BaseMailbox):
             )
 
     def get_current_ids(self, account: MailboxAccount) -> Set:
-        """获取当前邮件 ID 列表。"""
+        """获取当前邮件 ID 列表（Freemail /api/emails?mailbox=X&limit=50）。"""
         extra = account.extra or {}
         api_base = extra.get("api_base", "")
         if not api_base:
             return set()
         session = self._session()
+        admin_pw = extra.get("admin_password", "")
+        headers = {}
+        if admin_pw:
+            headers["Authorization"] = f"Bearer {admin_pw}"
         try:
             resp = session.get(
-                f"{api_base}/api/emails?address={account.email}",
+                f"{api_base}/api/emails",
+                params={"mailbox": account.email, "limit": 50},
+                headers=headers,
                 timeout=10,
             )
             resp.raise_for_status()
             items = resp.json() if isinstance(resp.json(), list) else resp.json().get("data", [])
-            return {str(item.get("id", "")) for item in items}
+            return {str(item.get("id", "")) for item in items if item.get("id")}
         except Exception:
             return set()
 
@@ -157,7 +165,11 @@ class BridgeMailbox(BaseMailbox):
         before_ids: Set = None,
         code_pattern: str = None,
     ) -> str:
-        """轮询邮件，提取验证码。"""
+        """轮询 Freemail /api/emails 拉邮件，提取验证码。
+
+        Freemail 接口的消息对象有 'verification_code' 字段（服务器侧已提取），
+        没有则从 preview + subject 正则提 6 位数字。
+        """
         import re
 
         extra = account.extra or {}
@@ -165,42 +177,49 @@ class BridgeMailbox(BaseMailbox):
         if not api_base:
             raise RuntimeError("邮箱 account 缺少 api_base")
 
-        pattern = re.compile(code_pattern or r"\b(\d{6})\b")
-        before_ids = before_ids or set()
+        pattern = re.compile(code_pattern or r"(?<!\d)(\d{6})(?!\d)")
+        seen = set(before_ids or [])
         session = self._session()
+        admin_pw = extra.get("admin_password", "")
+        headers = {}
+        if admin_pw:
+            headers["Authorization"] = f"Bearer {admin_pw}"
         deadline = time.time() + timeout
 
         while time.time() < deadline:
             try:
-                headers = {}
-                admin_pw = extra.get("admin_password", "")
-                if admin_pw:
-                    headers["Authorization"] = f"Bearer {admin_pw}"
-
                 resp = session.get(
-                    f"{api_base}/api/fetch",
-                    params={"email": account.email},
+                    f"{api_base}/api/emails",
+                    params={"mailbox": account.email, "limit": 20},
                     headers=headers,
                     timeout=10,
                 )
                 if resp.status_code == 200:
                     raw = resp.json()
                     items = raw if isinstance(raw, list) else raw.get("data", [])
-
                     for item in items:
                         mail_id = str(item.get("id", ""))
-                        if mail_id in before_ids:
+                        if not mail_id or mail_id in seen:
                             continue
-                        subject = item.get("subject", "")
-                        body = item.get("text", "") or item.get("body", "") or ""
-                        content = f"{subject} {body}"
-                        if keyword and keyword.lower() not in content.lower():
+                        seen.add(mail_id)
+                        subject = str(item.get("subject", ""))
+                        if keyword and keyword.lower() not in (
+                            subject + " " + str(item.get("preview", ""))
+                        ).lower():
                             continue
-                        m = pattern.search(content)
+                        # 优先使用 Freemail 服务器端已提取的 verification_code
+                        code = str(item.get("verification_code") or "").strip()
+                        if code and code.lower() != "none" and pattern.fullmatch(code):
+                            return code
+                        # 兜底：preview / subject / body / text 里正则抓
+                        text = " ".join(
+                            str(item.get(k, "")) for k in ("preview", "subject", "text", "body", "html")
+                        )
+                        m = pattern.search(text)
                         if m:
-                            return m.group(1)
+                            return m.group(1) if m.groups() else m.group(0)
             except Exception as e:
-                logger.debug(f"轮询邮件失败: {e}")
+                logger.debug(f"轮询 Freemail 邮件失败: {e}")
 
             time.sleep(3)
 
