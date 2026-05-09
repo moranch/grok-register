@@ -11,7 +11,7 @@ sqlmodel==0.0.22
 
 # HTTP 客户端（协议模式注册 + Exporter 推送）
 httpx==0.28.1
-curl_cffi==0.7.4
+curl_cffi>=0.15.0
 
 # 模板引擎（Any2API Exporter）
 jinja2==3.1.5
