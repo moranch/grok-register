@@ -35,6 +35,7 @@ class PlatformSummary(BaseModel):
     version: str
     supported_executors: List[str]
     engine_count: int
+    enabled: bool
 
 
 class PlatformConfigUpdate(BaseModel):
@@ -42,10 +43,30 @@ class PlatformConfigUpdate(BaseModel):
     config: Dict[str, Any]
 
 
+class PlatformEnabledUpdate(BaseModel):
+    """平台启用/禁用请求。"""
+    enabled: bool
+
+
 class TestRunRequest(BaseModel):
     """试跑请求。"""
     executor_type: str = "protocol"
     engine_id: str = "default"
+
+
+# ─── 辅助 ─────────────────────────────────────────────────────────────────────
+
+
+def _is_platform_enabled(name: str) -> bool:
+    """读取 settings 中平台启用状态；未设置视为启用（只要被 registry 发现就默认打开）。"""
+    raw = dao.get_all_settings().get(f"platform_{name}_enabled")
+    if raw is None:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(raw)
 
 
 # ─── 路由 ─────────────────────────────────────────────────────────────────────
@@ -63,6 +84,7 @@ async def list_platforms():
             version=instance.version,
             supported_executors=list(instance.supported_executors),
             engine_count=len(instance.get_register_engines()),
+            enabled=_is_platform_enabled(instance.name),
         ))
     return results
 
@@ -86,7 +108,18 @@ async def get_platform(name: str):
         platform_config = {}
 
     detail["config"] = platform_config
+    detail["enabled"] = _is_platform_enabled(name)
     return detail
+
+
+@router.patch("/{name}/enabled")
+async def update_platform_enabled(name: str, body: PlatformEnabledUpdate):
+    """启用或禁用平台。禁用的平台仍在 registry 中，但不会出现在任务创建的可选项里。"""
+    cls = PLATFORM_REGISTRY.get(name)
+    if cls is None:
+        raise HTTPException(status_code=404, detail=f"平台 '{name}' 未找到")
+    dao.upsert_setting(f"platform_{name}_enabled", "true" if body.enabled else "false")
+    return {"ok": True, "platform": name, "enabled": body.enabled}
 
 
 @router.patch("/{name}/config")
