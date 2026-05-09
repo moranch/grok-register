@@ -34,13 +34,13 @@ async def lifespan(_: FastAPI):
     """应用生命周期：启动阶段按顺序初始化，关闭阶段逆序清理。"""
     # 1. 数据库建表 + 种子数据
     init_db()
-    # 同时确保 vendor 的 SQLModel 表也存在（vendor 代码内部会查这些表）
+    # 同时确保 vendor 的 SQLModel 表存在，并 seed 内置 provider definitions
+    # （captcha / mailbox / proxy 的驱动清单都在 vendor 的 _BUILTIN_DEFINITIONS 里）
     try:
-        from core._vendor_aar.db import engine as _vendor_engine
-        from sqlmodel import SQLModel as _SQLModel
-        _SQLModel.metadata.create_all(_vendor_engine)
-    except Exception:
-        pass
+        from core._vendor_aar.db import init_db as _vendor_init_db
+        _vendor_init_db()
+    except Exception as exc:
+        print(f"[WARN] vendor init_db 失败（provider_definitions 可能未 seed）: {exc}")
     try:
         seed_mailbox_from_defaults(force=False)
     except Exception:

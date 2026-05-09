@@ -5,6 +5,7 @@ sso/
 chrome_data/
 apps/console/runtime/
 apps/console/.venv/
+apps/console/core/account_manager.db
 runtime/
 config.json
 config.json.bak-*
