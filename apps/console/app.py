@@ -173,6 +173,24 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 UNIQUE(email, sso)
             );
+
+            -- 邮箱 Provider 池：支持配置多套临时邮箱接口，按成功率加权挑一个给任务用
+            -- provider_type: tmail / duckmail / moemail / custom
+            CREATE TABLE IF NOT EXISTS mailbox_providers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                provider_type TEXT NOT NULL DEFAULT 'tmail',
+                api_base TEXT NOT NULL,
+                admin_password TEXT NOT NULL DEFAULT '',
+                domain TEXT NOT NULL DEFAULT '',
+                site_password TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                last_used_at TEXT,
+                created_at TEXT NOT NULL
+            );
             """
         )
 
@@ -550,6 +568,29 @@ class ProxyUpdate(BaseModel):
     reset_stats: bool | None = None
 
 
+# ---- 邮箱 Provider 池 ----
+
+class MailboxItem(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    provider_type: str = Field("tmail", pattern="^(tmail|duckmail|moemail|custom)$")
+    api_base: str = Field(..., min_length=1)
+    admin_password: str = ""
+    domain: str = ""
+    site_password: str = ""
+    enabled: bool = True
+
+
+class MailboxUpdate(BaseModel):
+    name: str | None = None
+    provider_type: str | None = Field(None, pattern="^(tmail|duckmail|moemail|custom)$")
+    api_base: str | None = None
+    admin_password: str | None = None
+    domain: str | None = None
+    site_password: str | None = None
+    enabled: bool | None = None
+    reset_stats: bool | None = None
+
+
 @dataclass
 class ManagedProcess:
     task_id: int
@@ -899,6 +940,158 @@ def proxy_report_failure(url: str) -> None:
     )
 
 
+# --------- 邮箱 Provider 池 ----------
+
+def _mailbox_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    total = int(row["success_count"]) + int(row["failure_count"])
+    success_rate = (int(row["success_count"]) / total * 100.0) if total else 0.0
+    return {
+        "id": int(row["id"]),
+        "name": row["name"],
+        "provider_type": row["provider_type"],
+        "api_base": row["api_base"],
+        "admin_password": row["admin_password"] or "",
+        "domain": row["domain"] or "",
+        "site_password": row["site_password"] or "",
+        "enabled": bool(row["enabled"]),
+        "success_count": int(row["success_count"]),
+        "failure_count": int(row["failure_count"]),
+        "consecutive_failures": int(row["consecutive_failures"]),
+        "success_rate": round(success_rate, 2),
+        "last_used_at": row["last_used_at"] or "",
+        "created_at": row["created_at"],
+    }
+
+
+def mailbox_list() -> list[dict[str, Any]]:
+    rows = fetch_all("SELECT * FROM mailbox_providers ORDER BY id ASC")
+    return [_mailbox_from_row(r) for r in rows]
+
+
+def mailbox_add(payload: MailboxItem) -> dict[str, Any]:
+    execute(
+        """
+        INSERT INTO mailbox_providers
+            (name, provider_type, api_base, admin_password, domain, site_password, enabled, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload.name.strip(),
+            payload.provider_type,
+            payload.api_base.strip(),
+            payload.admin_password,
+            payload.domain.strip(),
+            payload.site_password,
+            1 if payload.enabled else 0,
+            now_iso(),
+        ),
+    )
+    row = fetch_one(
+        "SELECT * FROM mailbox_providers ORDER BY id DESC LIMIT 1"
+    )
+    assert row is not None
+    return _mailbox_from_row(row)
+
+
+def mailbox_update(mbox_id: int, payload: MailboxUpdate) -> dict[str, Any]:
+    row = fetch_one("SELECT * FROM mailbox_providers WHERE id = ?", (mbox_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="mailbox provider not found")
+    new_name = row["name"] if payload.name is None else payload.name.strip()
+    new_type = row["provider_type"] if payload.provider_type is None else payload.provider_type
+    new_api = row["api_base"] if payload.api_base is None else payload.api_base.strip()
+    new_admin = row["admin_password"] if payload.admin_password is None else payload.admin_password
+    new_domain = row["domain"] if payload.domain is None else payload.domain.strip()
+    new_site = row["site_password"] if payload.site_password is None else payload.site_password
+    new_enabled = int(row["enabled"]) if payload.enabled is None else (1 if payload.enabled else 0)
+    if payload.reset_stats:
+        execute_no_return(
+            """
+            UPDATE mailbox_providers
+            SET name = ?, provider_type = ?, api_base = ?, admin_password = ?,
+                domain = ?, site_password = ?, enabled = ?,
+                success_count = 0, failure_count = 0, consecutive_failures = 0
+            WHERE id = ?
+            """,
+            (new_name, new_type, new_api, new_admin, new_domain, new_site, new_enabled, mbox_id),
+        )
+    else:
+        execute_no_return(
+            """
+            UPDATE mailbox_providers
+            SET name = ?, provider_type = ?, api_base = ?, admin_password = ?,
+                domain = ?, site_password = ?, enabled = ?
+            WHERE id = ?
+            """,
+            (new_name, new_type, new_api, new_admin, new_domain, new_site, new_enabled, mbox_id),
+        )
+    row = fetch_one("SELECT * FROM mailbox_providers WHERE id = ?", (mbox_id,))
+    assert row is not None
+    return _mailbox_from_row(row)
+
+
+def mailbox_delete(mbox_id: int) -> None:
+    execute_no_return("DELETE FROM mailbox_providers WHERE id = ?", (mbox_id,))
+
+
+def mailbox_pick_best() -> dict[str, Any] | None:
+    """按成功率加权从启用的邮箱 provider 里挑一个；连续失败 >=5 自动禁用"""
+    rows = fetch_all("SELECT * FROM mailbox_providers WHERE enabled = 1")
+    if not rows:
+        return None
+    alive = []
+    for r in rows:
+        if int(r["consecutive_failures"]) >= 5:
+            execute_no_return(
+                "UPDATE mailbox_providers SET enabled = 0 WHERE id = ?",
+                (int(r["id"]),),
+            )
+            continue
+        alive.append(r)
+    if not alive:
+        return None
+    import random as _random
+    weights = []
+    for r in alive:
+        s = int(r["success_count"])
+        f = int(r["failure_count"])
+        weights.append((s + 1) / (s + f + 2))
+    chosen = _random.choices(alive, weights=weights, k=1)[0]
+    execute_no_return(
+        "UPDATE mailbox_providers SET last_used_at = ? WHERE id = ?",
+        (now_iso(), int(chosen["id"])),
+    )
+    return _mailbox_from_row(chosen)
+
+
+def mailbox_report_success(mbox_id: int) -> None:
+    if not mbox_id:
+        return
+    execute_no_return(
+        """
+        UPDATE mailbox_providers
+        SET success_count = success_count + 1, consecutive_failures = 0, last_used_at = ?
+        WHERE id = ?
+        """,
+        (now_iso(), mbox_id),
+    )
+
+
+def mailbox_report_failure(mbox_id: int) -> None:
+    if not mbox_id:
+        return
+    execute_no_return(
+        """
+        UPDATE mailbox_providers
+        SET failure_count = failure_count + 1,
+            consecutive_failures = consecutive_failures + 1,
+            last_used_at = ?
+        WHERE id = ?
+        """,
+        (now_iso(), mbox_id),
+    )
+
+
 # --------- 注册事件 / 账号 ----------
 
 def classify_error(message: str) -> str:
@@ -1163,6 +1356,8 @@ class TaskSupervisor:
         self._processes: dict[int, ManagedProcess] = {}
         # 记录每个 task 本轮使用的代理 URL（来自代理池或 config.json 默认代理）
         self._task_proxy: dict[int, str] = {}
+        # 记录每个 task 本轮挑中的邮箱 provider id（来自邮箱池）
+        self._task_mailbox: dict[int, int] = {}
         # 记录每个 task console.log 已扫到的行号，用于增量抽取 register_events
         self._task_log_cursor: dict[int, int] = {}
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -1235,6 +1430,18 @@ class TaskSupervisor:
             task_config["proxy"] = picked_proxy_url
             task_config["browser_proxy"] = picked_proxy_url
 
+        # 邮箱 Provider 池：同上，覆盖 config 里的 temp_mail_* 字段
+        pool_mailbox = mailbox_pick_best()
+        picked_mailbox_id = 0
+        if pool_mailbox:
+            picked_mailbox_id = int(pool_mailbox["id"])
+            task_config["temp_mail_api_base"] = pool_mailbox["api_base"]
+            task_config["temp_mail_admin_password"] = pool_mailbox["admin_password"]
+            task_config["temp_mail_domain"] = pool_mailbox["domain"]
+            task_config["temp_mail_site_password"] = pool_mailbox["site_password"]
+            # 写入 temp_mail_provider 给 email_register.py 用（如果它识别该字段）
+            task_config["temp_mail_provider"] = pool_mailbox["provider_type"]
+
         copy_source_to_task_dir(task_dir, task_config)
 
         output_path = task_dir / "sso" / f"task_{task_id}.txt"
@@ -1268,6 +1475,9 @@ class TaskSupervisor:
             fallback_proxy = str(task_config.get("browser_proxy") or task_config.get("proxy") or "")
             if fallback_proxy:
                 self._task_proxy[task_id] = fallback_proxy
+        # 记录本轮挑中的邮箱 provider id（任务结束时根据 success/failure 反馈）
+        if picked_mailbox_id:
+            self._task_mailbox[task_id] = picked_mailbox_id
         process = subprocess.Popen(
             command,
             cwd=task_dir,
@@ -1359,8 +1569,18 @@ class TaskSupervisor:
             managed = self._processes.pop(task_id, None)
             if managed and managed.log_handle:
                 managed.log_handle.close()
-            # 清理本次任务的代理/日志游标缓存
+            # 给邮箱 Provider 反馈本次任务的成功/失败（基于整体结果）
+            mbox_id = self._task_mailbox.get(task_id, 0)
+            if mbox_id:
+                finished_row = task_row(task_id)
+                final = finished_row["status"]
+                if final in {STATUS_COMPLETED, STATUS_PARTIAL} and int(finished_row["completed_count"]) > 0:
+                    mailbox_report_success(mbox_id)
+                elif final in {STATUS_FAILED} and int(finished_row["completed_count"]) == 0:
+                    mailbox_report_failure(mbox_id)
+            # 清理本次任务的代理/邮箱/日志游标缓存
             self._task_proxy.pop(task_id, None)
+            self._task_mailbox.pop(task_id, None)
             self._task_log_cursor.pop(task_id, None)
 
 
@@ -1625,6 +1845,61 @@ def api_delete_proxy(request: Request, proxy_id: int) -> dict[str, Any]:
     check_auth(request)
     proxy_delete(proxy_id)
     return {"ok": True}
+
+
+# ================================================================
+# 邮箱 Provider 池 API
+# ================================================================
+
+@app.get("/api/mailboxes")
+def api_list_mailboxes(request: Request) -> dict[str, Any]:
+    check_auth(request)
+    return {"mailboxes": mailbox_list()}
+
+
+@app.post("/api/mailboxes")
+def api_add_mailbox(request: Request, payload: MailboxItem) -> dict[str, Any]:
+    check_auth(request)
+    return {"mailbox": mailbox_add(payload)}
+
+
+@app.patch("/api/mailboxes/{mbox_id}")
+def api_update_mailbox(
+    request: Request, mbox_id: int, payload: MailboxUpdate
+) -> dict[str, Any]:
+    check_auth(request)
+    return {"mailbox": mailbox_update(mbox_id, payload)}
+
+
+@app.delete("/api/mailboxes/{mbox_id}")
+def api_delete_mailbox(request: Request, mbox_id: int) -> dict[str, Any]:
+    check_auth(request)
+    mailbox_delete(mbox_id)
+    return {"ok": True}
+
+
+@app.post("/api/mailboxes/{mbox_id}/test")
+def api_test_mailbox(request: Request, mbox_id: int) -> dict[str, Any]:
+    """对单个邮箱 Provider 做一次可达性检测（访问 api_base）"""
+    check_auth(request)
+    row = fetch_one("SELECT * FROM mailbox_providers WHERE id = ?", (mbox_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="mailbox provider not found")
+    target = (row["api_base"] or "").strip()
+    if not target:
+        return {"ok": False, "message": "api_base 未配置"}
+    try:
+        # 大多数临时邮箱 API 直接访问 base 会返回 200/401/404 之类
+        response = _request_with_optional_proxy(target, timeout=15)
+        ok = response.status_code < 500
+        return {
+            "ok": ok,
+            "status_code": response.status_code,
+            "message": f"HTTP {response.status_code}",
+            "checked_at": now_iso(),
+        }
+    except Exception as exc:
+        return {"ok": False, "message": str(exc), "checked_at": now_iso()}
 
 
 # ================================================================
