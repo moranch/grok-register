@@ -118,28 +118,15 @@ class TaskSupervisor:
     def _start_task(self, row: sqlite3.Row) -> None:
         task_id = int(row["id"])
 
-        # 多平台分派：仅 grok 有落地执行路径；其它平台先置 FAILED 并给出明确信息。
-        # 这是第一阶段的安全网，避免 kiro 等未完成的插件任务被 grok 脚本吃掉。
+        # 多平台分派
         _row_keys = set(row.keys())
         platform_name = (
             str(row["platform"]) if "platform" in _row_keys else "grok"
         ).strip().lower() or "grok"
+
         if platform_name != "grok":
-            execute_no_return(
-                """
-                UPDATE tasks
-                SET status = ?, finished_at = ?, last_error = ?, current_phase = ?
-                WHERE id = ?
-                """,
-                (
-                    STATUS_FAILED,
-                    now_iso(),
-                    f"平台 '{platform_name}' 的注册执行尚未接入 supervisor，"
-                    f"当前 supervisor 仅支持 grok；spec task 6.2 / 7 未完成。",
-                    "not_dispatched",
-                    task_id,
-                ),
-            )
+            # 非 grok 平台：在线程池里调 vendor register()
+            self._start_vendor_task(task_id, row, platform_name)
             return
 
         task_dir = Path(row["task_dir"])
@@ -295,6 +282,150 @@ class TaskSupervisor:
             self._task_proxy.pop(task_id, None)
             self._task_mailbox.pop(task_id, None)
             self._task_log_cursor.pop(task_id, None)
+
+    # ── 多平台 vendor dispatch ────────────────────────────────────────
+
+    def _start_vendor_task(self, task_id: int, row: sqlite3.Row, platform_name: str) -> None:
+        """
+        非 grok 平台：在后台线程里调用 vendor 的 register() 方法。
+        每轮注册一个账号，循环 target_count 次。
+        成功的账号入库 accounts 表；失败记录到 last_error。
+        """
+        import threading as _threading
+
+        target_count = int(row["target_count"])
+        task_config = json.loads(row["config_json"])
+        task_dir = Path(row["task_dir"])
+        console_path = Path(row["console_path"])
+        task_dir.mkdir(parents=True, exist_ok=True)
+
+        # 读 engine_id / params
+        _row_keys = set(row.keys())
+        params_raw = row["params_json"] if "params_json" in _row_keys else "{}"
+        try:
+            params = json.loads(params_raw or "{}")
+        except Exception:
+            params = {}
+        engine_id = (row["engine_id"] if "engine_id" in _row_keys else "") or params.get("engine_id", "")
+
+        # 标记 running
+        execute_no_return(
+            "UPDATE tasks SET status = ?, started_at = ?, current_phase = ? WHERE id = ?",
+            (STATUS_RUNNING, now_iso(), "vendor_dispatch", task_id),
+        )
+
+        def _run():
+            completed = 0
+            failed = 0
+            last_error = ""
+            last_email = ""
+
+            try:
+                from core.registry import PLATFORM_REGISTRY
+                cls = PLATFORM_REGISTRY.get(platform_name)
+                if cls is None:
+                    raise RuntimeError(f"平台 '{platform_name}' 未在 registry 中找到")
+
+                instance = cls()
+
+                # 配置代理
+                proxy_url = task_config.get("proxy", "") or task_config.get("browser_proxy", "")
+                if hasattr(instance, "config") and instance.config is not None:
+                    if hasattr(instance.config, "proxy"):
+                        instance.config.proxy = proxy_url
+
+                for round_no in range(1, target_count + 1):
+                    execute_no_return(
+                        "UPDATE tasks SET current_round = ?, current_phase = ?, last_log_at = ? WHERE id = ?",
+                        (round_no, "registering", now_iso(), task_id),
+                    )
+
+                    # 写日志到 console_path
+                    with console_path.open("a", encoding="utf-8") as log:
+                        log.write(f"[{now_iso()}] 开始第 {round_no} 轮注册 (platform={platform_name}, engine={engine_id})\n")
+
+                    try:
+                        account = instance.register(email=None, password=None)
+                        completed += 1
+                        email = getattr(account, "email", "") or ""
+                        token = getattr(account, "token", "") or ""
+                        last_email = email
+
+                        # 入库 accounts
+                        from ._shared import execute as _execute
+                        _execute(
+                            """
+                            INSERT OR IGNORE INTO accounts
+                                (email, sso, password, task_id, proxy_url, status, platform, created_at)
+                            VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+                            """,
+                            (
+                                email,
+                                token,
+                                getattr(account, "password", ""),
+                                task_id,
+                                proxy_url,
+                                platform_name,
+                                now_iso(),
+                            ),
+                        )
+
+                        with console_path.open("a", encoding="utf-8") as log:
+                            log.write(f"[{now_iso()}] 注册成功 | email={email}\n")
+
+                    except NotImplementedError as e:
+                        failed += 1
+                        last_error = f"NotImplementedError: {e}"
+                        with console_path.open("a", encoding="utf-8") as log:
+                            log.write(f"[{now_iso()}] [Error] 第 {round_no} 轮失败: {last_error}\n")
+                        # NotImplementedError 说明 vendor 没实现，不用继续
+                        break
+
+                    except Exception as e:
+                        failed += 1
+                        last_error = f"{type(e).__name__}: {e}"
+                        with console_path.open("a", encoding="utf-8") as log:
+                            log.write(f"[{now_iso()}] [Error] 第 {round_no} 轮失败: {last_error}\n")
+
+                    # 更新进度
+                    execute_no_return(
+                        """
+                        UPDATE tasks SET completed_count = ?, failed_count = ?,
+                            last_email = ?, last_error = ?, last_log_at = ?
+                        WHERE id = ?
+                        """,
+                        (completed, failed, last_email, last_error, now_iso(), task_id),
+                    )
+
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
+                with console_path.open("a", encoding="utf-8") as log:
+                    log.write(f"[{now_iso()}] [Fatal] {last_error}\n")
+
+            # 最终状态
+            if completed >= target_count:
+                final_status = STATUS_COMPLETED
+            elif completed > 0:
+                final_status = STATUS_PARTIAL
+            else:
+                final_status = STATUS_FAILED
+
+            execute_no_return(
+                """
+                UPDATE tasks SET status = ?, finished_at = ?, completed_count = ?,
+                    failed_count = ?, last_email = ?, last_error = ?,
+                    current_phase = ?, last_log_at = ?
+                WHERE id = ?
+                """,
+                (
+                    final_status, now_iso(), completed, failed,
+                    last_email, last_error, final_status, now_iso(), task_id,
+                ),
+            )
+
+        # 在独立线程里跑，不阻塞 supervisor 主循环
+        t = _threading.Thread(target=_run, daemon=True, name=f"vendor-{platform_name}-{task_id}")
+        t.start()
 
 
 # ── 全局单例 ──────────────────────────────────────────────────────────
