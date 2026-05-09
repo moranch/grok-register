@@ -34,6 +34,13 @@ async def lifespan(_: FastAPI):
     """应用生命周期：启动阶段按顺序初始化，关闭阶段逆序清理。"""
     # 1. 数据库建表 + 种子数据
     init_db()
+    # 同时确保 vendor 的 SQLModel 表也存在（vendor 代码内部会查这些表）
+    try:
+        from core._vendor_aar.db import engine as _vendor_engine
+        from sqlmodel import SQLModel as _SQLModel
+        _SQLModel.metadata.create_all(_vendor_engine)
+    except Exception:
+        pass
     try:
         seed_mailbox_from_defaults(force=False)
     except Exception:
