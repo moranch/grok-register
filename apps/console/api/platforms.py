@@ -5,6 +5,7 @@
 - GET / — 返回所有已加载平台的元信息列表
 - GET /{name} — 返回单个平台详情（含 register_engines）
 - PATCH /{name}/config — 更新平台专属配置
+- PATCH /{name}/enabled — 启用/禁用平台
 - POST /{name}/test-run — 以 count=1 发起试跑任务
 """
 from __future__ import annotations
@@ -17,7 +18,8 @@ from pydantic import BaseModel
 
 from core.registry import PLATFORM_REGISTRY
 from core.config_store import ConfigStore, platform_to_dict
-from data import dao
+
+from ._shared import execute_no_return, fetch_one, now_iso
 
 router = APIRouter(prefix="/platforms", tags=["platforms"])
 
@@ -54,19 +56,43 @@ class TestRunRequest(BaseModel):
     engine_id: str = "default"
 
 
-# ─── 辅助 ─────────────────────────────────────────────────────────────────────
+# ─── 辅助：settings 表读写（用 _shared 原生 sqlite，避免与 SQLModel DAO 的 schema 冲突） ─
+
+
+def _get_setting(key: str) -> Optional[str]:
+    row = fetch_one("SELECT value FROM settings WHERE key = ?", (key,))
+    return row["value"] if row else None
+
+
+def _set_setting(key: str, value: str) -> None:
+    execute_no_return(
+        """
+        INSERT INTO settings (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                       updated_at = excluded.updated_at
+        """,
+        (key, value, now_iso()),
+    )
 
 
 def _is_platform_enabled(name: str) -> bool:
-    """读取 settings 中平台启用状态；未设置视为启用（只要被 registry 发现就默认打开）。"""
-    raw = dao.get_all_settings().get(f"platform_{name}_enabled")
+    """读取 settings 中平台启用状态；未设置视为启用。"""
+    raw = _get_setting(f"platform_{name}_enabled")
     if raw is None:
         return True
-    if isinstance(raw, bool):
-        return raw
-    if isinstance(raw, str):
-        return raw.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(raw)
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _get_platform_config(name: str) -> Dict[str, Any]:
+    raw = _get_setting(f"platform_{name}")
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 # ─── 路由 ─────────────────────────────────────────────────────────────────────
@@ -98,16 +124,7 @@ async def get_platform(name: str):
 
     instance = cls()
     detail = platform_to_dict(instance)
-
-    # 附加平台专属配置
-    settings = dao.get_all_settings()
-    platform_config_raw = settings.get(f"platform_{name}", "{}")
-    try:
-        platform_config = json.loads(platform_config_raw) if isinstance(platform_config_raw, str) else platform_config_raw
-    except (json.JSONDecodeError, TypeError):
-        platform_config = {}
-
-    detail["config"] = platform_config
+    detail["config"] = _get_platform_config(name)
     detail["enabled"] = _is_platform_enabled(name)
     return detail
 
@@ -118,7 +135,10 @@ async def update_platform_enabled(name: str, body: PlatformEnabledUpdate):
     cls = PLATFORM_REGISTRY.get(name)
     if cls is None:
         raise HTTPException(status_code=404, detail=f"平台 '{name}' 未找到")
-    dao.upsert_setting(f"platform_{name}_enabled", "true" if body.enabled else "false")
+    _set_setting(
+        f"platform_{name}_enabled",
+        "true" if body.enabled else "false",
+    )
     return {"ok": True, "platform": name, "enabled": body.enabled}
 
 
@@ -128,16 +148,20 @@ async def update_platform_config(name: str, body: PlatformConfigUpdate):
     cls = PLATFORM_REGISTRY.get(name)
     if cls is None:
         raise HTTPException(status_code=404, detail=f"平台 '{name}' 未找到")
-
-    config_json = json.dumps(body.config, ensure_ascii=False)
-    dao.upsert_setting(f"platform_{name}", config_json)
-
+    _set_setting(
+        f"platform_{name}",
+        json.dumps(body.config, ensure_ascii=False),
+    )
     return {"ok": True, "platform": name, "config": body.config}
 
 
 @router.post("/{name}/test-run")
 async def test_run(name: str, body: TestRunRequest):
-    """以 count=1 发起试跑任务。"""
+    """以 count=1 发起试跑任务。
+
+    注：多平台任务执行链路（spec task 4.4 + core/task_runtime 接插件 dispatch）
+    尚未完成，此端点暂时返回 501。完成后会切换到正式的 supervisor 流程。
+    """
     cls = PLATFORM_REGISTRY.get(name)
     if cls is None:
         raise HTTPException(status_code=404, detail=f"平台 '{name}' 未找到")
@@ -157,14 +181,10 @@ async def test_run(name: str, body: TestRunRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # 创建试跑任务
-    task = dao.save_task({
-        "name": f"[试跑] {instance.display_name}",
-        "platform": name,
-        "status": "queued",
-        "executor_type": body.executor_type,
-        "target_count": 1,
-        "params_json": json.dumps({"engine_id": body.engine_id, "is_test_run": True}, ensure_ascii=False),
-    })
-
-    return {"ok": True, "task_id": task.id, "message": f"试跑任务已创建 (ID={task.id})"}
+    raise HTTPException(
+        status_code=501,
+        detail=(
+            "平台试跑尚未接入任务执行链路 "
+            "(tasks 表 schema 与多平台字段尚未合并, 参见 spec task 2.1/4.4)。"
+        ),
+    )
