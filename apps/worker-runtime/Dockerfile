@@ -57,6 +57,15 @@ COPY apps/console/requirements.txt /tmp/console-requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/console-requirements.txt
 
+# 预下载 Camoufox 浏览器 + UBO 扩展，避免首次任务并发下载时
+# 多线程读到残缺的 addons/UBO/ 目录而报 "manifest.json is missing"。
+# 镜像构建完成后，/root/.cache/camoufox/ 已经包含完整的 firefox fork + UBO。
+RUN python -m camoufox fetch 2>&1 | tail -20 || echo "[camoufox fetch warn] 非致命，运行时会自动补下载" \
+    && python -c "from camoufox.addons import add_default_addons; lst=[]; add_default_addons(lst); print('camoufox addons ready:', lst)" 2>&1 | tail -5 || true
+
+# 预下载 Playwright 的 chromium（vendor 的 Playwright fallback 用）
+RUN python -m playwright install chromium 2>&1 | tail -5 || echo "[playwright install warn] 非致命"
+
 # 拉取并构建前端
 # rsbuild 产物结构：dist/index.html + dist/static/js/*.js + dist/static/css/*.css
 # 后端 FastAPI 挂载 /static → apps/console/static/，HTML 里引用 /static/js/... 和 /static/css/...
