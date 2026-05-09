@@ -326,13 +326,45 @@ class TaskSupervisor:
                 if cls is None:
                     raise RuntimeError(f"平台 '{platform_name}' 未在 registry 中找到")
 
-                instance = cls()
+                # 获取 vendor 原始平台类（绕过我们的 adapter wrapper）
+                vendor_cls = None
+                try:
+                    vendor_mod = __import__(
+                        f"platforms._vendor_aar.{platform_name}.plugin",
+                        fromlist=["_"],
+                    )
+                    for _k, _v in vars(vendor_mod).items():
+                        if (
+                            isinstance(_v, type)
+                            and _k.endswith("Platform")
+                            and _k != "BasePlatform"
+                            and hasattr(_v, "register")
+                        ):
+                            vendor_cls = _v
+                            break
+                except Exception:
+                    pass
 
-                # 配置代理
-                proxy_url = task_config.get("proxy", "") or task_config.get("browser_proxy", "")
-                if hasattr(instance, "config") and instance.config is not None:
-                    if hasattr(instance.config, "proxy"):
-                        instance.config.proxy = proxy_url
+                # 优先用 vendor 原始类（它有完整的 register() 实现）
+                if vendor_cls is not None:
+                    from core._vendor_aar.base_platform import RegisterConfig
+                    proxy_url = task_config.get("proxy", "") or task_config.get("browser_proxy", "")
+                    config = RegisterConfig(
+                        proxy=proxy_url,
+                        executor_type="protocol",
+                        extra={},
+                    )
+                    # 注入我们的邮箱桥接
+                    from platforms._shared.mailbox_bridge import BridgeMailbox
+                    mailbox = BridgeMailbox(proxy=proxy_url)
+                    instance = vendor_cls(config=config, mailbox=mailbox)
+                else:
+                    # fallback: 用我们的 wrapper（可能报 RegistrationContext 错误）
+                    instance = cls()
+                    proxy_url = task_config.get("proxy", "") or task_config.get("browser_proxy", "")
+                    if hasattr(instance, "config") and instance.config is not None:
+                        if hasattr(instance.config, "proxy"):
+                            instance.config.proxy = proxy_url
 
                 for round_no in range(1, target_count + 1):
                     execute_no_return(
