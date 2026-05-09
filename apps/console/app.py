@@ -378,15 +378,29 @@ def run_health_checks() -> dict[str, Any]:
             )
 
     xai_proxy = browser_proxy or request_proxy
+    xai_target = "https://x.ai"
+    xai_ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/140.0.0.0 Safari/537.36"
+    )
     try:
         response = _request_with_optional_proxy(
-            "https://accounts.x.ai/sign-up?redirect=grok-com",
+            xai_target,
             proxy_url=xai_proxy,
             timeout=20,
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers={
+                "User-Agent": xai_ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
         )
         ok = response.status_code in {200, 301, 302, 303, 307, 308}
-        detail = f"使用 `{_mask_proxy(xai_proxy)}` 访问注册页返回 HTTP {response.status_code}。" if xai_proxy else f"直连访问注册页返回 HTTP {response.status_code}。"
+        detail = (
+            f"使用 `{_mask_proxy(xai_proxy)}` 访问 x.ai 返回 HTTP {response.status_code}。"
+            if xai_proxy
+            else f"直连访问 x.ai 返回 HTTP {response.status_code}。"
+        )
         if not ok and response.status_code in {401, 403, 429}:
             detail += " 这通常说明当前出口被目标站点拦截、限流，或还没完成可用的人机验证链路。"
         items.append(
@@ -396,18 +410,36 @@ def run_health_checks() -> dict[str, Any]:
                 ok,
                 f"HTTP {response.status_code}",
                 detail,
-                "https://accounts.x.ai/sign-up?redirect=grok-com",
+                xai_target,
             )
         )
     except Exception as exc:
+        err_text = str(exc)
+        # 针对 SOCKS5 "Host unreachable" 给出更清晰的说明
+        if "0x04" in err_text or "Host unreachable" in err_text:
+            hint = (
+                "SOCKS 代理返回 'Host unreachable' —— 代理本身能通，"
+                "但从该出口无法到达 x.ai（常见于 WARP IP 被 x.ai 拦截，"
+                "或 Python requests 的 TLS 指纹被目标识别并丢弃）。"
+                "真实注册流程走的是 Chrome 浏览器，不受此影响。"
+            )
+        elif "NameResolutionError" in err_text or "resolve" in err_text.lower():
+            hint = "DNS 解析失败，请确认代理地址或容器网络可用。"
+        else:
+            hint = None
+
+        detail_text = f"访问 `{xai_target}` 失败：{exc}"
+        if hint:
+            detail_text += f"\n\n提示：{hint}"
+
         items.append(
             _build_health_item(
                 "xai",
                 "x.ai Sign-up",
                 False,
                 "注册页不可达",
-                f"访问 `x.ai` 注册页失败：{exc}",
-                "https://accounts.x.ai/sign-up?redirect=grok-com",
+                detail_text,
+                xai_target,
             )
         )
 
