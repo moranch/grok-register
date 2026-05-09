@@ -60,11 +60,11 @@ class BridgeMailbox(BaseMailbox):
 
         session = self._session()
 
-        if provider_type in ("tmail", "moemail", "freemail"):
-            # Freemail (github.com/idinging/freemail) 自建 CF Worker 邮箱：
-            #   GET /api/generate → 生成邮箱
-            #   GET /api/emails?mailbox=<email>&limit=20 → 拉邮件列表
-            # 认证：Authorization: Bearer <admin_token>  或  POST /api/login {username,password}
+        if provider_type in ("tmail", "moemail"):
+            # TMail v3 (mail.nnioj.com 这类 Astro 前端的临时邮箱服务):
+            #   GET /api/generate  → 生成邮箱
+            #   GET /api/fetch?to=<email>  → 拉邮件列表（返回 JSON 数组）
+            # 认证：Authorization: Bearer <api_key>（没有 key 会提示 "no available domains"）
             admin_password = provider.get("admin_password", "") or ""
             headers = {}
             if admin_password:
@@ -77,12 +77,12 @@ class BridgeMailbox(BaseMailbox):
             )
             if resp.status_code != 200:
                 raise RuntimeError(
-                    f"Freemail 邮箱创建失败: {resp.status_code} - {resp.text[:200]}"
+                    f"TMail 邮箱创建失败: {resp.status_code} - {resp.text[:200]}"
                 )
             data = resp.json()
             email = data.get("email", "")
             if not email:
-                raise RuntimeError(f"Freemail 创建邮箱未返回 email: {data}")
+                raise RuntimeError(f"TMail 创建邮箱未返回 email: {data}")
             return MailboxAccount(email=email, account_id=admin_password, extra={
                 "provider_id": provider["id"],
                 "api_base": api_base,
@@ -134,7 +134,7 @@ class BridgeMailbox(BaseMailbox):
             )
 
     def get_current_ids(self, account: MailboxAccount) -> Set:
-        """获取当前邮件 ID 列表（Freemail /api/emails?mailbox=X&limit=50）。"""
+        """获取当前邮件 ID 列表（TMail /api/fetch?to=<email>）。"""
         extra = account.extra or {}
         api_base = extra.get("api_base", "")
         if not api_base:
@@ -146,8 +146,8 @@ class BridgeMailbox(BaseMailbox):
             headers["Authorization"] = f"Bearer {admin_pw}"
         try:
             resp = session.get(
-                f"{api_base}/api/emails",
-                params={"mailbox": account.email, "limit": 50},
+                f"{api_base}/api/fetch",
+                params={"to": account.email},
                 headers=headers,
                 timeout=10,
             )
@@ -165,10 +165,10 @@ class BridgeMailbox(BaseMailbox):
         before_ids: Set = None,
         code_pattern: str = None,
     ) -> str:
-        """轮询 Freemail /api/emails 拉邮件，提取验证码。
+        """轮询 TMail /api/fetch 拉邮件，提取验证码。
 
-        Freemail 接口的消息对象有 'verification_code' 字段（服务器侧已提取），
-        没有则从 preview + subject 正则提 6 位数字。
+        TMail v3 返回 JSON 数组，每条至少有 subject + 某个 body 字段。
+        若服务端有预提取的 verification_code 字段优先使用，否则正则抓 6 位数字。
         """
         import re
 
@@ -189,8 +189,8 @@ class BridgeMailbox(BaseMailbox):
         while time.time() < deadline:
             try:
                 resp = session.get(
-                    f"{api_base}/api/emails",
-                    params={"mailbox": account.email, "limit": 20},
+                    f"{api_base}/api/fetch",
+                    params={"to": account.email},
                     headers=headers,
                     timeout=10,
                 )
@@ -203,23 +203,26 @@ class BridgeMailbox(BaseMailbox):
                             continue
                         seen.add(mail_id)
                         subject = str(item.get("subject", ""))
+                        # keyword 只用于 subject/preview，避免 body 碎片误匹
                         if keyword and keyword.lower() not in (
                             subject + " " + str(item.get("preview", ""))
                         ).lower():
                             continue
-                        # 优先使用 Freemail 服务器端已提取的 verification_code
+                        # 优先：服务端已提取的 verification_code
                         code = str(item.get("verification_code") or "").strip()
                         if code and code.lower() != "none" and pattern.fullmatch(code):
                             return code
-                        # 兜底：preview / subject / body / text 里正则抓
+                        # 兜底：从各种 body 字段里抓 6 位数字
                         text = " ".join(
-                            str(item.get(k, "")) for k in ("preview", "subject", "text", "body", "html")
+                            str(item.get(k, "")) for k in (
+                                "subject", "preview", "text", "body", "html", "raw", "content"
+                            )
                         )
                         m = pattern.search(text)
                         if m:
                             return m.group(1) if m.groups() else m.group(0)
             except Exception as e:
-                logger.debug(f"轮询 Freemail 邮件失败: {e}")
+                logger.debug(f"轮询 TMail 邮件失败: {e}")
 
             time.sleep(3)
 
