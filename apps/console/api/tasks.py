@@ -56,17 +56,58 @@ def list_tasks(request: Request) -> dict[str, Any]:
 @router.post("")
 def create_task(request: Request, payload: TaskCreate) -> dict[str, Any]:
     check_auth(request)
-    if not SOURCE_PROJECT.exists():
-        raise HTTPException(status_code=500, detail=f"Source project not found: {SOURCE_PROJECT}")
-    if not SOURCE_VENV_PYTHON.exists():
-        raise HTTPException(status_code=500, detail=f"Python not found: {SOURCE_VENV_PYTHON}")
+
+    # 平台校验：默认 grok；非 grok 必须在 PLATFORM_REGISTRY 中
+    platform_name = (payload.platform or "grok").strip().lower()
+    engine_id = (payload.engine_id or "").strip()
+    if platform_name != "grok":
+        try:
+            from core.registry import PLATFORM_REGISTRY
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"多平台 registry 不可用: {exc}",
+            )
+        cls = PLATFORM_REGISTRY.get(platform_name)
+        if cls is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"未知平台: {platform_name}",
+            )
+        instance = cls()
+        engines = {e.id for e in instance.get_register_engines()}
+        if not engine_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"平台 '{platform_name}' 必须指定 engine_id，可选: {sorted(engines)}",
+            )
+        if engine_id not in engines:
+            raise HTTPException(
+                status_code=400,
+                detail=f"平台 '{platform_name}' 不支持 engine_id '{engine_id}'，可选: {sorted(engines)}",
+            )
+
+    # grok 保持原有前置检查；其它平台 supervisor 会在分派阶段报错
+    if platform_name == "grok":
+        if not SOURCE_PROJECT.exists():
+            raise HTTPException(status_code=500, detail=f"Source project not found: {SOURCE_PROJECT}")
+        if not SOURCE_VENV_PYTHON.exists():
+            raise HTTPException(status_code=500, detail=f"Python not found: {SOURCE_VENV_PYTHON}")
+
     task_config = build_task_config(payload)
+    executor_type = str(task_config.get("executor", "") or payload.executor or "")
+    params = {
+        "platform": platform_name,
+        "engine_id": engine_id,
+        "extra": payload.extra or {},
+    }
     created_at = now_iso()
     task_id = execute(
         """
         INSERT INTO tasks (
-            name, status, target_count, notes, config_json, task_dir, console_path, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            name, status, target_count, notes, config_json, task_dir, console_path, created_at,
+            platform, executor_type, engine_id, params_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             payload.name.strip(),
@@ -77,6 +118,10 @@ def create_task(request: Request, payload: TaskCreate) -> dict[str, Any]:
             str(TASKS_DIR / "pending"),
             str(TASKS_DIR / "pending.log"),
             created_at,
+            platform_name,
+            executor_type,
+            engine_id,
+            json.dumps(params, ensure_ascii=False),
         ),
     )
     task_dir = TASKS_DIR / f"task_{task_id}"

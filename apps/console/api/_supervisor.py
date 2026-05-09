@@ -117,6 +117,31 @@ class TaskSupervisor:
 
     def _start_task(self, row: sqlite3.Row) -> None:
         task_id = int(row["id"])
+
+        # 多平台分派：仅 grok 有落地执行路径；其它平台先置 FAILED 并给出明确信息。
+        # 这是第一阶段的安全网，避免 kiro 等未完成的插件任务被 grok 脚本吃掉。
+        _row_keys = set(row.keys())
+        platform_name = (
+            str(row["platform"]) if "platform" in _row_keys else "grok"
+        ).strip().lower() or "grok"
+        if platform_name != "grok":
+            execute_no_return(
+                """
+                UPDATE tasks
+                SET status = ?, finished_at = ?, last_error = ?, current_phase = ?
+                WHERE id = ?
+                """,
+                (
+                    STATUS_FAILED,
+                    now_iso(),
+                    f"平台 '{platform_name}' 的注册执行尚未接入 supervisor，"
+                    f"当前 supervisor 仅支持 grok；spec task 6.2 / 7 未完成。",
+                    "not_dispatched",
+                    task_id,
+                ),
+            )
+            return
+
         task_dir = Path(row["task_dir"])
         console_path = Path(row["console_path"])
         task_config = json.loads(row["config_json"])

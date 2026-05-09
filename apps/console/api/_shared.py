@@ -129,6 +129,10 @@ def check_auth(request: Request):
 class TaskCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
     count: int = Field(50, ge=1, le=5000)
+    # 多平台扩展（默认 grok 以保持与旧表单的兼容）
+    platform: str = Field("grok", min_length=1, max_length=64)
+    engine_id: str | None = None
+    extra: dict[str, Any] | None = None
     proxy: str | None = None
     browser_proxy: str | None = None
     temp_mail_api_base: str | None = None
@@ -384,6 +388,18 @@ def build_task_config(payload: TaskCreate) -> dict[str, Any]:
 # ================================================================
 
 def serialize_task(row: sqlite3.Row) -> dict[str, Any]:
+    # sqlite3.Row 不支持 .get()，使用 keys() 检查存在性（向后兼容未迁移的 db）
+    _keys = set(row.keys())
+
+    def _col(name: str, default: Any = "") -> Any:
+        return row[name] if name in _keys else default
+
+    params_raw = _col("params_json", "{}") or "{}"
+    try:
+        params = json.loads(params_raw)
+    except Exception:
+        params = {}
+
     return {
         "id": int(row["id"]),
         "name": row["name"],
@@ -403,6 +419,11 @@ def serialize_task(row: sqlite3.Row) -> dict[str, Any]:
         "finished_at": row["finished_at"],
         "exit_code": row["exit_code"],
         "pid": row["pid"],
+        # 多平台字段
+        "platform": _col("platform", "grok") or "grok",
+        "executor_type": _col("executor_type", "") or "",
+        "engine_id": _col("engine_id", "") or "",
+        "params": params,
     }
 
 
@@ -682,7 +703,11 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 started_at TEXT,
                 finished_at TEXT,
-                exit_code INTEGER
+                exit_code INTEGER,
+                platform TEXT NOT NULL DEFAULT 'grok',
+                executor_type TEXT NOT NULL DEFAULT '',
+                engine_id TEXT NOT NULL DEFAULT '',
+                params_json TEXT NOT NULL DEFAULT '{}'
             );
 
             CREATE TABLE IF NOT EXISTS proxies (
@@ -727,6 +752,9 @@ def init_db() -> None:
                 last_checked_at TEXT,
                 notes TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
+                platform TEXT NOT NULL DEFAULT 'grok',
+                extra_json TEXT NOT NULL DEFAULT '{}',
+                exporter_status_json TEXT NOT NULL DEFAULT '{}',
                 UNIQUE(email, sso)
             );
 
@@ -760,11 +788,33 @@ def init_db() -> None:
             ("validity_status", "TEXT NOT NULL DEFAULT 'unknown'"),
             ("last_error", "TEXT NOT NULL DEFAULT ''"),
             ("notes", "TEXT NOT NULL DEFAULT ''"),
+            # 多平台扩展
+            ("platform", "TEXT NOT NULL DEFAULT 'grok'"),
+            ("extra_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("exporter_status_json", "TEXT NOT NULL DEFAULT '{}'"),
         ]
         for col, col_type in _migrations:
             if col not in _existing_cols:
                 try:
                     conn.execute(f"ALTER TABLE accounts ADD COLUMN {col} {col_type}")
+                except sqlite3.OperationalError:
+                    pass
+
+        # 兼容迁移：给旧的 tasks 表补多平台字段
+        _task_cols = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        _task_migrations = [
+            ("platform", "TEXT NOT NULL DEFAULT 'grok'"),
+            ("executor_type", "TEXT NOT NULL DEFAULT ''"),
+            ("engine_id", "TEXT NOT NULL DEFAULT ''"),
+            ("params_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ]
+        for col, col_type in _task_migrations:
+            if col not in _task_cols:
+                try:
+                    conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {col_type}")
                 except sqlite3.OperationalError:
                     pass
         conn.commit()
