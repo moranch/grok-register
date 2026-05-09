@@ -168,10 +168,18 @@ class BridgeMailbox(BaseMailbox):
         before_ids: Set = None,
         code_pattern: str = None,
     ) -> str:
-        """轮询 TMail /api/fetch 拉邮件，提取验证码。
+        """轮询 TMail v3 两步拉邮件 → 提验证码。
 
-        TMail v3 返回 JSON 数组，每条至少有 subject + 某个 body 字段。
-        若服务端有预提取的 verification_code 字段优先使用，否则正则抓 6 位数字。
+        TMail v3 (mail.nnioj.com 这类 Astro UI 的临时邮箱) 的收信 API 是两步的：
+          1. GET /api/fetch?to=<email>       → 返回 [{id, to, from, subject, created_at, ...}]
+                                                 只有 meta 字段，**没有 body**
+          2. GET /api/fetch/<id>             → 返回 {content: "<html>...</html>",
+                                                     attachments: [],
+                                                     code: "below"/"above",
+                                                     code_found: bool}
+             其中 content 是 HTML 正文，验证码一般在 content 里需要正则提。
+
+        所以不能只靠 list 接口——必须 follow up 拉详情。
         """
         import re
 
@@ -208,25 +216,45 @@ class BridgeMailbox(BaseMailbox):
                         if not mail_id or mail_id in seen:
                             continue
                         seen.add(mail_id)
+
+                        # list 响应里的 meta 用于 keyword 快速过滤
                         subject = str(item.get("subject", ""))
-                        # keyword 只用于 subject/preview，避免 body 碎片误匹
-                        if keyword and keyword.lower() not in (
-                            subject + " " + str(item.get("preview", ""))
-                        ).lower():
-                            continue
-                        # 优先：服务端已提取的 verification_code
-                        code = str(item.get("verification_code") or "").strip()
-                        if code and code.lower() != "none" and pattern.fullmatch(code):
-                            return code
-                        # 兜底：从各种 body 字段里抓 6 位数字
-                        text = " ".join(
-                            str(item.get(k, "")) for k in (
-                                "subject", "preview", "text", "body", "html", "raw", "content"
+                        sender = str(item.get("from", ""))
+                        if keyword:
+                            meta_text = f"{subject} {sender}".lower()
+                            if keyword.lower() not in meta_text:
+                                continue
+
+                        # Step 2: 拉详情（content 是 HTML 正文）
+                        try:
+                            detail = session.get(
+                                f"{api_base}/api/fetch/{mail_id}",
+                                headers=headers,
+                                timeout=10,
                             )
-                        )
-                        m = pattern.search(text)
+                            if detail.status_code != 200:
+                                logger.debug(f"拉邮件详情失败 id={mail_id}: {detail.status_code}")
+                                continue
+                            d = detail.json() if isinstance(detail.json(), dict) else {}
+                        except Exception as e:
+                            logger.debug(f"拉邮件详情异常 id={mail_id}: {e}")
+                            continue
+
+                        content = str(d.get("content", ""))
+                        # 先从 content 正则抓 6 位数字
+                        m = pattern.search(content)
                         if m:
-                            return m.group(1) if m.groups() else m.group(0)
+                            code = m.group(1) if m.groups() else m.group(0)
+                            if code and code.lower() != "none":
+                                return code
+
+                        # 兜底：subject 里有时也带验证码（比如 "Verify ... - 368905"）
+                        full_text = f"{subject} {content}"
+                        m2 = pattern.search(full_text)
+                        if m2:
+                            code = m2.group(1) if m2.groups() else m2.group(0)
+                            if code and code.lower() != "none":
+                                return code
             except Exception as e:
                 logger.debug(f"轮询 TMail 邮件失败: {e}")
 
