@@ -6,6 +6,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb \
+    x11vnc \
+    novnc \
+    websockify \
     wget \
     gnupg \
     ca-certificates \
@@ -92,5 +95,9 @@ RUN set -eux; \
 
 # 告诉 app.py 从这个路径读取前端资源（不会被 docker-compose volume 覆盖）
 ENV WEBUI_DIR=/opt/webui
+
+# 入口脚本：启动 Xvfb + x11vnc + noVNC + FastAPI 控制台
+COPY apps/worker-runtime/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 CMD ["bash"]

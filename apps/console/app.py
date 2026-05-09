@@ -131,6 +131,48 @@ def init_db() -> None:
                 finished_at TEXT,
                 exit_code INTEGER
             );
+
+            -- 代理池：支持多条代理，按成功率加权轮询；连续失败自动禁用
+            CREATE TABLE IF NOT EXISTS proxies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT NOT NULL UNIQUE,
+                label TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                last_used_at TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            -- 注册事件：每次成功/失败都记录一条，用于统计与趋势图
+            CREATE TABLE IF NOT EXISTS register_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER,
+                ok INTEGER NOT NULL,
+                email TEXT,
+                proxy_url TEXT,
+                error_kind TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_created_at
+                ON register_events(created_at);
+            CREATE INDEX IF NOT EXISTS idx_events_proxy
+                ON register_events(proxy_url);
+
+            -- 账号：持久化每一次注册成功的账号（邮箱 + sso token）
+            CREATE TABLE IF NOT EXISTS accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL,
+                sso TEXT NOT NULL,
+                task_id INTEGER,
+                proxy_url TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                last_checked_at TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(email, sso)
+            );
             """
         )
 
@@ -468,8 +510,11 @@ class TaskCreate(BaseModel):
     api_token: str | None = None
     api_append: bool | None = None
     # 调试模式：True=浏览器以"有头"方式跑（Xvfb 虚拟显示器）；False=完全无头
-    # 单任务可覆盖系统默认
+    # 单任务可覆盖
     debug_mode: bool | None = None
+    # 执行器：headless（无头，默认）/ headed（有头，对应调试模式）
+    # 预留 protocol（纯协议模式，后续接入 curl_cffi + 远程 Turnstile solver）
+    executor: str | None = None
     notes: str = ""
 
 
@@ -483,8 +528,26 @@ class SystemSettings(BaseModel):
     api_endpoint: str = ""
     api_token: str = ""
     api_append: bool = True
-    # 调试模式：默认关闭（生产场景用无头），开启后每个任务都会以"有头"方式跑
+    # 调试模式：默认关闭（生产场景用无头）
     debug_mode: bool = False
+    # 执行器：headless(默认) / headed / protocol
+    executor: str = "headless"
+    # Token 自动续期：关闭（默认）/ 开启；开启后会定期调用推送接口刷新账号池
+    lifecycle_enabled: bool = False
+    # 有效性检测间隔（小时），默认 6
+    lifecycle_check_hours: int = 6
+
+
+class ProxyItem(BaseModel):
+    url: str = Field(..., min_length=1)
+    label: str = ""
+    enabled: bool = True
+
+
+class ProxyUpdate(BaseModel):
+    label: str | None = None
+    enabled: bool | None = None
+    reset_stats: bool | None = None
 
 
 @dataclass
@@ -538,6 +601,18 @@ def merged_defaults() -> dict[str, Any]:
     base["api"] = api_base
     if "debug_mode" in saved:
         base["debug_mode"] = bool(saved.get("debug_mode", False))
+    if "executor" in saved:
+        base["executor"] = str(saved.get("executor") or "headless")
+    else:
+        base.setdefault("executor", "headless")
+    if "lifecycle_enabled" in saved:
+        base["lifecycle_enabled"] = bool(saved.get("lifecycle_enabled", False))
+    else:
+        base.setdefault("lifecycle_enabled", False)
+    if "lifecycle_check_hours" in saved:
+        base["lifecycle_check_hours"] = int(saved.get("lifecycle_check_hours") or 6)
+    else:
+        base.setdefault("lifecycle_check_hours", 6)
     return base
 
 
@@ -559,6 +634,8 @@ def build_task_config(payload: TaskCreate) -> dict[str, Any]:
         },
         # 调试模式：单任务可覆盖；未传则沿用系统默认（defaults.debug_mode）
         "debug_mode": bool(defaults.get("debug_mode", False)) if payload.debug_mode is None else bool(payload.debug_mode),
+        # 执行器：headless / headed / protocol
+        "executor": str(defaults.get("executor", "headless")) if not payload.executor else str(payload.executor),
     }
 
 
@@ -690,9 +767,404 @@ def copy_source_to_task_dir(task_dir: Path, task_config: dict[str, Any]) -> None
     )
 
 
+# ================================================================
+# 代理池 / 统计 / 账号 / 生命周期 辅助函数
+# ================================================================
+
+def _proxy_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    total = int(row["success_count"]) + int(row["failure_count"])
+    success_rate = (int(row["success_count"]) / total * 100.0) if total else 0.0
+    return {
+        "id": int(row["id"]),
+        "url": row["url"],
+        "label": row["label"] or "",
+        "enabled": bool(row["enabled"]),
+        "success_count": int(row["success_count"]),
+        "failure_count": int(row["failure_count"]),
+        "consecutive_failures": int(row["consecutive_failures"]),
+        "success_rate": round(success_rate, 2),
+        "last_used_at": row["last_used_at"] or "",
+        "created_at": row["created_at"],
+    }
+
+
+def proxy_list(include_disabled: bool = True) -> list[dict[str, Any]]:
+    if include_disabled:
+        rows = fetch_all("SELECT * FROM proxies ORDER BY id ASC")
+    else:
+        rows = fetch_all("SELECT * FROM proxies WHERE enabled = 1 ORDER BY id ASC")
+    return [_proxy_from_row(r) for r in rows]
+
+
+def proxy_add(url: str, label: str = "", enabled: bool = True) -> dict[str, Any]:
+    url = url.strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="proxy url required")
+    existing = fetch_one("SELECT * FROM proxies WHERE url = ?", (url,))
+    if existing:
+        raise HTTPException(status_code=409, detail="proxy url already exists")
+    execute(
+        """
+        INSERT INTO proxies (url, label, enabled, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (url, label, 1 if enabled else 0, now_iso()),
+    )
+    row = fetch_one("SELECT * FROM proxies WHERE url = ?", (url,))
+    assert row is not None
+    return _proxy_from_row(row)
+
+
+def proxy_update(proxy_id: int, label: str | None, enabled: bool | None, reset_stats: bool | None) -> dict[str, Any]:
+    row = fetch_one("SELECT * FROM proxies WHERE id = ?", (proxy_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="proxy not found")
+    new_label = row["label"] if label is None else label
+    new_enabled = int(row["enabled"]) if enabled is None else (1 if enabled else 0)
+    if reset_stats:
+        execute_no_return(
+            """
+            UPDATE proxies
+            SET label = ?, enabled = ?, success_count = 0, failure_count = 0,
+                consecutive_failures = 0
+            WHERE id = ?
+            """,
+            (new_label, new_enabled, proxy_id),
+        )
+    else:
+        execute_no_return(
+            "UPDATE proxies SET label = ?, enabled = ? WHERE id = ?",
+            (new_label, new_enabled, proxy_id),
+        )
+    row = fetch_one("SELECT * FROM proxies WHERE id = ?", (proxy_id,))
+    assert row is not None
+    return _proxy_from_row(row)
+
+
+def proxy_delete(proxy_id: int) -> None:
+    execute_no_return("DELETE FROM proxies WHERE id = ?", (proxy_id,))
+
+
+def proxy_pick_best() -> dict[str, Any] | None:
+    """按成功率加权从启用的代理里挑一个；连续失败 >=5 自动禁用"""
+    rows = fetch_all("SELECT * FROM proxies WHERE enabled = 1")
+    if not rows:
+        return None
+    alive = []
+    for r in rows:
+        if int(r["consecutive_failures"]) >= 5:
+            execute_no_return("UPDATE proxies SET enabled = 0 WHERE id = ?", (int(r["id"]),))
+            continue
+        alive.append(r)
+    if not alive:
+        return None
+    import random as _random
+    weights = []
+    for r in alive:
+        s = int(r["success_count"])
+        f = int(r["failure_count"])
+        weights.append((s + 1) / (s + f + 2))
+    chosen = _random.choices(alive, weights=weights, k=1)[0]
+    execute_no_return("UPDATE proxies SET last_used_at = ? WHERE id = ?", (now_iso(), int(chosen["id"])))
+    return _proxy_from_row(chosen)
+
+
+def proxy_report_success(url: str) -> None:
+    url = (url or "").strip()
+    if not url:
+        return
+    execute_no_return(
+        """
+        UPDATE proxies
+        SET success_count = success_count + 1, consecutive_failures = 0, last_used_at = ?
+        WHERE url = ?
+        """,
+        (now_iso(), url),
+    )
+
+
+def proxy_report_failure(url: str) -> None:
+    url = (url or "").strip()
+    if not url:
+        return
+    execute_no_return(
+        """
+        UPDATE proxies
+        SET failure_count = failure_count + 1,
+            consecutive_failures = consecutive_failures + 1,
+            last_used_at = ?
+        WHERE url = ?
+        """,
+        (now_iso(), url),
+    )
+
+
+# --------- 注册事件 / 账号 ----------
+
+def classify_error(message: str) -> str:
+    """把原始错误信息归并成少量可读的错误类型，便于聚合统计"""
+    if not message:
+        return "unknown"
+    m = message.lower()
+    if "turnstile" in m:
+        return "turnstile_failed"
+    if "timeout" in m or "超时" in message:
+        return "timeout"
+    if "0x04" in m or "host unreachable" in m:
+        return "proxy_host_unreachable"
+    if "proxy" in m or "socks" in m or "name or service not known" in m:
+        return "proxy_error"
+    if "captcha" in m or "cloudflare" in m:
+        return "anti_bot_challenge"
+    if "email" in m and ("验证码" in message or "code" in m):
+        return "email_otp_failed"
+    if "429" in m or "rate limit" in m:
+        return "rate_limited"
+    if "403" in m or "blocked" in m or "封" in message:
+        return "blocked"
+    return "other"
+
+
+def log_register_event(
+    *,
+    task_id: int | None,
+    ok: bool,
+    email: str = "",
+    proxy_url: str = "",
+    error_kind: str = "",
+    error_message: str = "",
+) -> None:
+    execute(
+        """
+        INSERT INTO register_events (task_id, ok, email, proxy_url, error_kind, error_message, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (task_id, 1 if ok else 0, email, proxy_url, error_kind, error_message, now_iso()),
+    )
+    if proxy_url:
+        if ok:
+            proxy_report_success(proxy_url)
+        else:
+            proxy_report_failure(proxy_url)
+
+
+def account_upsert(email: str, sso: str, task_id: int | None, proxy_url: str = "") -> None:
+    if not email or not sso:
+        return
+    execute_no_return(
+        """
+        INSERT OR IGNORE INTO accounts (email, sso, task_id, proxy_url, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (email.strip(), sso.strip(), task_id, proxy_url, now_iso()),
+    )
+
+
+def account_list(limit: int = 500) -> list[dict[str, Any]]:
+    rows = fetch_all(
+        "SELECT * FROM accounts ORDER BY id DESC LIMIT ?",
+        (max(1, min(limit, 5000)),),
+    )
+    return [
+        {
+            "id": int(r["id"]),
+            "email": r["email"],
+            "sso": r["sso"],
+            "task_id": r["task_id"],
+            "proxy_url": r["proxy_url"] or "",
+            "status": r["status"],
+            "last_checked_at": r["last_checked_at"] or "",
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
+
+
+# --------- 统计 ----------
+
+def stats_overview(days: int = 7) -> dict[str, Any]:
+    total = fetch_one("SELECT COUNT(*) AS c FROM register_events")
+    ok = fetch_one("SELECT COUNT(*) AS c FROM register_events WHERE ok = 1")
+    fail = fetch_one("SELECT COUNT(*) AS c FROM register_events WHERE ok = 0")
+    acc = fetch_one("SELECT COUNT(*) AS c FROM accounts")
+    total_c = int(total["c"]) if total else 0
+    ok_c = int(ok["c"]) if ok else 0
+    fail_c = int(fail["c"]) if fail else 0
+    success_rate = (ok_c / total_c * 100.0) if total_c else 0.0
+    recent = fetch_all(
+        """
+        SELECT DATE(created_at) AS day,
+               SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END) AS ok_count,
+               SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS fail_count
+        FROM register_events
+        WHERE DATE(created_at) >= DATE('now', ?)
+        GROUP BY DATE(created_at)
+        ORDER BY day ASC
+        """,
+        (f"-{max(1, days)} days",),
+    )
+    trend = [
+        {"day": r["day"], "ok": int(r["ok_count"] or 0), "fail": int(r["fail_count"] or 0)}
+        for r in recent
+    ]
+    return {
+        "total_events": total_c,
+        "success_count": ok_c,
+        "failure_count": fail_c,
+        "success_rate": round(success_rate, 2),
+        "account_count": int(acc["c"]) if acc else 0,
+        "trend": trend,
+    }
+
+
+def stats_errors(days: int = 7) -> list[dict[str, Any]]:
+    rows = fetch_all(
+        """
+        SELECT COALESCE(error_kind, '') AS kind, COUNT(*) AS c, MAX(error_message) AS sample
+        FROM register_events
+        WHERE ok = 0 AND DATE(created_at) >= DATE('now', ?)
+        GROUP BY error_kind
+        ORDER BY c DESC
+        LIMIT 50
+        """,
+        (f"-{max(1, days)} days",),
+    )
+    return [
+        {
+            "kind": (r["kind"] or "unknown") or "unknown",
+            "count": int(r["c"] or 0),
+            "sample": r["sample"] or "",
+        }
+        for r in rows
+    ]
+
+
+def stats_by_proxy() -> list[dict[str, Any]]:
+    rows = fetch_all(
+        """
+        SELECT COALESCE(proxy_url, '') AS url,
+               SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END) AS ok_count,
+               SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS fail_count,
+               COUNT(*) AS total
+        FROM register_events
+        WHERE proxy_url IS NOT NULL AND proxy_url != ''
+        GROUP BY proxy_url
+        ORDER BY total DESC
+        """
+    )
+    out = []
+    for r in rows:
+        total = int(r["total"] or 0)
+        ok_c = int(r["ok_count"] or 0)
+        rate = (ok_c / total * 100.0) if total else 0.0
+        out.append(
+            {
+                "proxy_url": r["url"] or "",
+                "ok": ok_c,
+                "fail": int(r["fail_count"] or 0),
+                "total": total,
+                "success_rate": round(rate, 2),
+            }
+        )
+    return out
+
+
+# --------- 日志 -> 事件 抽取 ----------
+
+def _harvest_log_events(task_id: int, console_path: Path, last_line_no: int, proxy_url: str = "") -> int:
+    """增量扫 console.log，把"注册成功""第 N 轮失败"写入 register_events；同时账号入库"""
+    if not console_path.exists():
+        return last_line_no
+    try:
+        text = console_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return last_line_no
+    lines = text.splitlines()
+    if len(lines) <= last_line_no:
+        return last_line_no
+    new_lines = lines[last_line_no:]
+    pending_email = ""
+    for line in new_lines:
+        if m := LINE_RE_FILLED_EMAIL.search(line):
+            pending_email = m.group(1)
+        if m := LINE_RE_SUCCESS.search(line):
+            email = m.group(1)
+            log_register_event(
+                task_id=task_id, ok=True, email=email, proxy_url=proxy_url,
+            )
+            pending_email = email
+        elif m := LINE_RE_ERROR.search(line):
+            err_msg = m.group(2).strip()
+            log_register_event(
+                task_id=task_id, ok=False,
+                proxy_url=proxy_url,
+                error_kind=classify_error(err_msg),
+                error_message=err_msg[:500],
+            )
+    return len(lines)
+
+
+# --------- 账号 sso 文件入库 ----------
+
+def _harvest_task_accounts(task_id: int, task_dir: Path, proxy_url: str = "") -> None:
+    """扫 task 目录下的 sso/task_{id}.txt，把新的 sso 入库。"""
+    sso_file = task_dir / "sso" / f"task_{task_id}.txt"
+    if not sso_file.exists():
+        return
+    try:
+        content = sso_file.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return
+    for sso in content.splitlines():
+        sso = sso.strip()
+        if not sso:
+            continue
+        # 我们暂时不从文件里拿 email（文件里只有 sso）
+        # 直接以 sso 为主键入库，email 留空由事件表关联
+        execute_no_return(
+            """
+            INSERT OR IGNORE INTO accounts (email, sso, task_id, proxy_url, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            ("", sso, task_id, proxy_url, now_iso()),
+        )
+
+
+# --------- 账号导出 ----------
+
+def export_accounts(fmt: str = "json") -> tuple[str, str, str]:
+    rows = account_list(5000)
+    fmt = (fmt or "json").lower()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if fmt == "csv":
+        lines = ["id,email,sso,task_id,proxy_url,status,created_at"]
+        for r in rows:
+            lines.append(
+                f"{r['id']},{r['email']},{r['sso']},{r['task_id'] or ''},"
+                f"{r['proxy_url']},{r['status']},{r['created_at']}"
+            )
+        return "\n".join(lines) + "\n", "text/csv; charset=utf-8", f"grok-accounts-{ts}.csv"
+    if fmt == "sso":
+        content = "\n".join(r["sso"] for r in rows) + "\n"
+        return content, "text/plain; charset=utf-8", f"grok-sso-{ts}.txt"
+    return (
+        json.dumps(rows, ensure_ascii=False, indent=2),
+        "application/json; charset=utf-8",
+        f"grok-accounts-{ts}.json",
+    )
+
+
+# ================================================================
+# TaskSupervisor
+# ================================================================
+
 class TaskSupervisor:
     def __init__(self) -> None:
         self._processes: dict[int, ManagedProcess] = {}
+        # 记录每个 task 本轮使用的代理 URL（来自代理池或 config.json 默认代理）
+        self._task_proxy: dict[int, str] = {}
+        # 记录每个 task console.log 已扫到的行号，用于增量抽取 register_events
+        self._task_log_cursor: dict[int, int] = {}
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._stop = threading.Event()
 
@@ -754,6 +1226,15 @@ class TaskSupervisor:
         task_dir = Path(row["task_dir"])
         console_path = Path(row["console_path"])
         task_config = json.loads(row["config_json"])
+
+        # 代理池：如果用户配置了启用的代理，就按成功率加权挑一个并覆盖 config 的 proxy/browser_proxy
+        pool_proxy = proxy_pick_best()
+        picked_proxy_url = ""
+        if pool_proxy:
+            picked_proxy_url = pool_proxy["url"]
+            task_config["proxy"] = picked_proxy_url
+            task_config["browser_proxy"] = picked_proxy_url
+
         copy_source_to_task_dir(task_dir, task_config)
 
         output_path = task_dir / "sso" / f"task_{task_id}.txt"
@@ -767,11 +1248,26 @@ class TaskSupervisor:
         ]
         log_handle = console_path.open("a", encoding="utf-8")
         # 构造子进程环境变量
-        # - GROK_DEBUG_MODE=1 时：强制开启 Xvfb 虚拟显示器 + 不加 --headless（"有头"调试模式）
-        # - GROK_DEBUG_MODE=0 时：强制走 --headless=new（生产默认，无头运行）
         task_env = os.environ.copy()
         debug_mode = bool(task_config.get("debug_mode", False))
+        executor = str(task_config.get("executor", "headless"))
+        # 执行器优先级 > 调试模式；executor=headed 等价于 debug_mode=True
+        if executor == "headed":
+            debug_mode = True
+        elif executor == "headless":
+            debug_mode = False
         task_env["GROK_DEBUG_MODE"] = "1" if debug_mode else "0"
+        task_env["GROK_EXECUTOR"] = executor
+        # 记录本轮使用的代理，方便日志收集 + 失败归因（写到子进程环境变量，
+        # 也写到本进程的内存映射里，供 _refresh_running 时统计使用）
+        if picked_proxy_url:
+            task_env["GROK_TASK_PROXY_URL"] = picked_proxy_url
+            self._task_proxy[task_id] = picked_proxy_url
+        else:
+            # 从 config.json 回落的默认代理
+            fallback_proxy = str(task_config.get("browser_proxy") or task_config.get("proxy") or "")
+            if fallback_proxy:
+                self._task_proxy[task_id] = fallback_proxy
         process = subprocess.Popen(
             command,
             cwd=task_dir,
@@ -797,6 +1293,17 @@ class TaskSupervisor:
             row = task_row(task_id)
             console_path = Path(row["console_path"])
             parsed = parse_console_state(console_path)
+            # 增量采集 register_events（用于统计 + 代理成功率）
+            proxy_url = self._task_proxy.get(task_id, "")
+            cursor = self._task_log_cursor.get(task_id, 0)
+            new_cursor = _harvest_log_events(task_id, console_path, cursor, proxy_url)
+            if new_cursor != cursor:
+                self._task_log_cursor[task_id] = new_cursor
+                # 成功后从 sso 文件同步账号到 accounts 表
+                try:
+                    _harvest_task_accounts(task_id, Path(row["task_dir"]), proxy_url)
+                except Exception:
+                    pass
             execute_no_return(
                 """
                 UPDATE tasks
@@ -852,6 +1359,9 @@ class TaskSupervisor:
             managed = self._processes.pop(task_id, None)
             if managed and managed.log_handle:
                 managed.log_handle.close()
+            # 清理本次任务的代理/日志游标缓存
+            self._task_proxy.pop(task_id, None)
+            self._task_log_cursor.pop(task_id, None)
 
 
 supervisor = TaskSupervisor()
@@ -874,6 +1384,9 @@ def check_auth(request: Request):
 async def lifespan(_: FastAPI):
     init_db()
     supervisor.start()
+    # 启动生命周期管理线程（Token 续期/有效性检测）
+    if not _lifecycle_thread.is_alive():
+        _lifecycle_thread.start()
     try:
         yield
     finally:
@@ -1083,6 +1596,247 @@ def delete_task(request: Request, task_id: int) -> dict[str, Any]:
     delete_task_files(row)
     execute_no_return("DELETE FROM tasks WHERE id = ?", (task_id,))
     return {"ok": True}
+
+
+# ================================================================
+# 代理池 API
+# ================================================================
+
+@app.get("/api/proxies")
+def api_list_proxies(request: Request) -> dict[str, Any]:
+    check_auth(request)
+    return {"proxies": proxy_list()}
+
+
+@app.post("/api/proxies")
+def api_add_proxy(request: Request, payload: ProxyItem) -> dict[str, Any]:
+    check_auth(request)
+    return {"proxy": proxy_add(payload.url, payload.label, payload.enabled)}
+
+
+@app.patch("/api/proxies/{proxy_id}")
+def api_update_proxy(request: Request, proxy_id: int, payload: ProxyUpdate) -> dict[str, Any]:
+    check_auth(request)
+    return {"proxy": proxy_update(proxy_id, payload.label, payload.enabled, payload.reset_stats)}
+
+
+@app.delete("/api/proxies/{proxy_id}")
+def api_delete_proxy(request: Request, proxy_id: int) -> dict[str, Any]:
+    check_auth(request)
+    proxy_delete(proxy_id)
+    return {"ok": True}
+
+
+# ================================================================
+# 统计 API
+# ================================================================
+
+@app.get("/api/stats/overview")
+def api_stats_overview(
+    request: Request, days: int = Query(7, ge=1, le=90)
+) -> dict[str, Any]:
+    check_auth(request)
+    return stats_overview(days)
+
+
+@app.get("/api/stats/errors")
+def api_stats_errors(
+    request: Request, days: int = Query(7, ge=1, le=90)
+) -> dict[str, Any]:
+    check_auth(request)
+    return {"items": stats_errors(days)}
+
+
+@app.get("/api/stats/by-proxy")
+def api_stats_by_proxy(request: Request) -> dict[str, Any]:
+    check_auth(request)
+    return {"items": stats_by_proxy()}
+
+
+# ================================================================
+# 账号 API（列表 / 导出）
+# ================================================================
+
+@app.get("/api/accounts")
+def api_accounts(
+    request: Request, limit: int = Query(500, ge=1, le=5000)
+) -> dict[str, Any]:
+    check_auth(request)
+    return {"items": account_list(limit)}
+
+
+@app.get("/api/accounts/export")
+def api_accounts_export(
+    request: Request,
+    fmt: str = Query("json", pattern="^(json|csv|sso)$"),
+):
+    from fastapi.responses import Response as _Response
+    check_auth(request)
+    content, media_type, filename = export_accounts(fmt)
+    return _Response(
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ================================================================
+# 实时日志 SSE（Server-Sent Events）
+# ================================================================
+
+@app.get("/api/tasks/{task_id}/stream")
+def api_task_stream(request: Request, task_id: int):
+    """SSE 实时推送 task console 日志。与老的 /logs 轮询接口并存。"""
+    from fastapi.responses import StreamingResponse
+    check_auth(request)
+    row = task_row(task_id)
+    console_path = Path(row["console_path"])
+
+    def _event_gen():
+        # 初始先把最后 200 行推回去
+        last_size = 0
+        if console_path.exists():
+            initial = read_log_lines(console_path, limit=200)
+            for line in initial:
+                yield f"data: {json.dumps({'line': line}, ensure_ascii=False)}\n\n"
+            try:
+                last_size = console_path.stat().st_size
+            except Exception:
+                last_size = 0
+        # 轮询追加（tail -f）
+        last_ping = time.time()
+        while True:
+            try:
+                if console_path.exists():
+                    size = console_path.stat().st_size
+                    if size > last_size:
+                        with console_path.open("r", encoding="utf-8", errors="replace") as f:
+                            f.seek(last_size)
+                            chunk = f.read()
+                        last_size = size
+                        for line in chunk.splitlines():
+                            yield f"data: {json.dumps({'line': line}, ensure_ascii=False)}\n\n"
+                    elif size < last_size:
+                        # 文件被截断或重建
+                        last_size = 0
+                # 每 15 秒发 ping 保持连接
+                if time.time() - last_ping >= 15:
+                    yield ": ping\n\n"
+                    last_ping = time.time()
+                time.sleep(1.0)
+                # 任务已完成，再等一会儿把尾部 flush 完后退出
+                status_row = fetch_one("SELECT status FROM tasks WHERE id = ?", (task_id,))
+                if status_row and status_row["status"] in {
+                    STATUS_COMPLETED, STATUS_PARTIAL, STATUS_FAILED, STATUS_STOPPED,
+                }:
+                    time.sleep(1.5)
+                    # 最后一次把未读内容读完
+                    if console_path.exists():
+                        size = console_path.stat().st_size
+                        if size > last_size:
+                            with console_path.open("r", encoding="utf-8", errors="replace") as f:
+                                f.seek(last_size)
+                                chunk = f.read()
+                            for line in chunk.splitlines():
+                                yield f"data: {json.dumps({'line': line}, ensure_ascii=False)}\n\n"
+                    yield f"event: done\ndata: {json.dumps({'status': status_row['status']})}\n\n"
+                    return
+            except GeneratorExit:
+                return
+            except Exception:
+                time.sleep(2.0)
+
+    return StreamingResponse(
+        _event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ================================================================
+# 生命周期（Token 续期 / 有效性检测）
+# ================================================================
+
+_lifecycle_state: dict[str, Any] = {
+    "last_check_at": "",
+    "last_refresh_at": "",
+    "last_result": "",
+    "running": False,
+}
+
+
+def _lifecycle_check_accounts() -> dict[str, Any]:
+    """简单的有效性检测：调用推送接口，确认 token sink 可用。"""
+    defaults = merged_defaults()
+    api_conf = dict(defaults.get("api") or {})
+    endpoint = str(api_conf.get("endpoint", "") or "").strip()
+    if not endpoint:
+        return {"ok": False, "message": "未配置 token sink（api.endpoint），无法检测"}
+    try:
+        response = _request_with_optional_proxy(endpoint, timeout=10)
+        ok = response.status_code in {200, 401, 403, 405}
+        return {
+            "ok": ok,
+            "message": f"HTTP {response.status_code}",
+            "endpoint": endpoint,
+        }
+    except Exception as exc:
+        return {"ok": False, "message": str(exc), "endpoint": endpoint}
+
+
+def _lifecycle_loop():
+    while True:
+        try:
+            defaults = merged_defaults()
+            enabled = bool(defaults.get("lifecycle_enabled", False))
+            hours = max(1, int(defaults.get("lifecycle_check_hours", 6) or 6))
+            if enabled:
+                _lifecycle_state["running"] = True
+                result = _lifecycle_check_accounts()
+                _lifecycle_state["last_check_at"] = now_iso()
+                _lifecycle_state["last_result"] = result.get("message", "")
+                _lifecycle_state["running"] = False
+                # 把所有账号的 last_checked_at 更新（simple，轻量）
+                execute_no_return(
+                    "UPDATE accounts SET last_checked_at = ? WHERE status = 'active'",
+                    (now_iso(),),
+                )
+                time.sleep(hours * 3600)
+            else:
+                time.sleep(60)
+        except Exception:
+            time.sleep(60)
+
+
+_lifecycle_thread = threading.Thread(target=_lifecycle_loop, daemon=True)
+
+
+@app.get("/api/lifecycle/status")
+def api_lifecycle_status(request: Request) -> dict[str, Any]:
+    check_auth(request)
+    defaults = merged_defaults()
+    return {
+        "enabled": bool(defaults.get("lifecycle_enabled", False)),
+        "check_hours": int(defaults.get("lifecycle_check_hours", 6) or 6),
+        **_lifecycle_state,
+    }
+
+
+@app.post("/api/lifecycle/check")
+def api_lifecycle_check(request: Request) -> dict[str, Any]:
+    """手动触发一次有效性检测"""
+    check_auth(request)
+    result = _lifecycle_check_accounts()
+    _lifecycle_state["last_check_at"] = now_iso()
+    _lifecycle_state["last_result"] = result.get("message", "")
+    execute_no_return(
+        "UPDATE accounts SET last_checked_at = ? WHERE status = 'active'",
+        (now_iso(),),
+    )
+    return {**result, "checked_at": now_iso()}
 
 
 if __name__ == "__main__":

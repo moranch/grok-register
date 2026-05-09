@@ -73,7 +73,7 @@ ensure_stable_python_runtime()
 warn_runtime_compatibility()
 
 # 调试模式开关（由控制台 app.py 注入）：
-#   GROK_DEBUG_MODE=1 -> 有头调试模式（启用 Xvfb，浏览器可见/可截图）
+#   GROK_DEBUG_MODE=1 -> 有头调试模式（复用容器内已经启动的 Xvfb :99，浏览器可见）
 #   GROK_DEBUG_MODE=0 -> 生产无头模式（--headless=new，最轻量）
 #   未设置时：沿用旧逻辑（自动 Xvfb 判断），保持兼容单独跑脚本的场景
 _GROK_DEBUG_MODE_ENV = os.environ.get("GROK_DEBUG_MODE")
@@ -81,13 +81,14 @@ _debug_mode_enabled = _GROK_DEBUG_MODE_ENV == "1"
 _debug_mode_disabled = _GROK_DEBUG_MODE_ENV == "0"
 
 # 虚拟显示器启动策略：
-#   - 调试模式开启 -> 必定启用 Xvfb（让浏览器能"有头"运行）
-#   - 调试模式关闭 -> 跳过 Xvfb，直接用 --headless=new
-#   - 未指定       -> 沿用旧的 DISPLAY / USE_XVFB 判断
+#   - 调试模式开启 + 已有 DISPLAY（容器里是 :99，已被 entrypoint 启动）：不再重复启 Xvfb
+#   - 调试模式开启 + 没有 DISPLAY（例如宿主直接跑）：自己起一个 Xvfb
+#   - 调试模式关闭：跳过 Xvfb，直接用 --headless=new
+#   - 未指定：沿用旧的 DISPLAY / USE_XVFB 判断
 _virtual_display = None
 _should_start_xvfb = False
 if _debug_mode_enabled:
-    _should_start_xvfb = True
+    _should_start_xvfb = not os.environ.get("DISPLAY")
 elif _debug_mode_disabled:
     _should_start_xvfb = False
 else:
@@ -101,6 +102,8 @@ if _should_start_xvfb:
         print(f"[*] Xvfb 虚拟显示器已启动: {os.environ.get('DISPLAY')} (debug_mode={_GROK_DEBUG_MODE_ENV or 'auto'})")
     except Exception as e:
         print(f"[Warn] Xvfb 启动失败: {e}，将尝试直接运行")
+elif _debug_mode_enabled and os.environ.get("DISPLAY"):
+    print(f"[*] 调试模式：复用已有 DISPLAY={os.environ.get('DISPLAY')}（noVNC 可观察）")
 
 co = ChromiumOptions()
 co.auto_port()
@@ -109,10 +112,10 @@ co.set_argument("--disable-gpu")
 co.set_argument("--disable-dev-shm-usage")
 co.set_argument("--disable-software-rasterizer")
 # headless 判定：
-#   - 调试模式开启 + Xvfb 可用  -> 不加 --headless（保留"有头"窗口，反检测更佳）
-#   - 其它情况（无 DISPLAY）    -> 加 --headless=new
+#   - 调试模式开启 + DISPLAY 可用  -> 不加 --headless（保留"有头"窗口，反检测更佳）
+#   - 其它情况（无 DISPLAY）       -> 加 --headless=new
 if _debug_mode_enabled and os.environ.get("DISPLAY"):
-    print("[*] 调试模式：使用有头浏览器（Xvfb 虚拟显示器）")
+    print("[*] 调试模式：使用有头浏览器（Xvfb 虚拟显示器 + noVNC 可观察）")
 elif not os.environ.get("DISPLAY"):
     co.set_argument("--headless=new")
     print("[*] 生产模式：使用 --headless=new")

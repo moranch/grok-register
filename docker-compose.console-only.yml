@@ -8,7 +8,7 @@ services:
       dockerfile: apps/worker-runtime/Dockerfile
     container_name: grok-console-local
     working_dir: /workspace
-    command: python /workspace/apps/console/app.py
+    entrypoint: ["/usr/local/bin/docker-entrypoint.sh"]
     environment:
       TZ: Asia/Shanghai
       GROK_REGISTER_SOURCE_DIR: /workspace
@@ -19,18 +19,16 @@ services:
       GROK_REGISTER_CONSOLE_PASSWORD: "admin123"
       GROK_REGISTER_CONSOLE_MAX_CONCURRENT_TASKS: 1
       GROK_REGISTER_DEFAULT_RUN_COUNT: 50
-      # 本地只跑 console 单容器，这里不配 warp/grok2api 网络，
-      # 健康检查会显示"代理不可达" —— 这是本地正常现象。
-      # 服务器上有完整的 warp/grok2api 容器组，通过 docker-compose.yml 的默认值即可。
-      #
-      # 如果本地要连自己的真实代理，把值填成 "socks5://host.docker.internal:xxxx" 即可。
       GROK_REGISTER_DEFAULT_PROXY: ""
       GROK_REGISTER_DEFAULT_BROWSER_PROXY: ""
       GROK_REGISTER_DEFAULT_API_ENDPOINT: ""
       GROK_REGISTER_DEFAULT_API_TOKEN: ""
       GROK_REGISTER_DEFAULT_API_APPEND: "true"
+      # 启动时拉起 Xvfb + x11vnc + noVNC
+      GROK_ENABLE_NOVNC: "1"
     ports:
       - "18600:18600"
+      - "6080:6080"
     volumes:
       - .:/workspace
     restart: unless-stopped

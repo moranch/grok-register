@@ -45,7 +45,7 @@ services:
       context: .
       dockerfile: apps/worker-runtime/Dockerfile
     working_dir: /workspace
-    command: python /workspace/apps/console/app.py
+    entrypoint: ["/usr/local/bin/docker-entrypoint.sh"]
     environment:
       TZ: Asia/Shanghai
       GROK_REGISTER_SOURCE_DIR: /workspace
@@ -60,8 +60,12 @@ services:
       GROK_REGISTER_DEFAULT_API_ENDPOINT: ${GROK_REGISTER_DEFAULT_API_ENDPOINT:-http://grok2api:8000/v1/admin/tokens}
       GROK_REGISTER_DEFAULT_API_TOKEN: ${GROK_REGISTER_DEFAULT_API_TOKEN:-change-this-admin-password}
       GROK_REGISTER_DEFAULT_API_APPEND: ${GROK_REGISTER_DEFAULT_API_APPEND:-true}
+      # 启动时拉起 Xvfb + x11vnc + noVNC；0 可禁用
+      GROK_ENABLE_NOVNC: ${GROK_ENABLE_NOVNC:-1}
     ports:
       - "${GROK_STACK_CONSOLE_PORT:-18600}:18600"
+      # noVNC Web 端（访问 http://host:6080/vnc.html 可实时看调试模式下的浏览器）
+      - "${GROK_STACK_NOVNC_PORT:-6080}:6080"
     volumes:
       - .:/workspace
     restart: unless-stopped
