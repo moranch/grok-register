@@ -1164,6 +1164,66 @@ def mailbox_report_failure(mbox_id: int) -> None:
     )
 
 
+def seed_mailbox_from_defaults(force: bool = False) -> dict[str, Any] | None:
+    """
+    首次启动时，把系统默认邮箱配置（config.json + .env + DB settings）
+    自动导入到邮箱 Provider 池里。
+      - force=False：只有池子为空时才导入
+      - force=True：不管池子多少都强制导入（用于前端"一键导入"按钮）
+    返回值：成功时返回新建的 provider dict；跳过或失败时返回 None
+    """
+    if not force:
+        existing = fetch_one("SELECT COUNT(*) AS c FROM mailbox_providers")
+        if existing and int(existing["c"]) > 0:
+            return None
+    try:
+        defaults = merged_defaults()
+    except Exception:
+        return None
+
+    api_base = str(defaults.get("temp_mail_api_base") or "").strip()
+    if not api_base:
+        return None
+
+    provider_type = str(defaults.get("temp_mail_provider") or "").strip().lower()
+    if provider_type not in {"tmail", "duckmail", "moemail", "custom"}:
+        # config.json 没明确指定类型时，按 api_base 简单启发判断
+        if "tmail" in api_base or "mail.nnioj" in api_base:
+            provider_type = "tmail"
+        else:
+            provider_type = "moemail"
+
+    admin_pw = str(defaults.get("temp_mail_admin_password") or "")
+    domain = str(defaults.get("temp_mail_domain") or "")
+    site_pw = str(defaults.get("temp_mail_site_password") or "")
+
+    # 避免 name 冲突
+    suffix = ""
+    idx = 0
+    while True:
+        candidate_name = f"default{suffix}"
+        if not fetch_one(
+            "SELECT 1 FROM mailbox_providers WHERE name = ?", (candidate_name,)
+        ):
+            break
+        idx += 1
+        suffix = f"-{idx}"
+
+    try:
+        item = MailboxItem(
+            name=candidate_name,
+            provider_type=provider_type,
+            api_base=api_base,
+            admin_password=admin_pw,
+            domain=domain,
+            site_password=site_pw,
+            enabled=True,
+        )
+        return mailbox_add(item)
+    except Exception:
+        return None
+
+
 # --------- 注册事件 / 账号 ----------
 
 def classify_error(message: str) -> str:
@@ -1783,6 +1843,11 @@ def check_auth(request: Request):
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    # 首次启动时，把系统默认邮箱配置种到邮箱 Provider 池里
+    try:
+        seed_mailbox_from_defaults(force=False)
+    except Exception:
+        pass
     supervisor.start()
     # 启动生命周期管理线程（Token 续期/有效性检测）
     if not _lifecycle_thread.is_alive():
@@ -2056,6 +2121,34 @@ def api_delete_mailbox(request: Request, mbox_id: int) -> dict[str, Any]:
     check_auth(request)
     mailbox_delete(mbox_id)
     return {"ok": True}
+
+
+@app.post("/api/mailboxes/import-default")
+def api_mailboxes_import_default(
+    request: Request, force: bool = Query(False)
+) -> dict[str, Any]:
+    """
+    把系统默认邮箱配置（config.json + .env + DB 里的 settings）
+    一键导入成一条 Provider。默认仅在池子为空时导入；
+    force=true 时不管池子多少都强制新增一条。
+    """
+    check_auth(request)
+    defaults = merged_defaults()
+    api_base = str(defaults.get("temp_mail_api_base") or "").strip()
+    if not api_base:
+        return {
+            "ok": False,
+            "message": "系统默认配置里没有 temp_mail_api_base，无法导入",
+        }
+    created = seed_mailbox_from_defaults(force=bool(force))
+    if not created:
+        # force=false 且已有 provider，不算失败
+        return {
+            "ok": True,
+            "skipped": True,
+            "message": "已存在 Provider，跳过导入；如需强制追加，使用 ?force=true",
+        }
+    return {"ok": True, "skipped": False, "mailbox": created}
 
 
 @app.post("/api/mailboxes/{mbox_id}/test")
