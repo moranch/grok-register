@@ -452,7 +452,19 @@ class KiroRegister:
         fqs=parse_qs(p.fragment.lstrip("#/?")) if p.fragment else {}
         oid=(qs.get("orchestrator_id") or fqs.get("orchestrator_id",[None]))[0]
         cb=(qs.get("callback_url") or fqs.get("callback_url",[None]))[0]
-        if not oid: self.log("  ❌ 无orchestrator_id"); return False
+        if not oid:
+            # ★ 新流程：AWS 直接把我们重定向到 signin.aws/.../login?workflowStateHandle=xxx
+            # 没经过 view.awsapps.com → portal.sso，wsh 已经在 URL 上
+            wsh_direct=qs.get("workflowStateHandle",[None])[0] or fqs.get("workflowStateHandle",[None])[0]
+            host=(p.hostname or "").lower()
+            if wsh_direct and host.endswith("signin.aws"):
+                self.log(f"  ⚡ 简化流程: 直接从 URL 拿到 wsh={wsh_direct}")
+                self.wsh=wsh_direct
+                self._login_wsh=wsh_direct
+                self._capture_cookies(r)
+                self._setup_signin_js_cookies()
+                return True
+            self.log("  ❌ 无orchestrator_id"); return False
         # ★ 保存 orchestrator_id 和 callback_url (Step 12 需要)
         self._orchestrator_id=oid
         self._callback_url=cb
