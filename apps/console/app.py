@@ -624,7 +624,21 @@ class ProxyUpdate(BaseModel):
 
 class MailboxItem(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
-    provider_type: str = Field("tmail", pattern="^(tmail|duckmail|moemail|custom)$")
+    # 对齐 any-auto-register 的 9 种邮箱 provider：
+    # - tmail        : VIP 密钥风格（/api/generate + Bearer）
+    # - duckmail     : 公共临时邮箱 mail.tm 风格（/domains + /accounts）
+    # - moemail      : cloudflare_temp_email 风格（/admin/new_address）
+    # - laoudo       : 固定自有域名（邮箱 + Account ID + JWT）
+    # - cloudflare_worker : 用户自建 Worker 邮箱（API URL + Admin Token + 域名）
+    # - freemail     : Worker 自建，管理员 Token 或用户名密码
+    # - testmail     : testmail.app namespace 模式
+    # - tempmail_lol : tempmail.lol 公共匿名邮箱（无需密钥）
+    # - duckduckgo   : DuckDuckGo Email Protection（需要 IMAP 转发邮箱）
+    # - custom       : 自定义，占位
+    provider_type: str = Field(
+        "tmail",
+        pattern="^(tmail|duckmail|moemail|laoudo|cloudflare_worker|freemail|testmail|tempmail_lol|duckduckgo|custom)$",
+    )
     api_base: str = Field(..., min_length=1)
     admin_password: str = ""
     domain: str = ""
@@ -1852,6 +1866,28 @@ async def lifespan(_: FastAPI):
     # 启动生命周期管理线程（Token 续期/有效性检测）
     if not _lifecycle_thread.is_alive():
         _lifecycle_thread.start()
+
+    # ── 多平台插件加载（新增）──────────────────────────────────────────
+    try:
+        import sys
+        console_dir = str(Path(__file__).resolve().parent)
+        if console_dir not in sys.path:
+            sys.path.insert(0, console_dir)
+        from core.registry import load_all, PLATFORM_REGISTRY, MAILBOX_REGISTRY, CAPTCHA_REGISTRY, EXPORTER_REGISTRY
+        import platforms as _platforms_pkg
+        load_all(_platforms_pkg)
+        import providers as _providers_pkg
+        load_all(_providers_pkg)
+        import exporters as _exporters_pkg
+        load_all(_exporters_pkg)
+        print(f"[OK] 多平台插件已加载: platforms={PLATFORM_REGISTRY.list_names()}, "
+              f"mailbox={MAILBOX_REGISTRY.list_names()}, "
+              f"captcha={CAPTCHA_REGISTRY.list_names()}, "
+              f"exporters={EXPORTER_REGISTRY.list_names()}")
+    except Exception as e:
+        print(f"[WARN] 多平台插件加载失败（不影响旧功能）: {e}")
+    # ── 多平台插件加载结束 ────────────────────────────────────────────
+
     try:
         yield
     finally:
@@ -1859,6 +1895,20 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Grok Register Console", lifespan=lifespan)
+
+# ── 挂载多平台新路由（新增）─────────────────────────────────────────
+try:
+    import sys as _sys
+    _console_dir = str(Path(__file__).resolve().parent)
+    if _console_dir not in _sys.path:
+        _sys.path.insert(0, _console_dir)
+    from api.platforms import router as platforms_router
+    from api.exporters import router as exporters_router
+    app.include_router(platforms_router, prefix="/api")
+    app.include_router(exporters_router, prefix="/api")
+except Exception as _e:
+    print(f"[WARN] 新路由挂载失败（不影响旧功能）: {_e}")
+# ── 新路由挂载结束 ────────────────────────────────────────────────────
 
 # 前端资源目录：
 # - 优先读取 WEBUI_DIR 环境变量（Dockerfile 中构建时注入，默认 /opt/webui，
