@@ -117,7 +117,13 @@ def check_auth(request: Request):
         return
     auth = request.headers.get("Authorization", "")
     cookie = request.cookies.get("console_password", "")
-    if auth == f"Bearer {CONSOLE_PASSWORD}" or cookie == CONSOLE_PASSWORD:
+    # SSE EventSource 不支持自定义 header，允许 query 参数认证
+    query_token = request.query_params.get("token", "")
+    if (
+        auth == f"Bearer {CONSOLE_PASSWORD}"
+        or cookie == CONSOLE_PASSWORD
+        or query_token == CONSOLE_PASSWORD
+    ):
         return
     raise HTTPException(status_code=401, detail="Unauthorized")
 
