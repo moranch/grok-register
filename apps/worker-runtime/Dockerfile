@@ -65,7 +65,14 @@ RUN pip install --no-cache-dir -r /tmp/console-requirements.txt
 # 自动探测网络环境选择最快的源：
 #   - GitHub：curl 5 秒内能通则直连，否则走 gh-proxy.com 镜像
 #   - npm：curl 3 秒内能通官方源则用官方源，否则切换到 npmmirror
+#
+# FRONTEND_REV：细粒度缓存失效开关。
+#   - 默认 "main"：Docker 第一次构建会拉最新 main，之后这一层会被缓存
+#   - 要强制重新拉前端：build 时传 --build-arg FRONTEND_REV=$(date +%s) 即可，
+#     这样只会让这一层失效，不影响 apt / pip / chrome 等上游层的缓存
+ARG FRONTEND_REV=main
 RUN set -eux; \
+    echo "===== FRONTEND_REV=$FRONTEND_REV ====="; \
     echo "===== probe GitHub ====="; \
     if curl -fsS --max-time 5 -o /dev/null https://github.com/ 2>/dev/null; then \
       GH_URL="https://github.com/moranch/grok-register-ui.git"; \
