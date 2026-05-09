@@ -53,6 +53,7 @@ class TaskSupervisor:
 
     def __init__(self) -> None:
         self._processes: dict[int, ManagedProcess] = {}
+        self._vendor_threads: dict[int, threading.Event] = {}  # task_id -> stop_event
         self._task_proxy: dict[int, str] = {}
         self._task_mailbox: dict[int, int] = {}
         self._task_log_cursor: dict[int, int] = {}
@@ -67,6 +68,17 @@ class TaskSupervisor:
         self._stop.set()
 
     def stop_task(self, task_id: int) -> None:
+        # 先检查是否是 vendor 线程任务
+        stop_event = self._vendor_threads.get(task_id)
+        if stop_event is not None:
+            stop_event.set()
+            execute_no_return(
+                "UPDATE tasks SET status = ?, last_error = ?, current_phase = ? WHERE id = ?",
+                (STATUS_STOPPING, "Stopping vendor task...", STATUS_STOPPING, task_id),
+            )
+            return
+
+        # 子进程任务（grok）
         managed = self._processes.get(task_id)
         if not managed:
             row = task_row(task_id)
@@ -314,6 +326,10 @@ class TaskSupervisor:
             (STATUS_RUNNING, now_iso(), "vendor_dispatch", task_id),
         )
 
+        # 在独立线程里跑，不阻塞 supervisor 主循环
+        stop_event = threading.Event()
+        self._vendor_threads[task_id] = stop_event
+
         def _run():
             completed = 0
             failed = 0
@@ -374,6 +390,13 @@ class TaskSupervisor:
                             instance.config.proxy = proxy_url
 
                 for round_no in range(1, target_count + 1):
+                    # 检查停止信号
+                    if stop_event.is_set():
+                        last_error = "Task stopped by user"
+                        with console_path.open("a", encoding="utf-8") as log:
+                            log.write(f"[{now_iso()}] [Stopped] 用户手动停止\n")
+                        break
+
                     execute_no_return(
                         "UPDATE tasks SET current_round = ?, current_phase = ?, last_log_at = ? WHERE id = ?",
                         (round_no, "registering", now_iso(), task_id),
@@ -442,7 +465,9 @@ class TaskSupervisor:
                     log.write(f"[{now_iso()}] [Fatal] {last_error}\n")
 
             # 最终状态
-            if completed >= target_count:
+            if stop_event.is_set():
+                final_status = STATUS_STOPPED
+            elif completed >= target_count:
                 final_status = STATUS_COMPLETED
             elif completed > 0:
                 final_status = STATUS_PARTIAL
@@ -461,6 +486,8 @@ class TaskSupervisor:
                     last_email, last_error, final_status, now_iso(), task_id,
                 ),
             )
+            # 清理
+            self._vendor_threads.pop(task_id, None)
 
         # 在独立线程里跑，不阻塞 supervisor 主循环
         t = _threading.Thread(target=_run, daemon=True, name=f"vendor-{platform_name}-{task_id}")
