@@ -128,6 +128,9 @@ def load_all(package: Any) -> None:
     for importer, module_name, is_pkg in pkgutil.walk_packages(
         pkg_path, prefix=f"{pkg_name}."
     ):
+        # 跳过 vendor 目录：上游代码可能顶层 @register，我们用适配器包装后再注册
+        if "._vendor_aar" in module_name or module_name.endswith("._vendor_aar"):
+            continue
         try:
             importlib.import_module(module_name)
         except Exception as exc:

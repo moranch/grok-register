@@ -1,19 +1,32 @@
-NOTICE - 上游项目致谢
+NOTICE - 上游项目与 vendor 说明
 
-本项目的架构设计参考了以下开源项目：
+本项目包含来自以下开源项目的源代码（vendored）：
 
-1. lxf746/any-auto-register
+1. zc-zhangchen/any-auto-register（主要 vendor 来源）
+   - URL: https://github.com/zc-zhangchen/any-auto-register
+   - License: AGPL-3.0
+   - Vendored 位置：
+     - apps/console/core/_vendor_aar/
+     - apps/console/platforms/_vendor_aar/
+   - Vendored 内容：core 基础抽象（BasePlatform / BaseCaptcha / BaseMailbox /
+     Registry / TaskRuntime / HttpClient 等）以及 chatgpt / cursor / grok /
+     kiro / openblocklabs / tavily 六个平台的注册实现代码。
+   - 修改说明：import 路径已批量重写（`from core.X` →
+     `from core._vendor_aar.X`，`from platforms.X` →
+     `from platforms._vendor_aar.X`），未改动业务逻辑。
+
+2. lxf746/any-auto-register（架构参考）
    - URL: https://github.com/lxf746/any-auto-register
    - License: AGPL-3.0
-   - 参考内容：插件化平台架构、BasePlatform 抽象设计、注册流程编排模式、
-     邮箱/验证码/代理池的加权选择算法
 
-2. zc-zhangchen/any-auto-register
-   - URL: https://github.com/zc-zhangchen/any-auto-register
-   - License: MIT
-   - 参考内容：双注册引擎（access_token_only / refresh_token）设计、
-     验证码策略四分模型（batch/browser/token/probe）、
-     Exporter 插件体系、ChatGPT 批量状态同步
+License 传染性说明：
+- vendor 的代码是 AGPL-3.0，由于本项目通过 import 调用了 vendor 模块，
+  根据 AGPL-3.0 传染条款，整个项目的分发（包括网络服务）也必须以 AGPL-3.0
+  或兼容许可证开放。
+- 本项目仓库 LICENSE 文件已声明为 AGPL-3.0。
 
-本项目未直接复制上述项目的源代码，仅参考其架构与接口设计自行实现。
-根据 Requirement 13 AC2，本项目采用独立的 MIT 许可证。
+适配层说明：
+- 我们自己的代码（apps/console/core/ 不含 _vendor_aar/、apps/console/api/、
+  apps/console/platforms/{grok,kiro,...}/plugin.py 等）通过
+  platforms/_shared/aar_adapter.py 将上游 BasePlatform.register() 的接口
+  适配到我们 BasePlatform.build_register_flow() 的接口。
