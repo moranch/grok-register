@@ -555,6 +555,27 @@ class SystemSettings(BaseModel):
     # 有效性检测间隔（小时），默认 6
     lifecycle_check_hours: int = 6
 
+    # ======== 注册策略（对齐 any-auto-register 的"注册"tab）========
+    # 每轮间隔秒数（0=无间隔，直接开下一轮）
+    round_interval_sec: int = 2
+    # 每轮最大耗时（秒），超过判定为失败（0=不限）
+    round_timeout_sec: int = 180
+    # 最大并发任务数（1=串行，默认跟随 MAX_CONCURRENT_TASKS）
+    max_concurrent_tasks: int = 1
+    # 连续失败多少次自动熔断停止任务（0=不熔断）
+    circuit_break_fail_threshold: int = 0
+
+    # ======== 验证码（对齐"验证服务"tab） ========
+    # Turnstile 远程 solver 类型：none / yescaptcha / 2captcha / local
+    captcha_provider: str = "none"
+    captcha_api_key: str = ""
+
+    # ======== 高级 ========
+    # 前端调试日志级别
+    log_level: str = "info"
+    # 是否在前端收集错误样本
+    collect_error_samples: bool = True
+
 
 class ProxyItem(BaseModel):
     url: str = Field(..., min_length=1)
@@ -654,6 +675,26 @@ def merged_defaults() -> dict[str, Any]:
         base["lifecycle_check_hours"] = int(saved.get("lifecycle_check_hours") or 6)
     else:
         base.setdefault("lifecycle_check_hours", 6)
+
+    # 注册策略 / 验证码 / 高级：白名单透传（只要 saved 里有就用，否则保留默认）
+    _PASSTHROUGH_KEYS = (
+        ("round_interval_sec", int, 2),
+        ("round_timeout_sec", int, 180),
+        ("max_concurrent_tasks", int, 1),
+        ("circuit_break_fail_threshold", int, 0),
+        ("captcha_provider", str, "none"),
+        ("captcha_api_key", str, ""),
+        ("log_level", str, "info"),
+        ("collect_error_samples", bool, True),
+    )
+    for key, cast, default in _PASSTHROUGH_KEYS:
+        if key in saved:
+            try:
+                base[key] = cast(saved.get(key) if saved.get(key) is not None else default)
+            except Exception:
+                base[key] = default
+        else:
+            base.setdefault(key, default)
     return base
 
 
@@ -1900,6 +1941,219 @@ def api_test_mailbox(request: Request, mbox_id: int) -> dict[str, Any]:
         }
     except Exception as exc:
         return {"ok": False, "message": str(exc), "checked_at": now_iso()}
+
+
+# ================================================================
+# 配置中心：系统信息 / 清理 / 导入导出
+# ================================================================
+
+@app.get("/api/system/info")
+def api_system_info(request: Request) -> dict[str, Any]:
+    """
+    系统信息（关于 tab 展示用）：
+      - 应用版本 / python 版本 / 运行目录 / 已处理事件数 / 账号总数 / 代理数 / 邮箱 provider 数
+    """
+    check_auth(request)
+    import platform
+    import sys
+
+    def _one(sql: str) -> int:
+        r = fetch_one(sql)
+        return int(r["c"]) if r else 0
+
+    # 数据库文件大小
+    db_size = 0
+    try:
+        db_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+    except Exception:
+        db_size = 0
+
+    # 任务运行目录占用（近似：只看一层）
+    tasks_size = 0
+    try:
+        if TASKS_DIR.exists():
+            for child in TASKS_DIR.rglob("*"):
+                try:
+                    if child.is_file():
+                        tasks_size += child.stat().st_size
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return {
+        "app_name": "Grok Register Console",
+        "app_version": "1.1.0",
+        "python_version": sys.version.split()[0],
+        "platform": platform.platform(),
+        "source_project": str(SOURCE_PROJECT),
+        "python_path": str(SOURCE_VENV_PYTHON),
+        "runtime_dir": str(RUNTIME_DIR),
+        "tasks_dir": str(TASKS_DIR),
+        "db_path": str(DB_PATH),
+        "db_size_bytes": db_size,
+        "tasks_size_bytes": tasks_size,
+        "auth_required": bool(CONSOLE_PASSWORD),
+        "max_concurrent_tasks": MAX_CONCURRENT_TASKS,
+        "webui_dir": str(WEBUI_DIR),
+        "counts": {
+            "tasks": _one("SELECT COUNT(*) AS c FROM tasks"),
+            "events": _one("SELECT COUNT(*) AS c FROM register_events"),
+            "accounts": _one("SELECT COUNT(*) AS c FROM accounts"),
+            "proxies": _one("SELECT COUNT(*) AS c FROM proxies"),
+            "mailboxes": _one("SELECT COUNT(*) AS c FROM mailbox_providers"),
+        },
+    }
+
+
+@app.post("/api/system/cleanup")
+def api_system_cleanup(
+    request: Request,
+    target: str = Query("events", pattern="^(events|finished_tasks|all_tasks|accounts)$"),
+    days: int = Query(30, ge=1, le=3650),
+) -> dict[str, Any]:
+    """
+    配置中心的"清理"按钮：
+      - target=events     → 删 N 天前的 register_events（默认 30 天）
+      - target=finished_tasks → 删 N 天前已完成/失败/停止的任务 + 其 console 目录
+      - target=all_tasks  → 删全部非运行中任务（高危，会清空 sso 文件）
+      - target=accounts   → 删所有账号（高危）
+    """
+    check_auth(request)
+    cutoff_date = f"DATE('now', '-{max(1, days)} days')"
+    deleted = 0
+    if target == "events":
+        before = fetch_one(
+            f"SELECT COUNT(*) AS c FROM register_events WHERE DATE(created_at) < {cutoff_date}"
+        )
+        deleted = int(before["c"]) if before else 0
+        execute_no_return(
+            f"DELETE FROM register_events WHERE DATE(created_at) < {cutoff_date}"
+        )
+    elif target == "finished_tasks":
+        rows = fetch_all(
+            f"""
+            SELECT * FROM tasks
+            WHERE status IN ('completed', 'failed', 'stopped', 'partial')
+            AND DATE(created_at) < {cutoff_date}
+            """
+        )
+        for row in rows:
+            delete_task_files(row)
+            execute_no_return(
+                "DELETE FROM tasks WHERE id = ?", (int(row["id"]),)
+            )
+            deleted += 1
+    elif target == "all_tasks":
+        rows = fetch_all(
+            "SELECT * FROM tasks WHERE status != 'running'"
+        )
+        for row in rows:
+            delete_task_files(row)
+            execute_no_return(
+                "DELETE FROM tasks WHERE id = ?", (int(row["id"]),)
+            )
+            deleted += 1
+    elif target == "accounts":
+        before = fetch_one("SELECT COUNT(*) AS c FROM accounts")
+        deleted = int(before["c"]) if before else 0
+        execute_no_return("DELETE FROM accounts")
+    return {"ok": True, "target": target, "deleted": deleted}
+
+
+@app.get("/api/system/export-config")
+def api_system_export_config(request: Request):
+    """
+    导出完整配置快照：system settings + 代理池 + 邮箱池（方便迁移到新环境）
+    """
+    from fastapi.responses import Response as _Response
+    check_auth(request)
+    payload = {
+        "exported_at": now_iso(),
+        "app_version": "1.1.0",
+        "settings": read_settings(),
+        "proxies": proxy_list(),
+        "mailboxes": mailbox_list(),
+    }
+    content = json.dumps(payload, ensure_ascii=False, indent=2)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return _Response(
+        content=content,
+        media_type="application/json; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="grok-config-{ts}.json"'
+        },
+    )
+
+
+@app.post("/api/system/import-config")
+async def api_system_import_config(request: Request) -> dict[str, Any]:
+    """
+    导入配置快照：把 export 出来的 JSON 再写回去。
+    - settings：整段覆盖
+    - proxies / mailboxes：按 URL / name 增量（已存在的跳过）
+    """
+    check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+
+    imported = {"settings": False, "proxies": 0, "mailboxes": 0}
+
+    # settings
+    raw_settings = body.get("settings") or {}
+    if isinstance(raw_settings, dict) and raw_settings:
+        try:
+            # 用 SystemSettings 兜底校验（字段名都在白名单里）
+            parsed = SystemSettings(**{
+                k: v for k, v in raw_settings.items() if k in SystemSettings.model_fields
+            })
+            write_settings(parsed)
+            imported["settings"] = True
+        except Exception:
+            pass
+
+    # proxies
+    for p in body.get("proxies") or []:
+        try:
+            if not isinstance(p, dict):
+                continue
+            existing = fetch_one("SELECT * FROM proxies WHERE url = ?", (p.get("url", ""),))
+            if existing:
+                continue
+            if p.get("url"):
+                proxy_add(
+                    p["url"], str(p.get("label") or ""), bool(p.get("enabled", True))
+                )
+                imported["proxies"] += 1
+        except Exception:
+            pass
+
+    # mailboxes
+    for m in body.get("mailboxes") or []:
+        try:
+            if not isinstance(m, dict):
+                continue
+            existing = fetch_one(
+                "SELECT * FROM mailbox_providers WHERE name = ?", (m.get("name", ""),)
+            )
+            if existing:
+                continue
+            mailbox_add(MailboxItem(
+                name=str(m.get("name") or ""),
+                provider_type=str(m.get("provider_type") or "tmail"),
+                api_base=str(m.get("api_base") or ""),
+                admin_password=str(m.get("admin_password") or ""),
+                domain=str(m.get("domain") or ""),
+                site_password=str(m.get("site_password") or ""),
+                enabled=bool(m.get("enabled", True)),
+            ))
+            imported["mailboxes"] += 1
+        except Exception:
+            pass
+
+    return {"ok": True, "imported": imported}
 
 
 # ================================================================
