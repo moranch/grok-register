@@ -1,4 +1,24 @@
-fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
-jinja2>=3.1.0
-requests[socks]>=2.32.0
+# Multi-Platform Account Registrar - Python 依赖
+# Python 3.12+
+
+# Web 框架
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+
+# 数据库
+sqlmodel==0.0.22
+
+# HTTP 客户端（协议模式注册 + Exporter 推送）
+httpx==0.28.1
+curl_cffi==0.7.4
+
+# 模板引擎（Any2API Exporter）
+jinja2==3.1.5
+
+# 浏览器自动化（可选，headed/headless 模式）
+# DrissionPage==4.1.0
+# playwright==1.49.0
+
+# 工具
+python-multipart==0.0.20

@@ -1,0 +1,19 @@
+NOTICE - 上游项目致谢
+
+本项目的架构设计参考了以下开源项目：
+
+1. lxf746/any-auto-register
+   - URL: https://github.com/lxf746/any-auto-register
+   - License: AGPL-3.0
+   - 参考内容：插件化平台架构、BasePlatform 抽象设计、注册流程编排模式、
+     邮箱/验证码/代理池的加权选择算法
+
+2. zc-zhangchen/any-auto-register
+   - URL: https://github.com/zc-zhangchen/any-auto-register
+   - License: MIT
+   - 参考内容：双注册引擎（access_token_only / refresh_token）设计、
+     验证码策略四分模型（batch/browser/token/probe）、
+     Exporter 插件体系、ChatGPT 批量状态同步
+
+本项目未直接复制上述项目的源代码，仅参考其架构与接口设计自行实现。
+根据 Requirement 13 AC2，本项目采用独立的 MIT 许可证。
