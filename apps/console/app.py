@@ -162,14 +162,24 @@ def init_db() -> None:
                 ON register_events(proxy_url);
 
             -- 账号：持久化每一次注册成功的账号（邮箱 + sso token）
+            -- 字段对齐 any-auto-register 的"账户资产"结构：
+            --   lifecycle_status: registered / trial / subscribed / expired / invalid
+            --   plan_state: free / trial / pro / team / unknown
+            --   validity_status: valid / invalid / unknown
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 email TEXT NOT NULL,
                 sso TEXT NOT NULL,
+                password TEXT NOT NULL DEFAULT '',
                 task_id INTEGER,
                 proxy_url TEXT,
                 status TEXT NOT NULL DEFAULT 'active',
+                lifecycle_status TEXT NOT NULL DEFAULT 'registered',
+                plan_state TEXT NOT NULL DEFAULT 'unknown',
+                validity_status TEXT NOT NULL DEFAULT 'unknown',
+                last_error TEXT NOT NULL DEFAULT '',
                 last_checked_at TEXT,
+                notes TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 UNIQUE(email, sso)
             );
@@ -193,6 +203,27 @@ def init_db() -> None:
             );
             """
         )
+
+        # 兼容迁移：给旧的 accounts 表补新字段（不存在时才加）
+        _existing_cols = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(accounts)").fetchall()
+        }
+        _migrations = [
+            ("password", "TEXT NOT NULL DEFAULT ''"),
+            ("lifecycle_status", "TEXT NOT NULL DEFAULT 'registered'"),
+            ("plan_state", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("validity_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("last_error", "TEXT NOT NULL DEFAULT ''"),
+            ("notes", "TEXT NOT NULL DEFAULT ''"),
+        ]
+        for col, col_type in _migrations:
+            if col not in _existing_cols:
+                try:
+                    conn.execute(f"ALTER TABLE accounts ADD COLUMN {col} {col_type}")
+                except sqlite3.OperationalError:
+                    pass
+        conn.commit()
 
 
 def load_source_defaults() -> dict[str, Any]:
@@ -1204,14 +1235,112 @@ def account_list(limit: int = 500) -> list[dict[str, Any]]:
             "id": int(r["id"]),
             "email": r["email"],
             "sso": r["sso"],
+            "password": _row_col(r, "password", ""),
             "task_id": r["task_id"],
             "proxy_url": r["proxy_url"] or "",
             "status": r["status"],
+            "lifecycle_status": _row_col(r, "lifecycle_status", "registered"),
+            "plan_state": _row_col(r, "plan_state", "unknown"),
+            "validity_status": _row_col(r, "validity_status", "unknown"),
+            "last_error": _row_col(r, "last_error", ""),
             "last_checked_at": r["last_checked_at"] or "",
+            "notes": _row_col(r, "notes", ""),
             "created_at": r["created_at"],
         }
         for r in rows
     ]
+
+
+def account_update(
+    account_id: int,
+    *,
+    lifecycle_status: str | None = None,
+    plan_state: str | None = None,
+    validity_status: str | None = None,
+    notes: str | None = None,
+    last_error: str | None = None,
+) -> dict[str, Any]:
+    row = fetch_one("SELECT * FROM accounts WHERE id = ?", (account_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="account not found")
+    fields = []
+    params: list[Any] = []
+    if lifecycle_status is not None:
+        fields.append("lifecycle_status = ?")
+        params.append(lifecycle_status)
+    if plan_state is not None:
+        fields.append("plan_state = ?")
+        params.append(plan_state)
+    if validity_status is not None:
+        fields.append("validity_status = ?")
+        params.append(validity_status)
+    if notes is not None:
+        fields.append("notes = ?")
+        params.append(notes)
+    if last_error is not None:
+        fields.append("last_error = ?")
+        params.append(last_error)
+    if not fields:
+        return account_list(1)[0] if account_list(1) else {}
+    params.append(account_id)
+    execute_no_return(
+        f"UPDATE accounts SET {', '.join(fields)}, last_checked_at = ? WHERE id = ?",
+        (*params[:-1], now_iso(), params[-1]),
+    )
+    row = fetch_one("SELECT * FROM accounts WHERE id = ?", (account_id,))
+    assert row is not None
+    return _account_row_to_dict(row)
+
+
+def account_delete(account_id: int) -> None:
+    execute_no_return("DELETE FROM accounts WHERE id = ?", (account_id,))
+
+
+def _row_col(row: sqlite3.Row, name: str, fallback: Any) -> Any:
+    try:
+        val = row[name]
+        return val if val is not None else fallback
+    except (IndexError, KeyError):
+        return fallback
+
+
+def _account_row_to_dict(r: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": int(r["id"]),
+        "email": r["email"],
+        "sso": r["sso"],
+        "password": _row_col(r, "password", ""),
+        "task_id": r["task_id"],
+        "proxy_url": r["proxy_url"] or "",
+        "status": r["status"],
+        "lifecycle_status": _row_col(r, "lifecycle_status", "registered"),
+        "plan_state": _row_col(r, "plan_state", "unknown"),
+        "validity_status": _row_col(r, "validity_status", "unknown"),
+        "last_error": _row_col(r, "last_error", ""),
+        "last_checked_at": r["last_checked_at"] or "",
+        "notes": _row_col(r, "notes", ""),
+        "created_at": r["created_at"],
+    }
+
+
+# 账号统计（资产概览）
+def account_asset_summary() -> dict[str, Any]:
+    total = fetch_one("SELECT COUNT(*) AS c FROM accounts")
+    total_c = int(total["c"]) if total else 0
+
+    def group_count(col: str) -> dict[str, int]:
+        try:
+            rows = fetch_all(f"SELECT {col} AS k, COUNT(*) AS c FROM accounts GROUP BY {col}")
+        except sqlite3.OperationalError:
+            return {}
+        return {str(r["k"] or "unknown"): int(r["c"]) for r in rows}
+
+    return {
+        "total": total_c,
+        "lifecycle_status": group_count("lifecycle_status"),
+        "plan_state": group_count("plan_state"),
+        "validity_status": group_count("validity_status"),
+    }
 
 
 # --------- 统计 ----------
@@ -1341,7 +1470,9 @@ def _harvest_log_events(task_id: int, console_path: Path, last_line_no: int, pro
 # --------- 账号 sso 文件入库 ----------
 
 def _harvest_task_accounts(task_id: int, task_dir: Path, proxy_url: str = "") -> None:
-    """扫 task 目录下的 sso/task_{id}.txt，把新的 sso 入库。"""
+    """扫 task 目录下的 sso/task_{id}.txt，把新的 sso 入库。
+    尽力匹配对应的 email：按 register_events 表里该 task 的成功事件，
+    按时间顺序跟 sso 行号对齐（近似，但实用）。"""
     sso_file = task_dir / "sso" / f"task_{task_id}.txt"
     if not sso_file.exists():
         return
@@ -1349,18 +1480,22 @@ def _harvest_task_accounts(task_id: int, task_dir: Path, proxy_url: str = "") ->
         content = sso_file.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return
-    for sso in content.splitlines():
-        sso = sso.strip()
-        if not sso:
-            continue
-        # 我们暂时不从文件里拿 email（文件里只有 sso）
-        # 直接以 sso 为主键入库，email 留空由事件表关联
+    # 拉该 task 所有成功 email（按插入顺序 = 时间顺序）
+    email_rows = fetch_all(
+        "SELECT email FROM register_events WHERE task_id = ? AND ok = 1 AND email != '' ORDER BY id ASC",
+        (task_id,),
+    )
+    emails = [r["email"] for r in email_rows if r["email"]]
+    sso_list = [s.strip() for s in content.splitlines() if s.strip()]
+    for idx, sso in enumerate(sso_list):
+        email = emails[idx] if idx < len(emails) else ""
         execute_no_return(
             """
-            INSERT OR IGNORE INTO accounts (email, sso, task_id, proxy_url, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT OR IGNORE INTO accounts
+                (email, sso, task_id, proxy_url, lifecycle_status, created_at)
+            VALUES (?, ?, ?, ?, 'registered', ?)
             """,
-            ("", sso, task_id, proxy_url, now_iso()),
+            (email, sso, task_id, proxy_url, now_iso()),
         )
 
 
@@ -1371,11 +1506,15 @@ def export_accounts(fmt: str = "json") -> tuple[str, str, str]:
     fmt = (fmt or "json").lower()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     if fmt == "csv":
-        lines = ["id,email,sso,task_id,proxy_url,status,created_at"]
+        lines = [
+            "id,email,sso,task_id,proxy_url,status,lifecycle_status,plan_state,validity_status,created_at"
+        ]
         for r in rows:
             lines.append(
                 f"{r['id']},{r['email']},{r['sso']},{r['task_id'] or ''},"
-                f"{r['proxy_url']},{r['status']},{r['created_at']}"
+                f"{r['proxy_url']},{r['status']},"
+                f"{r.get('lifecycle_status','')},{r.get('plan_state','')},"
+                f"{r.get('validity_status','')},{r['created_at']}"
             )
         return "\n".join(lines) + "\n", "text/csv; charset=utf-8", f"grok-accounts-{ts}.csv"
     if fmt == "sso":
@@ -1943,6 +2082,95 @@ def api_test_mailbox(request: Request, mbox_id: int) -> dict[str, Any]:
         return {"ok": False, "message": str(exc), "checked_at": now_iso()}
 
 
+@app.get("/api/mailboxes/{mbox_id}/domains")
+def api_mailbox_domains(request: Request, mbox_id: int) -> dict[str, Any]:
+    """
+    拉取某个邮箱 Provider 能用的域名列表（对齐 any-auto-register 的"邮箱域名"展示）。
+    - tmail / duckmail / moemail 都有 /api/domains 或 /domains 这种端点
+    - custom 类型会尝试 /api/domains
+    """
+    check_auth(request)
+    row = fetch_one("SELECT * FROM mailbox_providers WHERE id = ?", (mbox_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="mailbox provider not found")
+    base = (row["api_base"] or "").strip().rstrip("/")
+    if not base:
+        return {"ok": False, "items": [], "message": "api_base 未配置"}
+
+    # 不同 provider 的 endpoint 候选
+    candidates = [
+        f"{base}/api/domains",
+        f"{base}/domains",
+        f"{base}/api/v1/domains",
+    ]
+    headers: dict[str, str] = {}
+    admin_pw = (row["admin_password"] or "").strip()
+    if admin_pw:
+        headers["Authorization"] = f"Bearer {admin_pw}"
+        headers["x-admin-auth"] = admin_pw
+    site_pw = (row["site_password"] or "").strip()
+    if site_pw:
+        headers["x-custom-auth"] = site_pw
+
+    last_error = ""
+    for url in candidates:
+        try:
+            response = _request_with_optional_proxy(
+                url, timeout=10, headers=headers if headers else None
+            )
+            if response.status_code != 200:
+                last_error = f"{url} → HTTP {response.status_code}"
+                continue
+            try:
+                data = response.json()
+            except Exception:
+                last_error = f"{url} → 响应不是 JSON"
+                continue
+            # 兼容多种返回格式
+            items: list[str] = []
+            if isinstance(data, list):
+                for it in data:
+                    if isinstance(it, str):
+                        items.append(it)
+                    elif isinstance(it, dict):
+                        items.append(
+                            str(it.get("domain") or it.get("name") or "")
+                        )
+            elif isinstance(data, dict):
+                domains = (
+                    data.get("hydra:member")
+                    or data.get("data")
+                    or data.get("results")
+                    or data.get("domains")
+                    or []
+                )
+                if isinstance(domains, list):
+                    for it in domains:
+                        if isinstance(it, str):
+                            items.append(it)
+                        elif isinstance(it, dict):
+                            items.append(
+                                str(it.get("domain") or it.get("name") or "")
+                            )
+            items = [d.strip() for d in items if d and isinstance(d, str)]
+            if items:
+                return {
+                    "ok": True,
+                    "items": items,
+                    "endpoint": url,
+                    "checked_at": now_iso(),
+                }
+        except Exception as exc:
+            last_error = f"{url} → {exc}"
+
+    return {
+        "ok": False,
+        "items": [],
+        "message": last_error or "所有候选端点都拉取失败",
+        "checked_at": now_iso(),
+    }
+
+
 # ================================================================
 # 配置中心：系统信息 / 清理 / 导入导出
 # ================================================================
@@ -2192,6 +2420,48 @@ def api_accounts(
 ) -> dict[str, Any]:
     check_auth(request)
     return {"items": account_list(limit)}
+
+
+@app.get("/api/accounts/summary")
+def api_accounts_summary(request: Request) -> dict[str, Any]:
+    """账户资产总览：总数、生命周期 / 套餐 / 有效性分布"""
+    check_auth(request)
+    return account_asset_summary()
+
+
+class AccountUpdate(BaseModel):
+    lifecycle_status: str | None = Field(
+        None, pattern="^(registered|trial|subscribed|expired|invalid)$"
+    )
+    plan_state: str | None = Field(
+        None, pattern="^(free|trial|pro|team|unknown)$"
+    )
+    validity_status: str | None = Field(None, pattern="^(valid|invalid|unknown)$")
+    notes: str | None = None
+    last_error: str | None = None
+
+
+@app.patch("/api/accounts/{account_id}")
+def api_account_update(
+    request: Request, account_id: int, payload: AccountUpdate
+) -> dict[str, Any]:
+    check_auth(request)
+    row = account_update(
+        account_id,
+        lifecycle_status=payload.lifecycle_status,
+        plan_state=payload.plan_state,
+        validity_status=payload.validity_status,
+        notes=payload.notes,
+        last_error=payload.last_error,
+    )
+    return {"account": row}
+
+
+@app.delete("/api/accounts/{account_id}")
+def api_account_delete(request: Request, account_id: int) -> dict[str, Any]:
+    check_auth(request)
+    account_delete(account_id)
+    return {"ok": True}
 
 
 @app.get("/api/accounts/export")
