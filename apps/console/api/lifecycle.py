@@ -1,84 +1,112 @@
 """
-生命周期路由。
+生命周期路由（覆盖旧实现，等价于 app.py 原 `/api/lifecycle/*` 端点）。
 
-对应 Requirement 8 AC1-AC6：账号生命周期管理。
-- GET /status — Worker 状态
-- POST /check — 立即触发检测
-- POST /toggle — 启用/禁用 Worker
+- GET  /api/lifecycle/status
+- POST /api/lifecycle/check
+- POST /api/lifecycle/toggle    启用/禁用后台 worker
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from typing import Any
+
+from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
-router = APIRouter(prefix="/lifecycle", tags=["lifecycle"])
+from ._shared import (
+    SystemSettings,
+    check_auth,
+    execute_no_return,
+    merged_defaults,
+    now_iso,
+    read_settings,
+    write_settings,
+)
+from ._lifecycle_runtime import lifecycle_check_accounts, lifecycle_state
 
 
-# ─── 请求模型 ─────────────────────────────────────────────────────────────────
+class LifecycleToggle(BaseModel):
+    """启用/禁用生命周期 worker 的请求体。
+
+    - enabled 缺省时按当前状态反转
+    - check_hours 可选，用于同时调整巡检周期
+    """
+
+    enabled: bool | None = None
+    check_hours: int | None = None
 
 
-class ToggleRequest(BaseModel):
-    """启用/禁用 Worker 请求。"""
-    enabled: bool
-
-
-# ─── 路由 ─────────────────────────────────────────────────────────────────────
+router = APIRouter(prefix="/api/lifecycle", tags=["lifecycle"])
 
 
 @router.get("/status")
-async def get_status():
-    """获取 LifecycleWorker 状态。"""
-    from api.main_app import lifecycle_worker
-
-    if lifecycle_worker is None:
-        return {
-            "enabled": False,
-            "running": False,
-            "message": "Worker 未初始化",
-        }
-
-    state = lifecycle_worker.state
+def api_lifecycle_status(request: Request) -> dict[str, Any]:
+    check_auth(request)
+    defaults = merged_defaults()
     return {
-        "enabled": state.enabled,
-        "running": state.running,
-        "check_hours": state.check_hours,
-        "refresh_hours": state.refresh_hours,
-        "last_check_at": state.last_check_at,
-        "last_refresh_at": state.last_refresh_at,
-        "last_result": state.last_result,
-        "last_error": state.last_error,
-        "checked_count": state.checked_count,
-        "refreshed_count": state.refreshed_count,
-        "warned_count": state.warned_count,
+        "enabled": bool(defaults.get("lifecycle_enabled", False)),
+        "check_hours": int(defaults.get("lifecycle_check_hours", 6) or 6),
+        **lifecycle_state,
     }
 
 
 @router.post("/check")
-async def trigger_check():
-    """立即触发一次检测（无视周期）。"""
-    from api.main_app import lifecycle_worker
-
-    if lifecycle_worker is None:
-        raise HTTPException(status_code=503, detail="Worker 未初始化")
-
-    if lifecycle_worker.state.running:
-        raise HTTPException(status_code=409, detail="Worker 正在执行检测中，请稍后再试")
-
-    result = await lifecycle_worker.trigger_check_now()
-    return {"ok": True, "result": result}
+def api_lifecycle_check(request: Request) -> dict[str, Any]:
+    """手动触发一次有效性检测。"""
+    check_auth(request)
+    result = lifecycle_check_accounts()
+    lifecycle_state["last_check_at"] = now_iso()
+    lifecycle_state["last_result"] = result.get("message", "")
+    execute_no_return(
+        "UPDATE accounts SET last_checked_at = ? WHERE status = 'active'",
+        (now_iso(),),
+    )
+    return {**result, "checked_at": now_iso()}
 
 
 @router.post("/toggle")
-async def toggle_worker(body: ToggleRequest):
-    """启用/禁用 LifecycleWorker。"""
-    from api.main_app import lifecycle_worker
+def api_lifecycle_toggle(request: Request, payload: LifecycleToggle | None = None) -> dict[str, Any]:
+    """启用/禁用生命周期 worker（可选同时调整巡检周期）。
 
-    if lifecycle_worker is None:
-        raise HTTPException(status_code=503, detail="Worker 未初始化")
+    仅改动 `lifecycle_enabled` / `lifecycle_check_hours` 两个字段；其余系统配置保持原值，
+    避免 /api/settings 的整体覆盖语义把已配置项抹掉。
+    """
+    check_auth(request)
 
-    lifecycle_worker.state.enabled = body.enabled
+    payload = payload or LifecycleToggle()
+    defaults = merged_defaults()
+
+    # 构造完整 SystemSettings：先用当前已保存值铺底，再用 merged_defaults 兜底，
+    # 最后只覆盖 lifecycle 两个字段。
+    saved = read_settings()
+    base: dict[str, Any] = {}
+    for field, _info in SystemSettings.model_fields.items():
+        if field in saved:
+            base[field] = saved[field]
+        elif field == "api_endpoint":
+            base[field] = (defaults.get("api") or {}).get("endpoint", "") or ""
+        elif field == "api_token":
+            base[field] = (defaults.get("api") or {}).get("token", "") or ""
+        elif field == "api_append":
+            base[field] = bool((defaults.get("api") or {}).get("append", True))
+        elif field in defaults:
+            base[field] = defaults[field]
+
+    current_enabled = bool(defaults.get("lifecycle_enabled", False))
+    new_enabled = (not current_enabled) if payload.enabled is None else bool(payload.enabled)
+    base["lifecycle_enabled"] = new_enabled
+
+    if payload.check_hours is not None:
+        base["lifecycle_check_hours"] = max(1, int(payload.check_hours))
+
+    write_settings(SystemSettings(**base))
+
+    # 禁用时清空 "running" 状态显示；后台线程 ≤60s 内通过 merged_defaults 感知变更
+    if not new_enabled:
+        lifecycle_state["running"] = False
+
     return {
-        "ok": True,
-        "enabled": lifecycle_worker.state.enabled,
-        "message": f"Worker 已{'启用' if body.enabled else '禁用'}",
+        "enabled": new_enabled,
+        "check_hours": int(base.get("lifecycle_check_hours", 6) or 6),
+        "changed_at": now_iso(),
+        **lifecycle_state,
     }

@@ -1,240 +1,191 @@
 """
-注册任务路由。
+注册任务路由（覆盖旧实现，等价于 app.py 原 `/api/tasks/*` 端点）。
 
-对应 Requirement 2 AC1-AC9：注册任务管理。
-- POST /register — 创建注册任务
-- GET / — 任务列表
-- GET /{task_id} — 任务详情
-- GET /{task_id}/stream — SSE 实时日志流
-- POST /{task_id}/stop — 停止任务
-- POST /{task_id}/skip-current — 跳过当前轮
-- DELETE /{task_id} — 删除任务
+- GET    /api/tasks               列表
+- POST   /api/tasks                创建
+- GET    /api/tasks/{id}           详情
+- GET    /api/tasks/{id}/logs      轮询日志
+- POST   /api/tasks/{id}/stop      停止
+- DELETE /api/tasks/{id}           删除（未运行才允许）
+- GET    /api/tasks/{id}/stream    SSE 实时日志
 """
 from __future__ import annotations
 
-import asyncio
 import json
-from typing import Any, Dict, List, Optional
+import time
+from pathlib import Path
+from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
 
-from core.registry import PLATFORM_REGISTRY
-from core.task_runtime import TaskRuntime, TaskStatus
-from data import dao
+from ._shared import (
+    SOURCE_PROJECT,
+    SOURCE_VENV_PYTHON,
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+    STATUS_PARTIAL,
+    STATUS_QUEUED,
+    STATUS_STOPPED,
+    TASKS_DIR,
+    TaskCreate,
+    build_task_config,
+    check_auth,
+    delete_task_files,
+    execute,
+    execute_no_return,
+    fetch_all,
+    fetch_one,
+    now_iso,
+    read_log_lines,
+    serialize_task,
+    task_row,
+)
+from ._supervisor import supervisor
 
-router = APIRouter(prefix="/tasks", tags=["tasks"])
-
-# 全局 TaskRuntime 实例
-task_runtime = TaskRuntime(max_concurrent_tasks=3)
-
-
-# ─── 请求/响应模型 ────────────────────────────────────────────────────────────
-
-
-class RegisterTaskRequest(BaseModel):
-    """创建注册任务请求。"""
-    platform: str
-    count: int = Field(ge=1, le=100, default=1)
-    executor_type: str = "protocol"
-    engine_id: str = "default"
-    name: str = ""
-    config: Dict[str, Any] = {}
-    params: Dict[str, Any] = {}
-
-
-class TaskResponse(BaseModel):
-    """任务响应。"""
-    id: int
-    name: str
-    platform: str
-    status: str
-    executor_type: str
-    target_count: int
-    completed_count: int
-    success_count: int
-    failure_count: int
-    skipped_count: int
-    last_error: str
-    created_at: str
-    updated_at: str
+router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
 
-# ─── 路由 ─────────────────────────────────────────────────────────────────────
+@router.get("")
+def list_tasks(request: Request) -> dict[str, Any]:
+    check_auth(request)
+    rows = fetch_all("SELECT * FROM tasks ORDER BY id DESC")
+    return {"tasks": [serialize_task(row) for row in rows]}
 
 
-@router.post("/register")
-async def create_register_task(body: RegisterTaskRequest):
-    """创建注册任务。"""
-    # 校验平台
-    cls = PLATFORM_REGISTRY.get(body.platform)
-    if cls is None:
-        raise HTTPException(status_code=400, detail=f"平台 '{body.platform}' 未注册")
-
-    instance = cls()
-
-    # 校验 executor_type
-    if body.executor_type not in instance.supported_executors:
-        raise HTTPException(
-            status_code=400,
-            detail=f"平台 '{body.platform}' 不支持执行器 '{body.executor_type}'，可用: {instance.supported_executors}",
-        )
-
-    # 校验 engine_id
-    try:
-        instance.get_engine(body.engine_id)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    # 生成任务名称
-    task_name = body.name or f"{instance.display_name} x{body.count}"
-
-    # 保存到数据库
-    task = dao.save_task({
-        "name": task_name,
-        "platform": body.platform,
-        "status": "queued",
-        "executor_type": body.executor_type,
-        "target_count": body.count,
-        "config_json": json.dumps(body.config, ensure_ascii=False),
-        "params_json": json.dumps({
-            "engine_id": body.engine_id,
-            **body.params,
-        }, ensure_ascii=False),
-    })
-
-    # 在 TaskRuntime 中创建运行时状态
-    task_runtime.create_task(
-        task_id=str(task.id),
-        platform=body.platform,
-        engine_id=body.engine_id,
-        executor_type=body.executor_type,
-        target_count=body.count,
+@router.post("")
+def create_task(request: Request, payload: TaskCreate) -> dict[str, Any]:
+    check_auth(request)
+    if not SOURCE_PROJECT.exists():
+        raise HTTPException(status_code=500, detail=f"Source project not found: {SOURCE_PROJECT}")
+    if not SOURCE_VENV_PYTHON.exists():
+        raise HTTPException(status_code=500, detail=f"Python not found: {SOURCE_VENV_PYTHON}")
+    task_config = build_task_config(payload)
+    created_at = now_iso()
+    task_id = execute(
+        """
+        INSERT INTO tasks (
+            name, status, target_count, notes, config_json, task_dir, console_path, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload.name.strip(),
+            STATUS_QUEUED,
+            payload.count,
+            payload.notes.strip(),
+            json.dumps(task_config, ensure_ascii=False),
+            str(TASKS_DIR / "pending"),
+            str(TASKS_DIR / "pending.log"),
+            created_at,
+        ),
     )
-
-    return {"ok": True, "task_id": task.id, "name": task_name}
-
-
-@router.get("/")
-async def list_tasks(
-    platform: str = Query(default="", description="按平台过滤"),
-    status: str = Query(default="", description="按状态过滤"),
-    limit: int = Query(default=50, ge=1, le=200),
-):
-    """获取任务列表。"""
-    tasks = dao.list_tasks(platform=platform, status=status, limit=limit)
-    return [
-        {
-            "id": t.id,
-            "name": t.name,
-            "platform": t.platform,
-            "status": t.status,
-            "executor_type": t.executor_type,
-            "target_count": t.target_count,
-            "completed_count": t.completed_count,
-            "success_count": t.success_count,
-            "failure_count": t.failure_count,
-            "skipped_count": t.skipped_count,
-            "last_error": t.last_error,
-            "created_at": t.created_at,
-            "updated_at": t.updated_at,
-        }
-        for t in tasks
-    ]
+    task_dir = TASKS_DIR / f"task_{task_id}"
+    console_path = task_dir / "console.log"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    execute_no_return(
+        "UPDATE tasks SET task_dir = ?, console_path = ? WHERE id = ?",
+        (str(task_dir), str(console_path), task_id),
+    )
+    return {"task": serialize_task(task_row(task_id))}
 
 
 @router.get("/{task_id}")
-async def get_task(task_id: int):
-    """获取任务详情。"""
-    tasks = dao.list_tasks(limit=9999)
-    task = next((t for t in tasks if t.id == task_id), None)
-    if task is None:
-        raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
-
-    # 合并运行时状态
-    runtime_state = task_runtime.get_state(str(task_id))
-    runtime_info = {}
-    if runtime_state:
-        runtime_info = {
-            "runtime_status": runtime_state.status.value,
-            "runtime_success": runtime_state.success_count,
-            "runtime_failure": runtime_state.failure_count,
-        }
-
-    return {
-        "id": task.id,
-        "name": task.name,
-        "platform": task.platform,
-        "status": task.status,
-        "executor_type": task.executor_type,
-        "target_count": task.target_count,
-        "completed_count": task.completed_count,
-        "success_count": task.success_count,
-        "failure_count": task.failure_count,
-        "skipped_count": task.skipped_count,
-        "last_error": task.last_error,
-        "config_json": task.config_json,
-        "params_json": task.params_json,
-        "created_at": task.created_at,
-        "updated_at": task.updated_at,
-        **runtime_info,
-    }
+def get_task(request: Request, task_id: int) -> dict[str, Any]:
+    check_auth(request)
+    return {"task": serialize_task(task_row(task_id))}
 
 
-@router.get("/{task_id}/stream")
-async def task_stream(task_id: int, since: int = Query(default=0, ge=0)):
-    """SSE 实时日志流。"""
-    event_bus = task_runtime.get_event_bus(str(task_id))
-    if event_bus is None:
-        raise HTTPException(status_code=404, detail=f"任务 {task_id} 无活跃事件流")
-
-    async def event_generator():
-        async for event in event_bus.subscribe(since=since):
-            yield event.to_sse_string()
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+@router.get("/{task_id}/logs")
+def get_task_logs(
+    request: Request,
+    task_id: int,
+    limit: int = Query(200, ge=20, le=1000),
+) -> dict[str, Any]:
+    check_auth(request)
+    row = task_row(task_id)
+    console_path = Path(row["console_path"])
+    return {"lines": read_log_lines(console_path, limit=limit)}
 
 
 @router.post("/{task_id}/stop")
-async def stop_task(task_id: int):
-    """停止任务。"""
-    success = task_runtime.request_stop(str(task_id))
-    if not success:
-        raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在或无法停止")
-
-    dao.update_task(task_id, {"status": "stopping"})
-    return {"ok": True, "task_id": task_id, "message": "已发送停止信号"}
-
-
-@router.post("/{task_id}/skip-current")
-async def skip_current(task_id: int):
-    """跳过当前轮。"""
-    success = task_runtime.request_skip(str(task_id))
-    if not success:
-        raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在或无法跳过")
-
-    return {"ok": True, "task_id": task_id, "message": "已发送跳过信号"}
+def stop_task(request: Request, task_id: int) -> dict[str, Any]:
+    check_auth(request)
+    supervisor.stop_task(task_id)
+    return {"ok": True}
 
 
 @router.delete("/{task_id}")
-async def delete_task(task_id: int):
-    """删除任务。"""
-    # 检查任务是否在运行中
-    runtime_state = task_runtime.get_state(str(task_id))
-    if runtime_state and runtime_state.status in (TaskStatus.RUNNING, TaskStatus.STOPPING):
-        raise HTTPException(status_code=400, detail="无法删除运行中的任务，请先停止")
+def delete_task(request: Request, task_id: int) -> dict[str, Any]:
+    check_auth(request)
+    row = task_row(task_id)
+    managed = supervisor._processes.get(task_id)
+    if managed and managed.process.poll() is None:
+        raise HTTPException(status_code=409, detail="Task is still running")
+    delete_task_files(row)
+    execute_no_return("DELETE FROM tasks WHERE id = ?", (task_id,))
+    return {"ok": True}
 
-    result = dao.update_task(task_id, {"status": "deleted"})
-    if result is None:
-        raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
 
-    return {"ok": True, "task_id": task_id, "message": "任务已删除"}
+@router.get("/{task_id}/stream")
+def api_task_stream(request: Request, task_id: int):
+    """SSE 实时推送 task console 日志。与 /logs 轮询接口并存。"""
+    check_auth(request)
+    row = task_row(task_id)
+    console_path = Path(row["console_path"])
+
+    def _event_gen():
+        last_size = 0
+        if console_path.exists():
+            initial = read_log_lines(console_path, limit=200)
+            for line in initial:
+                yield f"data: {json.dumps({'line': line}, ensure_ascii=False)}\n\n"
+            try:
+                last_size = console_path.stat().st_size
+            except Exception:
+                last_size = 0
+        last_ping = time.time()
+        while True:
+            try:
+                if console_path.exists():
+                    size = console_path.stat().st_size
+                    if size > last_size:
+                        with console_path.open("r", encoding="utf-8", errors="replace") as f:
+                            f.seek(last_size)
+                            chunk = f.read()
+                        last_size = size
+                        for line in chunk.splitlines():
+                            yield f"data: {json.dumps({'line': line}, ensure_ascii=False)}\n\n"
+                    elif size < last_size:
+                        last_size = 0
+                if time.time() - last_ping >= 15:
+                    yield ": ping\n\n"
+                    last_ping = time.time()
+                time.sleep(1.0)
+                status_row = fetch_one("SELECT status FROM tasks WHERE id = ?", (task_id,))
+                if status_row and status_row["status"] in {
+                    STATUS_COMPLETED, STATUS_PARTIAL, STATUS_FAILED, STATUS_STOPPED,
+                }:
+                    time.sleep(1.5)
+                    if console_path.exists():
+                        size = console_path.stat().st_size
+                        if size > last_size:
+                            with console_path.open("r", encoding="utf-8", errors="replace") as f:
+                                f.seek(last_size)
+                                chunk = f.read()
+                            for line in chunk.splitlines():
+                                yield f"data: {json.dumps({'line': line}, ensure_ascii=False)}\n\n"
+                    yield f"event: done\ndata: {json.dumps({'status': status_row['status']})}\n\n"
+                    return
+            except GeneratorExit:
+                return
+            except Exception:
+                time.sleep(2.0)
+
+    return StreamingResponse(
+        _event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
