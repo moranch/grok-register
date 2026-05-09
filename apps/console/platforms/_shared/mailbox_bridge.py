@@ -8,8 +8,6 @@ import time
 import logging
 from typing import Set
 
-import requests
-
 from core._vendor_aar.base_mailbox import BaseMailbox, MailboxAccount
 from api._shared import fetch_all, fetch_one, execute_no_return, now_iso
 
@@ -47,11 +45,11 @@ class BridgeMailbox(BaseMailbox):
                 )
         return self._provider
 
-    def _session(self) -> requests.Session:
-        s = requests.Session()
+    def _session(self):
+        from curl_cffi.requests import Session
+        s = Session(impersonate="chrome131")
         if self.proxy:
             s.proxies = {"http": self.proxy, "https": self.proxy}
-        s.verify = False
         return s
 
     def get_email(self) -> MailboxAccount:
@@ -63,46 +61,27 @@ class BridgeMailbox(BaseMailbox):
         session = self._session()
 
         if provider_type in ("tmail", "moemail"):
-            # TMail (cloudflare_temp_email): POST /admin/new_address
+            # TMail (cloudflare_temp_email): GET /api/generate?ttl=3600
             admin_password = provider.get("admin_password", "") or ""
-            domain = provider.get("domain", "") or ""
-            payload = {}
-            if domain:
-                payload["domain"] = domain
             headers = {}
             if admin_password:
-                headers["x-admin-password"] = admin_password
+                headers["Authorization"] = f"Bearer {admin_password}"
 
-            resp = session.post(
-                f"{api_base}/admin/new_address",
-                json=payload,
+            resp = session.get(
+                f"{api_base}/api/generate",
+                params={"ttl": 3600},
                 headers=headers,
-                timeout=15,
+                timeout=20,
             )
-            if resp.status_code == 405 or resp.status_code == 404:
-                # 备选路径：有些版本用 /api/generate
-                resp = session.post(
-                    f"{api_base}/api/generate",
-                    json=payload,
-                    headers=headers,
-                    timeout=15,
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"TMail 邮箱创建失败: {resp.status_code} - {resp.text[:200]}"
                 )
-            resp.raise_for_status()
             data = resp.json()
-            email = (
-                data.get("email")
-                or data.get("data", {}).get("email", "")
-                or data.get("address", "")
-            )
-            account_id = str(
-                data.get("id")
-                or data.get("data", {}).get("id", "")
-                or data.get("jwt", "")
-                or ""
-            )
+            email = data.get("email", "")
             if not email:
-                raise RuntimeError(f"TMail 邮箱创建返回无 email: {data}")
-            return MailboxAccount(email=email, account_id=account_id, extra={
+                raise RuntimeError(f"TMail 创建邮箱未返回 email: {data}")
+            return MailboxAccount(email=email, account_id=admin_password, extra={
                 "provider_id": provider["id"],
                 "api_base": api_base,
                 "provider_type": provider_type,
@@ -193,26 +172,33 @@ class BridgeMailbox(BaseMailbox):
 
         while time.time() < deadline:
             try:
+                headers = {}
+                admin_pw = extra.get("admin_password", "")
+                if admin_pw:
+                    headers["Authorization"] = f"Bearer {admin_pw}"
+
                 resp = session.get(
-                    f"{api_base}/api/emails?address={account.email}",
+                    f"{api_base}/api/fetch",
+                    params={"email": account.email},
+                    headers=headers,
                     timeout=10,
                 )
-                resp.raise_for_status()
-                raw = resp.json()
-                items = raw if isinstance(raw, list) else raw.get("data", [])
+                if resp.status_code == 200:
+                    raw = resp.json()
+                    items = raw if isinstance(raw, list) else raw.get("data", [])
 
-                for item in items:
-                    mail_id = str(item.get("id", ""))
-                    if mail_id in before_ids:
-                        continue
-                    subject = item.get("subject", "")
-                    body = item.get("text", "") or item.get("body", "") or ""
-                    content = f"{subject} {body}"
-                    if keyword and keyword.lower() not in content.lower():
-                        continue
-                    m = pattern.search(content)
-                    if m:
-                        return m.group(1)
+                    for item in items:
+                        mail_id = str(item.get("id", ""))
+                        if mail_id in before_ids:
+                            continue
+                        subject = item.get("subject", "")
+                        body = item.get("text", "") or item.get("body", "") or ""
+                        content = f"{subject} {body}"
+                        if keyword and keyword.lower() not in content.lower():
+                            continue
+                        m = pattern.search(content)
+                        if m:
+                            return m.group(1)
             except Exception as e:
                 logger.debug(f"轮询邮件失败: {e}")
 
