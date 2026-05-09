@@ -12,6 +12,7 @@ sqlmodel==0.0.22
 # HTTP 客户端（协议模式注册 + Exporter 推送）
 httpx==0.28.1
 curl_cffi>=0.15.0
+requests>=2.31.0
 
 # 模板引擎（Any2API Exporter）
 jinja2==3.1.5
@@ -22,3 +23,19 @@ jinja2==3.1.5
 
 # 工具
 python-multipart==0.0.20
+
+# ===== vendor 平台依赖（lxf746/any-auto-register） =====
+# kiro / AWS Builder ID 协议模式注册需要 (CBOR + JWS/JWK)
+cbor2>=5.4.0
+jwcrypto>=1.5.0
+
+# vendor core / 平台异步 IO
+aiofiles>=23.0.0
+
+# cursor / trae / windsurf 浏览器自动化
+patchright>=1.0.0
+# camoufox 可选（cursor 反指纹），体积大，按需手动装
+# camoufox>=0.4.0
+
+# vendor UI/CLI 工具（部分平台日志/进度条使用）
+rich>=13.0.0
