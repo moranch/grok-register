@@ -390,7 +390,7 @@ class TaskSupervisor:
                     )
                     # 注入我们的邮箱桥接
                     from platforms._shared.mailbox_bridge import BridgeMailbox
-                    mailbox = BridgeMailbox(proxy=proxy_url)
+                    mailbox = BridgeMailbox(proxy=proxy_url, stop_event=stop_event)
                     instance = vendor_cls(config=config, mailbox=mailbox)
                 else:
                     # fallback: 用我们的 wrapper（可能报 RegistrationContext 错误）

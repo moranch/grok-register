@@ -32,9 +32,12 @@ def _pick_mailbox_provider() -> dict | None:
 class BridgeMailbox(BaseMailbox):
     """用我们系统的邮箱 provider 实现上游 BaseMailbox 接口。"""
 
-    def __init__(self, proxy: str = ""):
+    def __init__(self, proxy: str = "", stop_event=None):
         self.proxy = proxy
         self._provider: dict | None = None
+        # stop_event (threading.Event) 由 supervisor 注入，让 wait_for_code
+        # 能在用户手动停止任务时立刻醒过来，而不是等满 120 秒。
+        self._stop_event = stop_event
 
     def _get_provider(self) -> dict:
         if self._provider is None:
@@ -187,6 +190,9 @@ class BridgeMailbox(BaseMailbox):
         deadline = time.time() + timeout
 
         while time.time() < deadline:
+            # 用户手动停止：立刻抛异常让 worker 退出，不再等 120s
+            if self._stop_event is not None and self._stop_event.is_set():
+                raise RuntimeError("Task stopped by user")
             try:
                 resp = session.get(
                     f"{api_base}/api/fetch",
@@ -224,6 +230,11 @@ class BridgeMailbox(BaseMailbox):
             except Exception as e:
                 logger.debug(f"轮询 TMail 邮件失败: {e}")
 
-            time.sleep(3)
+            # 用 event.wait 代替 time.sleep —— stop_event 被 set 时立刻醒
+            if self._stop_event is not None:
+                if self._stop_event.wait(timeout=3):
+                    raise RuntimeError("Task stopped by user")
+            else:
+                time.sleep(3)
 
         raise TimeoutError(f"等待验证码超时 ({timeout}s)，邮箱: {account.email}")
