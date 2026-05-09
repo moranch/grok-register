@@ -349,9 +349,16 @@ class TaskSupervisor:
                 if vendor_cls is not None:
                     from core._vendor_aar.base_platform import RegisterConfig
                     proxy_url = task_config.get("proxy", "") or task_config.get("browser_proxy", "")
+
+                    # 确定执行器类型：优先 protocol，如果 vendor 不支持则用 headless
+                    executor_type = "protocol"
+                    vendor_supported = getattr(vendor_cls, "supported_executors", []) or []
+                    if vendor_supported and executor_type not in vendor_supported:
+                        executor_type = "headless" if "headless" in vendor_supported else (vendor_supported[0] if vendor_supported else "headless")
+
                     config = RegisterConfig(
                         proxy=proxy_url,
-                        executor_type="protocol",
+                        executor_type=executor_type,
                         extra={},
                     )
                     # 注入我们的邮箱桥接
