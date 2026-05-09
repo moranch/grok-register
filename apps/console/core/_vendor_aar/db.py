@@ -23,6 +23,7 @@ engine = create_engine(DATABASE_URL)
 
 
 class AccountModel(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "accounts"
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -35,6 +36,7 @@ class AccountModel(SQLModel, table=True):
 
 
 class AccountOverviewModel(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "account_overviews"
 
     account_id: int = Field(primary_key=True, foreign_key="accounts.id")
@@ -57,6 +59,7 @@ class AccountOverviewModel(SQLModel, table=True):
 
 
 class AccountCredentialModel(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "account_credentials"
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -80,6 +83,7 @@ class AccountCredentialModel(SQLModel, table=True):
 
 
 class ProviderAccountModel(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "provider_accounts"
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -107,6 +111,7 @@ class ProviderAccountModel(SQLModel, table=True):
 
 
 class ProviderResourceModel(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "provider_resources"
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -129,6 +134,7 @@ class ProviderResourceModel(SQLModel, table=True):
 
 
 class ProviderDefinitionModel(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "provider_definitions"
     __table_args__ = (
         UniqueConstraint("provider_type", "provider_key", name="uq_provider_definitions_type_key"),
@@ -170,6 +176,7 @@ class ProviderDefinitionModel(SQLModel, table=True):
 
 
 class ProviderSettingModel(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "provider_settings"
     __table_args__ = (
         UniqueConstraint("provider_type", "provider_key", name="uq_provider_settings_type_key"),
@@ -208,6 +215,7 @@ class ProviderSettingModel(SQLModel, table=True):
 
 
 class PlatformCapabilityOverrideModel(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "platform_capability_overrides"
     __table_args__ = (
         UniqueConstraint("platform_name", name="uq_platform_capability_overrides_platform"),
@@ -227,6 +235,7 @@ class PlatformCapabilityOverrideModel(SQLModel, table=True):
 
 
 class TaskLog(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "task_logs"
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -239,6 +248,7 @@ class TaskLog(SQLModel, table=True):
 
 
 class TaskModel(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "tasks"
 
     id: str = Field(primary_key=True)
@@ -271,6 +281,7 @@ class TaskModel(SQLModel, table=True):
 
 
 class TaskEventModel(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "task_events"
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -289,6 +300,7 @@ class TaskEventModel(SQLModel, table=True):
 
 
 class ProxyModel(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "proxies"
 
     id: Optional[int] = Field(default=None, primary_key=True)
