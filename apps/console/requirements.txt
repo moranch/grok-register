@@ -1,41 +1,46 @@
 # Multi-Platform Account Registrar - Python 依赖
 # Python 3.12+
 
-# Web 框架
+# ===== Web 框架 =====
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 pydantic==2.10.4
+# starlette 是 fastapi 的传递依赖，vendor auth.py 直接引用，显式声明
+starlette>=0.40.0
 
-# 数据库
+# ===== 数据库 =====
 sqlmodel==0.0.22
+# sqlalchemy 由 sqlmodel 锁定版本，vendor 直接引用，显式声明
+SQLAlchemy>=2.0.0,<2.1.0
 
-# HTTP 客户端（协议模式注册 + Exporter 推送）
+# ===== HTTP 客户端 =====
 httpx==0.28.1
 curl_cffi>=0.15.0
 requests>=2.31.0
+# urllib3 是 requests 传递依赖，vendor tls.py 直接引用
+urllib3>=2.0.0
 
-# 模板引擎（Any2API Exporter）
+# ===== 模板引擎 =====
 jinja2==3.1.5
 
-# 浏览器自动化（可选，headed/headless 模式）
-# DrissionPage==4.1.0
-# playwright==1.49.0
-
-# 工具
+# ===== 表单/文件上传 =====
 python-multipart==0.0.20
 
 # ===== vendor 平台依赖（lxf746/any-auto-register） =====
-# kiro / AWS Builder ID 协议模式注册需要 (CBOR + JWS/JWK)
+# kiro / AWS Builder ID 协议模式注册 (CBOR + JWS/JWK)
 cbor2>=5.4.0
 jwcrypto>=1.5.0
 
-# vendor core / 平台异步 IO
+# 异步文件 IO
 aiofiles>=23.0.0
 
-# cursor / trae / windsurf 浏览器自动化
+# ===== 浏览器自动化 =====
+# 9 个平台的 browser_register.py 顶层 import camoufox，必须装
+camoufox>=0.4.0
+# playwright 执行器（headless/headed 模式）
+playwright>=1.43.0
+# patchright（playwright 的 stealth fork，部分平台反检测）
 patchright>=1.0.0
-# camoufox 可选（cursor 反指纹），体积大，按需手动装
-# camoufox>=0.4.0
 
-# vendor UI/CLI 工具（部分平台日志/进度条使用）
+# ===== 日志/进度条 =====
 rich>=13.0.0
