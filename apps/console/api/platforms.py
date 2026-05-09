@@ -38,6 +38,7 @@ class PlatformSummary(BaseModel):
     supported_executors: List[str]
     engine_count: int
     enabled: bool
+    register_engines: List[Dict[str, Any]] = []
 
 
 class PlatformConfigUpdate(BaseModel):
@@ -111,6 +112,16 @@ async def list_platforms():
             supported_executors=list(instance.supported_executors),
             engine_count=len(instance.get_register_engines()),
             enabled=_is_platform_enabled(instance.name),
+            register_engines=[
+                {
+                    "id": e.id,
+                    "display_name": e.display_name,
+                    "description": getattr(e, "description", ""),
+                    "is_recommended": getattr(e, "is_recommended", False),
+                    "is_deprecated": getattr(e, "is_deprecated", False),
+                }
+                for e in instance.get_register_engines()
+            ],
         ))
     return results
 
