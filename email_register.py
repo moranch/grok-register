@@ -187,49 +187,68 @@ def _extract_duckmail_domain_name(item: Dict[str, Any]) -> str:
 
 
 def _resolve_duckmail_domain(session, use_cffi, api_base: str) -> str:
+    """
+    解析 DuckMail / MoeMail 应使用的域名：
+      1. 用户显式填了 temp_mail_domain → 直接用
+      2. 否则尝试调 /domains 接口拿列表；拿到就挑一个可用的
+      3. 拿不到（接口不开放 / 无权限 / 返回空）→ 返回空字符串，
+         让上层用"只填 local part，由服务端随机分配域名"的方式兜底
+    """
     if TEMP_MAIL_DOMAIN:
         return TEMP_MAIL_DOMAIN
 
-    headers = _build_duckmail_headers(TEMP_MAIL_ADMIN_PASSWORD)
-    res = _do_request(
-        session,
-        use_cffi,
-        "get",
-        f"{api_base}/domains",
-        params={"page": 1},
-        headers=headers,
-        timeout=20,
-    )
-    if res.status_code != 200:
-        raise Exception(f"获取 DuckMail 域名失败: {res.status_code} - {res.text[:200]}")
+    try:
+        headers = _build_duckmail_headers(TEMP_MAIL_ADMIN_PASSWORD)
+        res = _do_request(
+            session,
+            use_cffi,
+            "get",
+            f"{api_base}/domains",
+            params={"page": 1},
+            headers=headers,
+            timeout=20,
+        )
+        if res.status_code != 200:
+            print(
+                f"[Warn] 获取 DuckMail 域名接口返回 {res.status_code}，"
+                f"将交给服务端随机分配域名"
+            )
+            return ""
 
-    data = res.json()
-    if not isinstance(data, dict):
-        raise Exception("DuckMail 域名接口返回格式异常")
+        data = res.json()
+        if not isinstance(data, dict):
+            print("[Warn] DuckMail 域名接口返回非 JSON，交给服务端随机分配")
+            return ""
 
-    domains = data.get("hydra:member") or data.get("data") or data.get("results") or []
-    if not isinstance(domains, list) or not domains:
-        raise Exception("DuckMail 域名列表为空，请在配置里显式填写 temp_mail_domain")
+        domains = data.get("hydra:member") or data.get("data") or data.get("results") or []
+        if not isinstance(domains, list) or not domains:
+            print("[Warn] DuckMail 域名列表为空，交给服务端随机分配")
+            return ""
 
-    public_verified: List[str] = []
-    verified: List[str] = []
-    fallback: List[str] = []
-    for item in domains:
-        if not isinstance(item, dict):
-            continue
-        domain = _extract_duckmail_domain_name(item)
-        if not domain:
-            continue
-        fallback.append(domain)
-        if item.get("isVerified") is True:
-            verified.append(domain)
-            if item.get("isPublic") is True or item.get("ownerId") in (None, "", 0):
-                public_verified.append(domain)
+        public_verified: List[str] = []
+        verified: List[str] = []
+        fallback: List[str] = []
+        for item in domains:
+            if not isinstance(item, dict):
+                continue
+            domain = _extract_duckmail_domain_name(item)
+            if not domain:
+                continue
+            fallback.append(domain)
+            if item.get("isVerified") is True:
+                verified.append(domain)
+                if item.get("isPublic") is True or item.get("ownerId") in (None, "", 0):
+                    public_verified.append(domain)
 
-    for candidates in (public_verified, verified, fallback):
-        if candidates:
-            return candidates[0]
-    raise Exception("DuckMail 域名列表里没有可用域名，请在配置里显式填写 temp_mail_domain")
+        for candidates in (public_verified, verified, fallback):
+            if candidates:
+                return candidates[0]
+
+        print("[Warn] DuckMail 域名列表里没有可用域名，交给服务端随机分配")
+        return ""
+    except Exception as exc:
+        print(f"[Warn] 拉取 DuckMail 域名列表异常（{exc}），交给服务端随机分配")
+        return ""
 
 
 def _create_duckmail_email() -> Tuple[str, str, str]:
@@ -239,25 +258,65 @@ def _create_duckmail_email() -> Tuple[str, str, str]:
     create_headers = _build_duckmail_headers(TEMP_MAIL_ADMIN_PASSWORD)
     last_error = ""
 
+    # domain 为空时（服务端接口不开放或 VIP 专属），走"服务端随机分配"分支：
+    #   - 不填 address 字段 / 只填 local part，由服务端返回完整邮箱
+    server_side_random = not domain
+    if server_side_random:
+        print("[*] 将由服务端随机分配邮箱域名")
+
     for _ in range(5):
         email_local = _generate_local_part(random.randint(8, 12))
-        email = f"{email_local}@{domain}"
         password = _generate_mail_password()
+
+        if server_side_random:
+            # 多数 cloudflare_temp_email 风格的服务允许这两种提交方式：
+            #   - 完全不传 address（或传空）：由服务端生成完整邮箱
+            #   - 只传 local part（不带 @）：由服务端补 domain
+            # 这里用"只传 local part"做更通用的兜底
+            payload = {
+                "address": email_local,
+                "password": password,
+                "expiresIn": 86400,
+            }
+        else:
+            email = f"{email_local}@{domain}"
+            payload = {
+                "address": email,
+                "password": password,
+                "expiresIn": 86400,
+            }
 
         res = _do_request(
             session,
             use_cffi,
             "post",
             f"{api_base}/accounts",
-            json={
-                "address": email,
-                "password": password,
-                "expiresIn": 86400,
-            },
+            json=payload,
             headers=create_headers,
             timeout=20,
         )
         if res.status_code in {200, 201}:
+            try:
+                created = res.json()
+            except Exception:
+                created = {}
+            # 如果服务端在响应里回了实际邮箱，用它；否则用我们自己拼的
+            server_email = ""
+            if isinstance(created, dict):
+                server_email = str(
+                    created.get("address")
+                    or created.get("email")
+                    or created.get("account")
+                    or ""
+                ).strip()
+            email = server_email or (
+                f"{email_local}@{domain}" if domain else email_local
+            )
+            if "@" not in email:
+                # 实在拿不到完整邮箱 —— 用 last_error 标记并重试下一轮
+                last_error = f"200 OK 但返回里没有完整邮箱地址: {created}"
+                continue
+
             auth_res = _do_request(
                 session,
                 use_cffi,
@@ -402,8 +461,8 @@ def create_temp_email() -> Tuple[str, str, str]:
 
     if not TEMP_MAIL_ADMIN_PASSWORD:
         raise Exception("temp_mail_admin_password 未设置，无法创建临时邮箱")
-    if not TEMP_MAIL_DOMAIN:
-        raise Exception("temp_mail_domain 未设置，无法创建临时邮箱")
+    # temp_mail_domain 不再强制必填：留空时由服务端随机分配
+    # （适用于接口不开放 /domains 或域名列表为 VIP 专属的场景）
 
     api_base = TEMP_MAIL_API_BASE.rstrip("/")
     email_local = _generate_local_part(random.randint(8, 12))
@@ -411,16 +470,22 @@ def create_temp_email() -> Tuple[str, str, str]:
     headers = _build_headers({"x-admin-auth": TEMP_MAIL_ADMIN_PASSWORD})
 
     try:
+        # domain 字段：有值就带上，空就不带，让服务端生成
+        payload: Dict[str, Any] = {
+            "name": email_local,
+            "enablePrefix": False,
+        }
+        if TEMP_MAIL_DOMAIN:
+            payload["domain"] = TEMP_MAIL_DOMAIN
+        else:
+            print("[*] 未指定 temp_mail_domain，交给邮箱服务端随机分配域名")
+
         res = _do_request(
             session,
             use_cffi,
             "post",
             f"{api_base}/admin/new_address",
-            json={
-                "name": email_local,
-                "domain": TEMP_MAIL_DOMAIN,
-                "enablePrefix": False,
-            },
+            json=payload,
             headers=headers,
             timeout=20,
         )
