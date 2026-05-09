@@ -92,6 +92,17 @@ class TaskSupervisor:
                     (STATUS_STOPPED, now_iso(), "Task stopped before launch.", task_id),
                 )
                 return
+            # 如果数据库是 running 但内存里没有（孤儿任务，比如 restart 后），直接标 stopped
+            if row["status"] == STATUS_RUNNING:
+                execute_no_return(
+                    """
+                    UPDATE tasks
+                    SET status = ?, finished_at = ?, last_error = ?, current_phase = ?
+                    WHERE id = ?
+                    """,
+                    (STATUS_STOPPED, now_iso(), "Task stopped (orphan after restart).", STATUS_STOPPED, task_id),
+                )
+                return
             raise HTTPException(status_code=409, detail="Task is not running")
         execute_no_return(
             "UPDATE tasks SET status = ?, last_error = ?, current_phase = ? WHERE id = ?",
