@@ -400,6 +400,19 @@ class TaskSupervisor:
                         if hasattr(instance.config, "proxy"):
                             instance.config.proxy = proxy_url
 
+                # 把 vendor 的 self.log(...) 重定向到 console_path
+                def _append_log(msg: str, _cp=console_path):
+                    try:
+                        with _cp.open("a", encoding="utf-8") as _lf:
+                            _lf.write(f"[{now_iso()}] {msg}\n")
+                    except Exception:
+                        pass
+                if hasattr(instance, "set_logger"):
+                    try:
+                        instance.set_logger(_append_log)
+                    except Exception:
+                        pass
+
                 for round_no in range(1, target_count + 1):
                     # 检查停止信号
                     if stop_event.is_set():
