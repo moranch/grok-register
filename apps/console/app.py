@@ -189,6 +189,12 @@ def load_source_defaults() -> dict[str, Any]:
     if append_env is not None:
         api_base["append"] = append_env.strip().lower() in {"1", "true", "yes", "on"}
     base["api"] = api_base
+
+    # 调试模式：默认关闭
+    base.setdefault("debug_mode", False)
+    debug_env = os.getenv("GROK_REGISTER_DEFAULT_DEBUG_MODE")
+    if debug_env is not None:
+        base["debug_mode"] = debug_env.strip().lower() in {"1", "true", "yes", "on"}
     return base
 
 
@@ -461,6 +467,9 @@ class TaskCreate(BaseModel):
     api_endpoint: str | None = None
     api_token: str | None = None
     api_append: bool | None = None
+    # 调试模式：True=浏览器以"有头"方式跑（Xvfb 虚拟显示器）；False=完全无头
+    # 单任务可覆盖系统默认
+    debug_mode: bool | None = None
     notes: str = ""
 
 
@@ -474,6 +483,8 @@ class SystemSettings(BaseModel):
     api_endpoint: str = ""
     api_token: str = ""
     api_append: bool = True
+    # 调试模式：默认关闭（生产场景用无头），开启后每个任务都会以"有头"方式跑
+    debug_mode: bool = False
 
 
 @dataclass
@@ -525,6 +536,8 @@ def merged_defaults() -> dict[str, Any]:
     if "api_append" in saved:
         api_base["append"] = bool(saved.get("api_append", True))
     base["api"] = api_base
+    if "debug_mode" in saved:
+        base["debug_mode"] = bool(saved.get("debug_mode", False))
     return base
 
 
@@ -544,6 +557,8 @@ def build_task_config(payload: TaskCreate) -> dict[str, Any]:
             "token": api_defaults.get("token", "") if payload.api_token is None else payload.api_token.strip(),
             "append": api_defaults.get("append", True) if payload.api_append is None else bool(payload.api_append),
         },
+        # 调试模式：单任务可覆盖；未传则沿用系统默认（defaults.debug_mode）
+        "debug_mode": bool(defaults.get("debug_mode", False)) if payload.debug_mode is None else bool(payload.debug_mode),
     }
 
 
@@ -751,6 +766,12 @@ class TaskSupervisor:
             str(output_path),
         ]
         log_handle = console_path.open("a", encoding="utf-8")
+        # 构造子进程环境变量
+        # - GROK_DEBUG_MODE=1 时：强制开启 Xvfb 虚拟显示器 + 不加 --headless（"有头"调试模式）
+        # - GROK_DEBUG_MODE=0 时：强制走 --headless=new（生产默认，无头运行）
+        task_env = os.environ.copy()
+        debug_mode = bool(task_config.get("debug_mode", False))
+        task_env["GROK_DEBUG_MODE"] = "1" if debug_mode else "0"
         process = subprocess.Popen(
             command,
             cwd=task_dir,
@@ -758,6 +779,7 @@ class TaskSupervisor:
             stderr=subprocess.STDOUT,
             start_new_session=True,
             text=True,
+            env=task_env,
         )
         self._processes[task_id] = ManagedProcess(task_id=task_id, process=process, log_handle=log_handle)
         execute_no_return(

@@ -72,14 +72,33 @@ def warn_runtime_compatibility():
 ensure_stable_python_runtime()
 warn_runtime_compatibility()
 
-# 无头服务器自动启用 Xvfb 虚拟显示器
+# 调试模式开关（由控制台 app.py 注入）：
+#   GROK_DEBUG_MODE=1 -> 有头调试模式（启用 Xvfb，浏览器可见/可截图）
+#   GROK_DEBUG_MODE=0 -> 生产无头模式（--headless=new，最轻量）
+#   未设置时：沿用旧逻辑（自动 Xvfb 判断），保持兼容单独跑脚本的场景
+_GROK_DEBUG_MODE_ENV = os.environ.get("GROK_DEBUG_MODE")
+_debug_mode_enabled = _GROK_DEBUG_MODE_ENV == "1"
+_debug_mode_disabled = _GROK_DEBUG_MODE_ENV == "0"
+
+# 虚拟显示器启动策略：
+#   - 调试模式开启 -> 必定启用 Xvfb（让浏览器能"有头"运行）
+#   - 调试模式关闭 -> 跳过 Xvfb，直接用 --headless=new
+#   - 未指定       -> 沿用旧的 DISPLAY / USE_XVFB 判断
 _virtual_display = None
-if not os.environ.get("DISPLAY") or os.environ.get("USE_XVFB") == "1":
+_should_start_xvfb = False
+if _debug_mode_enabled:
+    _should_start_xvfb = True
+elif _debug_mode_disabled:
+    _should_start_xvfb = False
+else:
+    _should_start_xvfb = not os.environ.get("DISPLAY") or os.environ.get("USE_XVFB") == "1"
+
+if _should_start_xvfb:
     try:
         from pyvirtualdisplay import Display
         _virtual_display = Display(visible=0, size=(1920, 1080))
         _virtual_display.start()
-        print(f"[*] Xvfb 虚拟显示器已启动: {os.environ.get('DISPLAY')}")
+        print(f"[*] Xvfb 虚拟显示器已启动: {os.environ.get('DISPLAY')} (debug_mode={_GROK_DEBUG_MODE_ENV or 'auto'})")
     except Exception as e:
         print(f"[Warn] Xvfb 启动失败: {e}，将尝试直接运行")
 
@@ -89,8 +108,14 @@ co.set_argument("--no-sandbox")
 co.set_argument("--disable-gpu")
 co.set_argument("--disable-dev-shm-usage")
 co.set_argument("--disable-software-rasterizer")
-if not os.environ.get("DISPLAY"):
+# headless 判定：
+#   - 调试模式开启 + Xvfb 可用  -> 不加 --headless（保留"有头"窗口，反检测更佳）
+#   - 其它情况（无 DISPLAY）    -> 加 --headless=new
+if _debug_mode_enabled and os.environ.get("DISPLAY"):
+    print("[*] 调试模式：使用有头浏览器（Xvfb 虚拟显示器）")
+elif not os.environ.get("DISPLAY"):
     co.set_argument("--headless=new")
+    print("[*] 生产模式：使用 --headless=new")
 
 # 从 config.json 读取代理配置给浏览器
 _browser_proxy = ""
