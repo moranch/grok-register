@@ -1400,12 +1400,15 @@ def _account_row_to_dict(r: sqlite3.Row) -> dict[str, Any]:
         "task_id": r["task_id"],
         "proxy_url": r["proxy_url"] or "",
         "status": r["status"],
+        "platform": _row_col(r, "platform", "grok"),
         "lifecycle_status": _row_col(r, "lifecycle_status", "registered"),
         "plan_state": _row_col(r, "plan_state", "unknown"),
         "validity_status": _row_col(r, "validity_status", "unknown"),
         "last_error": _row_col(r, "last_error", ""),
         "last_checked_at": r["last_checked_at"] or "",
         "notes": _row_col(r, "notes", ""),
+        "extra_json": _row_col(r, "extra_json", "{}"),
+        "exporter_status_json": _row_col(r, "exporter_status_json", "{}"),
         "created_at": r["created_at"],
     }
 
