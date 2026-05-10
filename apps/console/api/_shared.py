@@ -1391,7 +1391,24 @@ def _row_col(row: sqlite3.Row, name: str, fallback: Any) -> Any:
         return fallback
 
 
+def _derive_display_status(lifecycle: str, validity: str, plan: str) -> str:
+    """对齐 vendor core._vendor_aar.account_graph._derive_display_status：
+    把 lifecycle/validity/plan 综合成一个前端展示用状态。"""
+    if validity == "invalid":
+        return "invalid"
+    if plan == "expired" or lifecycle == "expired":
+        return "expired"
+    if plan == "subscribed":
+        return "subscribed"
+    if plan == "trial":
+        return "trial"
+    return lifecycle or "registered"
+
+
 def _account_row_to_dict(r: sqlite3.Row) -> dict[str, Any]:
+    lifecycle = _row_col(r, "lifecycle_status", "registered")
+    plan = _row_col(r, "plan_state", "unknown")
+    validity = _row_col(r, "validity_status", "unknown")
     return {
         "id": int(r["id"]),
         "email": r["email"],
@@ -1401,9 +1418,10 @@ def _account_row_to_dict(r: sqlite3.Row) -> dict[str, Any]:
         "proxy_url": r["proxy_url"] or "",
         "status": r["status"],
         "platform": _row_col(r, "platform", "grok"),
-        "lifecycle_status": _row_col(r, "lifecycle_status", "registered"),
-        "plan_state": _row_col(r, "plan_state", "unknown"),
-        "validity_status": _row_col(r, "validity_status", "unknown"),
+        "lifecycle_status": lifecycle,
+        "plan_state": plan,
+        "validity_status": validity,
+        "display_status": _derive_display_status(lifecycle, validity, plan),
         "last_error": _row_col(r, "last_error", ""),
         "last_checked_at": r["last_checked_at"] or "",
         "notes": _row_col(r, "notes", ""),
