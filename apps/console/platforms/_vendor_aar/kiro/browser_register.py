@@ -491,14 +491,50 @@ class KiroBrowserRegister:
                 except Exception:
                     pass
 
+            # 尝试查询套餐信息（用 accessToken + sessionToken cookie）
+            account_overview = {}
+            access_token = tokens.get("accessToken", "")
+            session_token = ""
+            try:
+                cookies = page.context.cookies()
+                for c in cookies:
+                    if c.get("name") == "__Secure-authjs.session-token":
+                        session_token = c.get("value", "")
+                        break
+                    if c.get("name") == "SessionToken":
+                        session_token = c.get("value", "")
+            except Exception:
+                pass
+
+            if access_token and session_token:
+                try:
+                    from platforms._vendor_aar.kiro.switch import get_kiro_portal_state, summarize_kiro_usage
+                    self.log("查询 Kiro 套餐信息...")
+                    portal_state = get_kiro_portal_state(access_token, session_token)
+                    if portal_state and portal_state.get("available"):
+                        summary = summarize_kiro_usage(portal_state)
+                        if summary:
+                            plan_title = summary.get("plan_title") or summary.get("subscription_type") or ""
+                            account_overview = {
+                                "plan_name": plan_title or "Free",
+                                "plan_state": "free" if "free" in (plan_title or "free").lower() else plan_title.lower(),
+                                "user_email": summary.get("user_email", ""),
+                                "user_status": summary.get("user_status", ""),
+                                "breakdowns": summary.get("breakdowns", []),
+                            }
+                            self.log(f"套餐: {plan_title or 'Free'}")
+                except Exception as exc:
+                    self.log(f"查询套餐失败（不影响注册）: {exc}")
+
             self.log(f"✓ 注册成功: {email}")
             return {
                 "email": email,
                 "password": password,
-                "accessToken": tokens.get("accessToken", ""),
+                "accessToken": access_token,
                 "refreshToken": tokens.get("refreshToken", ""),
                 "idToken": tokens.get("idToken", ""),
-                "sessionToken": "",
+                "sessionToken": session_token,
                 "clientId": "",
                 "clientSecret": "",
+                "account_overview": account_overview,
             }
