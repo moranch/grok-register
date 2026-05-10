@@ -552,18 +552,12 @@ class KiroBrowserRegister:
                 _click_submit_button(page, timeout=8)
                 time.sleep(3)
 
-            # 6. 填完邮箱 submit 后直接等跳转到 profile.aws（新账号注册流程）
-            # signin.aws 上没有密码框，密码在 profile.aws 最后一步才填
-            self.log("等待跳转到注册流程...")
-            if not _wait_for_url(page, AWS_PROFILE_DOMAIN, timeout=90):
-                if "kiro.dev" in page.url:
-                    self.log("已有账号，直接登录成功")
-                else:
-                    raise RuntimeError(f"AWS 注册流程未跳转到 profile.aws: {page.url}")
-
-            if AWS_PROFILE_DOMAIN in page.url:
-                self.log("进入 AWS Builder ID 注册流程...")
-                self._handle_aws_profile_spa(page, email, password)
+            # 6. 填完邮箱 submit 后，AWS 会跳转到 profile.aws
+            # 但跳转方式可能是 SPA 内部路由，page.url 不一定立刻变
+            # 所以不死等 URL，直接短暂等待后进入 SPA 处理主循环
+            time.sleep(5)
+            self.log("进入注册流程...")
+            self._handle_aws_profile_spa(page, email, password)
 
             # 7. 等待跳回 kiro.dev
             self.log("等待跳回 Kiro...")
