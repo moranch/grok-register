@@ -73,24 +73,43 @@ class TaskSupervisor:
             self._thread.start()
 
     def _reap_orphan_tasks_on_startup(self) -> None:
-        """任何 running / stopping 状态的任务，启动时都视为孤儿并标记 stopped。"""
+        """任何 running / stopping 状态的任务，启动时视为孤儿。
+
+        根据 completed_count 区分：
+          - 已有账号入库 → STATUS_PARTIAL（部分完成，前端显示"部分成功"）
+          - 一个都没完成  → STATUS_STOPPED（停止）
+        """
         rows = fetch_all(
-            "SELECT id FROM tasks WHERE status IN (?, ?, ?)",
+            "SELECT id, completed_count, target_count FROM tasks WHERE status IN (?, ?, ?)",
             (STATUS_RUNNING, STATUS_STOPPING, "vendor_dispatch"),
         )
         if not rows:
             return
         for r in rows:
             task_id = int(r["id"])
+            completed = int(r["completed_count"] or 0)
+            target = int(r["target_count"] or 0)
+
+            if completed >= target > 0:
+                final_status = STATUS_COMPLETED
+                msg = f"Task completed before restart ({completed}/{target})."
+            elif completed > 0:
+                final_status = STATUS_PARTIAL
+                msg = (
+                    f"Task interrupted by container restart at round "
+                    f"{completed + 1}/{target}; {completed} account(s) already saved."
+                )
+            else:
+                final_status = STATUS_STOPPED
+                msg = "Task stopped (orphan after container restart/crash)."
+
             execute_no_return(
                 """
                 UPDATE tasks
                 SET status = ?, finished_at = ?, last_error = ?, current_phase = ?
                 WHERE id = ?
                 """,
-                (STATUS_STOPPED, now_iso(),
-                 "Task stopped (orphan after container restart/crash).",
-                 STATUS_STOPPED, task_id),
+                (final_status, now_iso(), msg, final_status, task_id),
             )
         print(f"[supervisor] 启动时清理了 {len(rows)} 个孤儿任务")
 
