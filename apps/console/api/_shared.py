@@ -1640,15 +1640,22 @@ def _harvest_task_accounts(task_id: int, task_dir: Path, proxy_url: str = "") ->
     )
     emails = [r["email"] for r in email_rows if r["email"]]
     sso_list = [s.strip() for s in content.splitlines() if s.strip()]
+    # grok 子进程跑完没有 Account 对象可读，默认值如下：
+    #   platform='grok'；token 能拿到说明注册流程完整 → validity='valid'
+    #   plan_state 未知；lifecycle_status='registered'
     for idx, sso in enumerate(sso_list):
         email = emails[idx] if idx < len(emails) else ""
         execute_no_return(
             """
             INSERT OR IGNORE INTO accounts
-                (email, sso, task_id, proxy_url, lifecycle_status, created_at)
-            VALUES (?, ?, ?, ?, 'registered', ?)
+                (email, sso, task_id, proxy_url, platform, status,
+                 lifecycle_status, plan_state, validity_status,
+                 last_checked_at, created_at)
+            VALUES (?, ?, ?, ?, 'grok', 'active',
+                    'registered', 'unknown', 'valid',
+                    ?, ?)
             """,
-            (email, sso, task_id, proxy_url, now_iso()),
+            (email, sso, task_id, proxy_url, now_iso(), now_iso()),
         )
 
 

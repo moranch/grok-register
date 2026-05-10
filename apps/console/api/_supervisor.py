@@ -491,13 +491,49 @@ class TaskSupervisor:
                         token = getattr(account, "token", "") or ""
                         last_email = email
 
-                        # 入库 accounts
+                        # 从 vendor Account 提取 lifecycle / plan / validity
+                        # vendor AccountStatus 枚举值 = 我们 lifecycle_status 列的域
+                        _status = getattr(account, "status", None)
+                        lifecycle_status = str(
+                            getattr(_status, "value", _status) or "registered"
+                        )
+                        extra = dict(getattr(account, "extra", {}) or {})
+                        overview = extra.get("account_overview") or {}
+                        if not isinstance(overview, dict):
+                            overview = {}
+
+                        # plan_state：用 vendor 的推导规则
+                        try:
+                            from core._vendor_aar.account_graph import (
+                                _derive_plan_state,
+                                _derive_validity_status,
+                            )
+                            _trial_end = int(getattr(account, "trial_end_time", 0) or 0)
+                            plan_state = _derive_plan_state(
+                                lifecycle_status, overview, _trial_end
+                            ) or "unknown"
+                            validity_status = _derive_validity_status(
+                                lifecycle_status, overview
+                            )
+                            # 刚注册成功：如果 overview 没明确给 valid，
+                            # 默认视作 valid（vendor 本轮能跑通说明 token 有效）
+                            if validity_status == "unknown":
+                                validity_status = "valid"
+                        except Exception:
+                            plan_state = "unknown"
+                            validity_status = "valid"
+
+                        extra_json = json.dumps(extra, ensure_ascii=False, default=str)
+
+                        # 入库 accounts（一次性写全所有已知字段）
                         from ._shared import execute as _execute
                         _execute(
                             """
                             INSERT OR IGNORE INTO accounts
-                                (email, sso, password, task_id, proxy_url, status, platform, created_at)
-                            VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+                                (email, sso, password, task_id, proxy_url, status, platform,
+                                 lifecycle_status, plan_state, validity_status, extra_json,
+                                 last_checked_at, created_at)
+                            VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 email,
@@ -506,12 +542,21 @@ class TaskSupervisor:
                                 task_id,
                                 proxy_url,
                                 platform_name,
+                                lifecycle_status,
+                                plan_state,
+                                validity_status,
+                                extra_json,
+                                now_iso(),
                                 now_iso(),
                             ),
                         )
 
                         with console_path.open("a", encoding="utf-8") as log:
-                            log.write(f"[{now_iso()}] 注册成功 | email={email}\n")
+                            log.write(
+                                f"[{now_iso()}] 注册成功 | email={email} "
+                                f"lifecycle={lifecycle_status} plan={plan_state} "
+                                f"validity={validity_status}\n"
+                            )
 
                     except NotImplementedError as e:
                         failed += 1
