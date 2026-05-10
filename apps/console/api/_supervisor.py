@@ -596,11 +596,27 @@ class TaskSupervisor:
                                 f"validity={validity_status}\n"
                             )
 
+                        # 更新邮箱 provider 成功计数
+                        try:
+                            _mbox_provider_id = getattr(mailbox, "_provider", {}) or {}
+                            _mbox_id = int(_mbox_provider_id.get("id", 0)) if isinstance(_mbox_provider_id, dict) else 0
+                            if _mbox_id:
+                                mailbox_report_success(_mbox_id)
+                        except Exception:
+                            pass
+
                     except NotImplementedError as e:
                         failed += 1
                         last_error = f"NotImplementedError: {e}"
                         with console_path.open("a", encoding="utf-8") as log:
                             log.write(f"[{now_iso()}] [Error] 第 {round_no} 轮失败: {last_error}\n")
+                        try:
+                            _mbox_provider_id = getattr(mailbox, "_provider", {}) or {}
+                            _mbox_id = int(_mbox_provider_id.get("id", 0)) if isinstance(_mbox_provider_id, dict) else 0
+                            if _mbox_id:
+                                mailbox_report_failure(_mbox_id)
+                        except Exception:
+                            pass
                         # NotImplementedError 说明 vendor 没实现，不用继续
                         break
 
@@ -609,6 +625,13 @@ class TaskSupervisor:
                         last_error = f"{type(e).__name__}: {e}"
                         with console_path.open("a", encoding="utf-8") as log:
                             log.write(f"[{now_iso()}] [Error] 第 {round_no} 轮失败: {last_error}\n")
+                        try:
+                            _mbox_provider_id = getattr(mailbox, "_provider", {}) or {}
+                            _mbox_id = int(_mbox_provider_id.get("id", 0)) if isinstance(_mbox_provider_id, dict) else 0
+                            if _mbox_id:
+                                mailbox_report_failure(_mbox_id)
+                        except Exception:
+                            pass
 
                     # 更新进度
                     execute_no_return(
