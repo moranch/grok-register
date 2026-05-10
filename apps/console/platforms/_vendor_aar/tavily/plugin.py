@@ -11,6 +11,7 @@ class TavilyPlatform(BasePlatform):
     name = "tavily"
     display_name = "Tavily"
     version = "1.0.0"
+    supported_executors = ['protocol', 'headless', 'headed']
 
     def __init__(self, config: RegisterConfig = None, mailbox: BaseMailbox = None):
         super().__init__(config)
@@ -47,7 +48,7 @@ class TavilyPlatform(BasePlatform):
     def build_browser_registration_adapter(self):
         return BrowserRegistrationAdapter(
             result_mapper=lambda ctx, result: self._map_tavily_result(result),
-            browser_worker_builder=lambda ctx, artifacts: __import__("platforms.tavily.browser_register", fromlist=["TavilyBrowserRegister"]).TavilyBrowserRegister(
+            browser_worker_builder=lambda ctx, artifacts: __import__("platforms._vendor_aar.tavily.browser_register", fromlist=["TavilyBrowserRegister"]).TavilyBrowserRegister(
                 captcha=artifacts.captcha_solver if ctx.identity.identity_provider == "mailbox" else None,
                 headless=(ctx.executor_type == "headless"),
                 proxy=ctx.proxy,
@@ -90,7 +91,7 @@ class TavilyPlatform(BasePlatform):
     def build_protocol_mailbox_adapter(self):
         return ProtocolMailboxAdapter(
             result_mapper=lambda ctx, result: self._map_tavily_result(result),
-            worker_builder=lambda ctx, artifacts: __import__("platforms.tavily.protocol_mailbox", fromlist=["TavilyProtocolMailboxWorker"]).TavilyProtocolMailboxWorker(
+            worker_builder=lambda ctx, artifacts: __import__("platforms._vendor_aar.tavily.protocol_mailbox", fromlist=["TavilyProtocolMailboxWorker"]).TavilyProtocolMailboxWorker(
                 executor=artifacts.executor,
                 captcha=artifacts.captcha_solver,
                 log_fn=ctx.log,

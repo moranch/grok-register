@@ -12,6 +12,7 @@ class OpenBlockLabsPlatform(BasePlatform):
     name = "openblocklabs"
     display_name = "OpenBlockLabs"
     version = "1.0.0"
+    supported_executors = ['protocol', 'headless', 'headed']
 
     def __init__(self, config: RegisterConfig = None, mailbox: BaseMailbox = None):
         super().__init__(config)
@@ -46,7 +47,7 @@ class OpenBlockLabsPlatform(BasePlatform):
     def build_browser_registration_adapter(self):
         return BrowserRegistrationAdapter(
             result_mapper=lambda ctx, result: self._map_openblocklabs_result(result),
-            browser_worker_builder=lambda ctx, artifacts: __import__("platforms.openblocklabs.browser_register", fromlist=["OpenBlockLabsBrowserRegister"]).OpenBlockLabsBrowserRegister(
+            browser_worker_builder=lambda ctx, artifacts: __import__("platforms._vendor_aar.openblocklabs.browser_register", fromlist=["OpenBlockLabsBrowserRegister"]).OpenBlockLabsBrowserRegister(
                 headless=(ctx.executor_type == "headless"),
                 proxy=ctx.proxy,
                 otp_callback=artifacts.otp_callback,

@@ -82,7 +82,7 @@ class KiroPlatform(BasePlatform):
     def build_browser_registration_adapter(self):
         return BrowserRegistrationAdapter(
             result_mapper=lambda ctx, result: self._map_kiro_result(result, oauth_provider=ctx.identity.oauth_provider),
-            browser_worker_builder=lambda ctx, artifacts: __import__("platforms.kiro.browser_register", fromlist=["KiroBrowserRegister"]).KiroBrowserRegister(
+            browser_worker_builder=lambda ctx, artifacts: __import__("platforms._vendor_aar._vendor_aar.kiro.browser_register", fromlist=["KiroBrowserRegister"]).KiroBrowserRegister(
                 headless=(ctx.executor_type == "headless"),
                 proxy=ctx.proxy,
                 otp_callback=artifacts.otp_callback,

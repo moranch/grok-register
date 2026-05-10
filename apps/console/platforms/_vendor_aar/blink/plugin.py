@@ -22,6 +22,7 @@ class BlinkPlatform(BasePlatform):
     name = "blink"
     display_name = "Blink.new"
     version = "1.0.0"
+    supported_executors = ['protocol']
 
     def __init__(self, config: RegisterConfig = None, mailbox: BaseMailbox = None):
         super().__init__(config)

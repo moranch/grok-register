@@ -11,6 +11,7 @@ class GrokPlatform(BasePlatform):
     name = "grok"
     display_name = "Grok"
     version = "1.0.0"
+    supported_executors = ['protocol', 'headless', 'headed']
 
     def __init__(self, config: RegisterConfig = None, mailbox: BaseMailbox = None):
         super().__init__(config)
@@ -49,7 +50,7 @@ class GrokPlatform(BasePlatform):
     def build_browser_registration_adapter(self):
         return BrowserRegistrationAdapter(
             result_mapper=lambda ctx, result: self._map_grok_result(result),
-            browser_worker_builder=lambda ctx, artifacts: __import__("platforms.grok.browser_register", fromlist=["GrokBrowserRegister"]).GrokBrowserRegister(
+            browser_worker_builder=lambda ctx, artifacts: __import__("platforms._vendor_aar.grok.browser_register", fromlist=["GrokBrowserRegister"]).GrokBrowserRegister(
                 headless=(ctx.executor_type == "headless"),
                 proxy=ctx.proxy,
                 otp_callback=artifacts.otp_callback,
@@ -73,7 +74,7 @@ class GrokPlatform(BasePlatform):
     def build_protocol_mailbox_adapter(self):
         return ProtocolMailboxAdapter(
             result_mapper=lambda ctx, result: self._map_grok_result(result),
-            worker_builder=lambda ctx, artifacts: __import__("platforms.grok.protocol_mailbox", fromlist=["GrokProtocolMailboxWorker"]).GrokProtocolMailboxWorker(
+            worker_builder=lambda ctx, artifacts: __import__("platforms._vendor_aar.grok.protocol_mailbox", fromlist=["GrokProtocolMailboxWorker"]).GrokProtocolMailboxWorker(
                 captcha_solver=artifacts.captcha_solver,
                 proxy=ctx.proxy,
                 log_fn=ctx.log,

@@ -25,7 +25,7 @@ def _utcnow_str() -> str:
 # ─── Tasks ───────────────────────────────────────────────────────────────────
 
 
-class TaskModel(SQLModel, table=True):
+class TaskModel(SQLModel, table=False):
     """注册任务表。"""
     __tablename__ = "tasks"
 
@@ -52,7 +52,7 @@ class TaskModel(SQLModel, table=True):
 # ─── Accounts ────────────────────────────────────────────────────────────────
 
 
-class AccountModel(SQLModel, table=True):
+class AccountModel(SQLModel, table=False):
     """账号资产表。"""
     __tablename__ = "accounts"
 
@@ -78,7 +78,7 @@ class AccountModel(SQLModel, table=True):
 # ─── Register Events ─────────────────────────────────────────────────────────
 
 
-class RegisterEventModel(SQLModel, table=True):
+class RegisterEventModel(SQLModel, table=False):
     """注册事件表（日志 + 生命周期事件 + Exporter 事件）。"""
     __tablename__ = "register_events"
 
@@ -101,7 +101,7 @@ class RegisterEventModel(SQLModel, table=True):
 # ─── Proxies ─────────────────────────────────────────────────────────────────
 
 
-class ProxyModel(SQLModel, table=True):
+class ProxyModel(SQLModel, table=False):
     """代理池表。"""
     __tablename__ = "proxies"
 
@@ -119,7 +119,7 @@ class ProxyModel(SQLModel, table=True):
 # ─── Mailbox Providers ───────────────────────────────────────────────────────
 
 
-class MailboxProviderModel(SQLModel, table=True):
+class MailboxProviderModel(SQLModel, table=False):
     """邮箱 Provider 配置表。"""
     __tablename__ = "mailbox_providers"
 
@@ -140,7 +140,7 @@ class MailboxProviderModel(SQLModel, table=True):
 # ─── Settings ────────────────────────────────────────────────────────────────
 
 
-class SettingModel(SQLModel, table=True):
+class SettingModel(SQLModel, table=False):
     """全局配置表（key-value 形式）。"""
     __tablename__ = "settings"
 
@@ -153,7 +153,7 @@ class SettingModel(SQLModel, table=True):
 # ─── Exporter States ─────────────────────────────────────────────────────────
 
 
-class ExporterStateModel(SQLModel, table=True):
+class ExporterStateModel(SQLModel, table=False):
     """Exporter 推送状态表。"""
     __tablename__ = "exporter_states"
 
@@ -169,7 +169,7 @@ class ExporterStateModel(SQLModel, table=True):
 # ─── Sync Jobs ───────────────────────────────────────────────────────────────
 
 
-class SyncJobModel(SQLModel, table=True):
+class SyncJobModel(SQLModel, table=False):
     """批量状态同步 / auth-file 补传任务表。"""
     __tablename__ = "sync_jobs"
 

@@ -11,6 +11,7 @@ class TraePlatform(BasePlatform):
     name = "trae"
     display_name = "Trae.ai"
     version = "1.0.0"
+    supported_executors = ['protocol', 'headless', 'headed']
 
     def __init__(self, config: RegisterConfig = None, mailbox: BaseMailbox = None):
         super().__init__(config)
@@ -51,7 +52,7 @@ class TraePlatform(BasePlatform):
     def build_browser_registration_adapter(self):
         return BrowserRegistrationAdapter(
             result_mapper=lambda ctx, result: self._map_trae_result(result),
-            browser_worker_builder=lambda ctx, artifacts: __import__("platforms.trae.browser_register", fromlist=["TraeBrowserRegister"]).TraeBrowserRegister(
+            browser_worker_builder=lambda ctx, artifacts: __import__("platforms._vendor_aar.trae.browser_register", fromlist=["TraeBrowserRegister"]).TraeBrowserRegister(
                 headless=(ctx.executor_type == "headless"),
                 proxy=ctx.proxy,
                 otp_callback=artifacts.otp_callback,
@@ -75,7 +76,7 @@ class TraePlatform(BasePlatform):
     def build_protocol_mailbox_adapter(self):
         return ProtocolMailboxAdapter(
             result_mapper=lambda ctx, result: self._map_trae_result(result),
-            worker_builder=lambda ctx, artifacts: __import__("platforms.trae.protocol_mailbox", fromlist=["TraeProtocolMailboxWorker"]).TraeProtocolMailboxWorker(
+            worker_builder=lambda ctx, artifacts: __import__("platforms._vendor_aar.trae.protocol_mailbox", fromlist=["TraeProtocolMailboxWorker"]).TraeProtocolMailboxWorker(
                 executor=artifacts.executor,
                 log_fn=ctx.log,
             ),

@@ -72,7 +72,7 @@ class CursorPlatform(BasePlatform):
     def build_browser_registration_adapter(self):
         return BrowserRegistrationAdapter(
             result_mapper=lambda ctx, result: self._map_oauth_result(result) if ctx.identity.identity_provider == "oauth_browser" else self._map_mailbox_result(result),
-            browser_worker_builder=lambda ctx, artifacts: __import__("platforms.cursor.browser_register", fromlist=["CursorBrowserRegister"]).CursorBrowserRegister(
+            browser_worker_builder=lambda ctx, artifacts: __import__("platforms._vendor_aar.cursor.browser_register", fromlist=["CursorBrowserRegister"]).CursorBrowserRegister(
                 captcha=artifacts.captcha_solver,
                 headless=(ctx.executor_type == "headless"),
                 proxy=ctx.proxy,
@@ -99,7 +99,7 @@ class CursorPlatform(BasePlatform):
     def build_protocol_mailbox_adapter(self):
         return ProtocolMailboxAdapter(
             result_mapper=lambda ctx, result: self._map_mailbox_result(result),
-            worker_builder=lambda ctx, artifacts: __import__("platforms.cursor.protocol_mailbox", fromlist=["CursorProtocolMailboxWorker"]).CursorProtocolMailboxWorker(
+            worker_builder=lambda ctx, artifacts: __import__("platforms._vendor_aar.cursor.protocol_mailbox", fromlist=["CursorProtocolMailboxWorker"]).CursorProtocolMailboxWorker(
                 proxy=ctx.proxy,
                 log_fn=ctx.log,
             ),
