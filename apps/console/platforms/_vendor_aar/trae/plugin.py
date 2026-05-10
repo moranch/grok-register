@@ -126,7 +126,7 @@ class TraePlatform(BasePlatform):
                 }
             }
         
-        elif action_id == "get_user_info":
+        elif action_id in ("get_user_info", "query_state"):
             from platforms._vendor_aar.trae.switch import get_trae_user_info
             
             token = account.token
