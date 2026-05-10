@@ -527,76 +527,18 @@ class KiroBrowserRegister:
                 _click_submit_button(page, timeout=8)
                 time.sleep(3)
 
-            # 6. 等待进入 profile.aws.amazon.com（新账号注册流程）
-            # AWS 重定向可能需要较长时间，等待最多 60 秒
-            self.log("等待进入 AWS 注册流程...")
-            deadline_profile = time.time() + 60
-            while time.time() < deadline_profile:
-                if AWS_PROFILE_DOMAIN in page.url:
-                    break
+            # 6. 填完邮箱 submit 后直接等跳转到 profile.aws（新账号注册流程）
+            # signin.aws 上没有密码框，密码在 profile.aws 最后一步才填
+            self.log("等待跳转到注册流程...")
+            if not _wait_for_url(page, AWS_PROFILE_DOMAIN, timeout=90):
                 if "kiro.dev" in page.url:
-                    break
-                time.sleep(1)
+                    self.log("已有账号，直接登录成功")
+                else:
+                    raise RuntimeError(f"AWS 注册流程未跳转到 profile.aws: {page.url}")
 
             if AWS_PROFILE_DOMAIN in page.url:
                 self.log("进入 AWS Builder ID 注册流程...")
                 self._handle_aws_profile_spa(page, email, password)
-            elif "kiro.dev" in page.url:
-                # 已有账号直接登录成功
-                self.log("已有账号，直接登录成功")
-            elif AWS_SIGNIN_DOMAIN in page.url:
-                # 还在 signin.aws：只有当页面确实有可见的密码框时才认为是"登录密码页"
-                # （新账号注册流程里 signin.aws 可能只是一个过渡 url，不是密码页）
-                has_pwd_input = False
-                try:
-                    pwd_check = page.query_selector('input[type="password"]')
-                    has_pwd_input = bool(pwd_check and pwd_check.is_visible())
-                except Exception:
-                    has_pwd_input = False
-
-                if has_pwd_input:
-                    self.log("检测到密码输入页（已有账号），填写密码...")
-                    pwd_selectors = ['input[type="password"]', 'input[name="password"]']
-                    _fill_input_wait(page, pwd_selectors, password, timeout=10)
-                    time.sleep(0.5)
-                    _click_submit_button(page, timeout=5)
-                    time.sleep(3)
-                    # 密码提交后再等一次 profile.aws 或 kiro.dev
-                    deadline2 = time.time() + 60
-                    while time.time() < deadline2:
-                        if AWS_PROFILE_DOMAIN in page.url:
-                            self.log("密码后跳转到 AWS 注册流程...")
-                            self._handle_aws_profile_spa(page, email, password)
-                            break
-                        if "kiro.dev" in page.url:
-                            break
-                        time.sleep(1)
-                else:
-                    # 没有密码框，再多等一会让 AWS 自己跳转
-                    self.log("signin.aws 未见密码框，继续等待跳转到注册流程...")
-                    deadline3 = time.time() + 60
-                    while time.time() < deadline3:
-                        if AWS_PROFILE_DOMAIN in page.url:
-                            self.log("进入 AWS Builder ID 注册流程...")
-                            self._handle_aws_profile_spa(page, email, password)
-                            break
-                        if "kiro.dev" in page.url:
-                            break
-                        # 期间页面可能出现密码框（已存在账号）
-                        try:
-                            pwd_check2 = page.query_selector('input[type="password"]')
-                            if pwd_check2 and pwd_check2.is_visible():
-                                self.log("检测到密码输入页（已有账号），填写密码...")
-                                _fill_input_wait(page, ['input[type="password"]'], password, timeout=5)
-                                time.sleep(0.5)
-                                _click_submit_button(page, timeout=5)
-                                time.sleep(3)
-                                if AWS_PROFILE_DOMAIN in page.url:
-                                    self._handle_aws_profile_spa(page, email, password)
-                                    break
-                        except Exception:
-                            pass
-                        time.sleep(1)
 
             # 7. 等待跳回 kiro.dev
             self.log("等待跳回 Kiro...")
