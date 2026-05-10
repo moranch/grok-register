@@ -508,7 +508,8 @@ class TaskSupervisor:
                         email = getattr(account, "email", "") or ""
                         token = getattr(account, "token", "") or ""
                         # vendor 有时会返回"部分成功"的 Account（token 为空但没 raise），
-                        # 这种不能算成功账号，更不能入库——直接跳过本轮
+                        # 但如果有 email + password 也算有效（trae/openblocklabs 等平台
+                        # 注册成功后 token 提取可能失败，但账号本身可用）
                         extra_check = dict(getattr(account, "extra", {}) or {})
                         _has_credential = bool(
                             token
@@ -516,6 +517,7 @@ class TaskSupervisor:
                             or extra_check.get("refreshToken")
                             or extra_check.get("session_token")
                             or extra_check.get("auth_token")
+                            or (email and getattr(account, "password", ""))
                         )
                         if not _has_credential:
                             failed += 1
