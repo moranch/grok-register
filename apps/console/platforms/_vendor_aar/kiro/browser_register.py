@@ -145,7 +145,9 @@ def _get_kiro_tokens(page, timeout: int = 60) -> dict:
                 for c in cookies:
                     cn = c.get("name", "").lower()
                     cv = c.get("value", "")
-                    if "accesstoken" in cn and not access:
+                    if cn == "__secure-authjs.session-token" and not access:
+                        access = cv
+                    elif "accesstoken" in cn and not access:
                         access = cv
                     if "refreshtoken" in cn and not refresh:
                         refresh = cv
