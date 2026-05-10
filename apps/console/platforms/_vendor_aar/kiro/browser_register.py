@@ -243,88 +243,43 @@ class KiroBrowserRegister:
                         f"AWS enter-email 步骤重试超 5 次仍无法前进 — "
                         f"邮箱域名可能被 AWS 拒绝 (url={page.url})"
                     )
-                self.log(f"AWS 步骤: 确认邮箱 + 填写姓名 (第{enter_email_retries}次)")
+                self.log(f"AWS 步骤: 确认邮箱 (第{enter_email_retries}次)")
                 time.sleep(1.5)  # 给 SPA 渲染时间
                 # 填邮箱（若为空）
+                email_ok = False
                 for sel in email_selectors:
                     try:
                         el = page.query_selector(sel)
                         if el and el.is_visible():
                             cur = el.input_value() or ""
                             if not cur:
+                                el.click()
                                 el.fill(email)
+                                time.sleep(0.2)
+                            email_ok = bool(el.input_value())
                             break
                     except Exception:
                         pass
-                # 等待姓名输入框出现（最多 8 秒；新版 AWS enter-email 页可能不带姓名框）
-                name = _random_name()
-                name_filled = False
-                name_deadline = time.time() + 8
-                while time.time() < name_deadline and not name_filled:
-                    for sel in name_selectors:
-                        try:
-                            el = page.query_selector(sel)
-                            if el and el.is_visible():
-                                el.click()
-                                time.sleep(0.2)
-                                el.fill(name)
-                                time.sleep(0.2)
-                                # 确认填入成功
-                                if el.input_value():
-                                    self.log(f"填写姓名: {name}")
-                                    name_filled = True
-                                    break
-                        except Exception:
-                            pass
-                    if not name_filled:
-                        time.sleep(0.5)
+                if not email_ok:
+                    self.log("⚠️ enter-email 未找到/填入邮箱输入框")
 
-                if not name_filled:
-                    # 新版 AWS：姓名不在 enter-email 页，留到 enter-name 再填
-                    self.log("enter-email 页未找到姓名框，留到 enter-name 再处理")
-                    try:
-                        page.evaluate(f"""
-                        () => {{
-                            const inputs = document.querySelectorAll('input[type="text"], input:not([type])');
-                            for (const inp of inputs) {{
-                                const ph = (inp.placeholder || '').toLowerCase();
-                                const id_ = (inp.id || '').toLowerCase();
-                                // 过滤掉 username / email / first-name / last-name
-                                if (id_.includes('user') || id_.includes('email') ||
-                                    ph.includes('username') || ph.includes('email') ||
-                                    ph.includes('first') || ph.includes('last')) {{
-                                    continue;
-                                }}
-                                if (ph.includes('maria') || ph.includes('your name') ||
-                                    ph.includes('full name') || id_.includes('fullname') ||
-                                    inp.name === 'name' || inp.name === 'fullName' ||
-                                    inp.name === 'full_name') {{
-                                    inp.focus();
-                                    inp.value = {repr(name)};
-                                    inp.dispatchEvent(new Event('input', {{bubbles: true}}));
-                                    inp.dispatchEvent(new Event('change', {{bubbles: true}}));
-                                    return;
-                                }}
-                            }}
-                        }}
-                        """)
-                        time.sleep(0.3)
-                    except Exception:
-                        pass
-
+                # 注意：新版 AWS enter-email 页面只有邮箱，姓名在下一步 enter-name
+                # 不要在这里填姓名——之前误匹配到 username/其它字段导致 AWS 拒绝提交
                 time.sleep(0.5)
                 _click_submit_button(page, timeout=8)
                 handled_steps.add("enter-email")
-                # 等待 hash 变化（最多 12 秒），若未变则清除标记允许重试
+                # 等待 hash 变化（最多 20 秒）。AWS 有时响应慢。
                 start_wait = time.time()
-                while time.time() - start_wait < 12:
+                advanced = False
+                while time.time() - start_wait < 20:
                     time.sleep(0.5)
                     new_url = page.url
                     new_hash = new_url.split("#")[-1] if "#" in new_url else ""
                     if new_hash != hash_part:
+                        advanced = True
                         break  # hash 变了，进入下一步
-                else:
-                    # 12 秒后 hash 未变，提交可能失败，允许重试
+                if not advanced:
+                    # 20 秒后 hash 未变，提交可能失败，允许重试
                     self.log("⚠️ enter-email 提交后 URL 未变化，将重试")
                     handled_steps.discard("enter-email")
                     hash_stuck_since = time.time()
