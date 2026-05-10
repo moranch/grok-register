@@ -523,6 +523,8 @@ class KiroBrowserRegister:
                                 "breakdowns": summary.get("breakdowns", []),
                             }
                             self.log(f"套餐: {plan_title or 'Free'}")
+                    else:
+                        self.log(f"套餐查询返回空: {portal_state}")
                 except Exception as exc:
                     self.log(f"查询套餐失败（不影响注册）: {exc}")
 
