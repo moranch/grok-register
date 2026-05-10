@@ -172,6 +172,14 @@ def api_account_query_state(request: Request, account_id: int) -> dict[str, Any]
         if validity == "unknown" and result.data.get("valid") is not None:
             validity = "valid" if result.data["valid"] else "invalid"
 
+        # 不用 unknown 覆盖已有的有效值
+        existing_plan = row["plan_state"] or "unknown"
+        existing_validity = row["validity_status"] or "unknown"
+        if plan_state == "unknown" and existing_plan != "unknown":
+            plan_state = existing_plan
+        if validity == "unknown" and existing_validity != "unknown":
+            validity = existing_validity
+
         execute_no_return(
             """UPDATE accounts SET extra_json=?, plan_state=?, validity_status=?, last_checked_at=? WHERE id=?""",
             (extra_json, plan_state, validity, now_iso(), account_id),
