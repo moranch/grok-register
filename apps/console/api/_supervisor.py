@@ -425,6 +425,9 @@ class TaskSupervisor:
                 if vendor_cls is not None:
                     from core._vendor_aar.base_platform import RegisterConfig
                     proxy_url = task_config.get("proxy", "") or task_config.get("browser_proxy", "")
+                    # 默认使用 WARP 代理（容器内 socks5://127.0.0.1:1080）
+                    if not proxy_url:
+                        proxy_url = os.getenv("GROK_REGISTER_DEFAULT_PROXY", "") or "socks5://127.0.0.1:1080"
 
                     # 确定执行器类型：
                     #   1. 读用户在前端选择的（tasks.executor_type 列 或 config_json.executor）
