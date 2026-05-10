@@ -60,6 +60,7 @@ class BridgeMailbox(BaseMailbox):
         provider = self._get_provider()
         api_base = provider["api_base"].rstrip("/")
         provider_type = provider.get("provider_type", "tmail")
+        provider_id = int(provider.get("id", 0))
 
         session = self._session()
 
@@ -192,10 +193,27 @@ class BridgeMailbox(BaseMailbox):
         seen = set(before_ids or [])
         session = self._session()
         admin_pw = extra.get("admin_password", "")
+        _provider_id = int(extra.get("provider_id", 0) or 0)
         headers = {}
         if admin_pw:
             headers["Authorization"] = f"Bearer {admin_pw}"
         deadline = time.time() + timeout
+
+        def _report_ok():
+            if _provider_id:
+                try:
+                    from api._shared import mailbox_report_success
+                    mailbox_report_success(_provider_id)
+                except Exception:
+                    pass
+
+        def _report_fail():
+            if _provider_id:
+                try:
+                    from api._shared import mailbox_report_failure
+                    mailbox_report_failure(_provider_id)
+                except Exception:
+                    pass
 
         while time.time() < deadline:
             # 用户手动停止：立刻抛异常让 worker 退出，不再等 120s
@@ -245,6 +263,7 @@ class BridgeMailbox(BaseMailbox):
                         server_code = str(d.get("code") or "").strip()
                         code_found = bool(d.get("code_found"))
                         if code_found and server_code and pattern.fullmatch(server_code):
+                            _report_ok()
                             return server_code
 
                         content = str(d.get("content", ""))
@@ -261,6 +280,7 @@ class BridgeMailbox(BaseMailbox):
                         if m:
                             code = m.group(1) if m.groups() else m.group(0)
                             if code and code.lower() != "none":
+                                _report_ok()
                                 return code
 
                         # 兜底：subject 里有时也带验证码（比如 "Verify ... - 368905"）
@@ -268,6 +288,7 @@ class BridgeMailbox(BaseMailbox):
                         if m2:
                             code = m2.group(1) if m2.groups() else m2.group(0)
                             if code and code.lower() != "none":
+                                _report_ok()
                                 return code
             except Exception as e:
                 logger.debug(f"轮询 TMail 邮件失败: {e}")
@@ -278,5 +299,7 @@ class BridgeMailbox(BaseMailbox):
                     raise RuntimeError("Task stopped by user")
             else:
                 time.sleep(3)
+
+        _report_fail()
 
         raise TimeoutError(f"等待验证码超时 ({timeout}s)，邮箱: {account.email}")

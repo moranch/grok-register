@@ -556,8 +556,12 @@ class KiroBrowserRegister:
             # 但跳转方式可能是 SPA 内部路由，page.url 不一定立刻变
             # 所以不死等 URL，直接短暂等待后进入 SPA 处理主循环
             time.sleep(5)
-            self.log("进入注册流程...")
-            self._handle_aws_profile_spa(page, email, password)
+            # 如果已有账号直接跳回了 kiro.dev，不用走注册流程
+            if "kiro.dev" in page.url:
+                self.log("已有账号，直接登录成功")
+            else:
+                self.log("进入注册流程...")
+                self._handle_aws_profile_spa(page, email, password)
 
             # 7. 等待跳回 kiro.dev
             self.log("等待跳回 Kiro...")
