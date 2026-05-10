@@ -97,6 +97,11 @@ def api_account_query_state(request: Request, account_id: int) -> dict[str, Any]
         raise HTTPException(status_code=404, detail="account not found")
 
     platform = row["platform"] or "grok"
+
+    # grok 没有 query_state（没有套餐/额度 API），直接返回
+    if platform == "grok":
+        return {"ok": False, "error": "Grok 平台不支持查询状态（无套餐/额度 API）"}
+
     runtime = PlatformRuntime()
     # 先查 vendor DB 里有没有这个 account（vendor 用自己的 account_manager.db）
     from core._vendor_aar.db import engine as _vendor_engine, AccountModel as _VendorAccount
