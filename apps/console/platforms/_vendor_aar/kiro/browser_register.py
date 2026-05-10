@@ -77,16 +77,7 @@ def _click_submit_button(page, timeout: int = 8) -> bool:
     """点击 submit 按钮（AWS 页面用 button[type=submit]）。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        # 1. 优先 Playwright locator text 精确匹配
-        for text in ["Continue", "Next", "Verify", "Create account", "Sign in", "Submit"]:
-            try:
-                el = page.locator(f'text="{text}"').last
-                if el.is_visible():
-                    el.click()
-                    return True
-            except Exception:
-                pass
-        # 2. button[type=submit]
+        # 1. 优先 button[type=submit]（最可靠，AWS 主 Continue 按钮都是 submit）
         try:
             el = page.query_selector('button[type="submit"]:not([disabled])')
             if el and el.is_visible():
@@ -94,6 +85,15 @@ def _click_submit_button(page, timeout: int = 8) -> bool:
                 return True
         except Exception:
             pass
+        # 2. Playwright locator text 精确匹配（用 .first 避免匹配到 "Continue with Google"）
+        for text in ["Continue", "Next", "Verify", "Create account", "Sign in", "Submit"]:
+            try:
+                el = page.locator(f'button:has-text("{text}")').first
+                if el.is_visible():
+                    el.click()
+                    return True
+            except Exception:
+                pass
         # 3. JS text walker
         if _js_click_by_text(page, "Continue", "Next", "Verify", "Create account"):
             return True
@@ -245,10 +245,10 @@ class KiroBrowserRegister:
                     )
                 self.log(f"AWS 步骤: 确认邮箱 (第{enter_email_retries}次)")
                 time.sleep(1.5)  # 给 SPA 渲染时间
-                # 填邮箱（若为空）—— profile.aws 的 enter-email 页面可能：
-                #   a) 有 email input 且预填了（从 signin.aws 带过来）→ 不用填
-                #   b) 有 email input 但空 → 填入
-                #   c) 根本没有 email input（只显示文本 + Continue）→ 直接 submit
+                # profile.aws 的 #/signup/enter-email 页面实际可能是：
+                #   - 填邮箱（有 email input）
+                #   - 填名字（显示邮箱文本 + Name input，placeholder "Maria José Silva"）
+                # 两种都处理
                 email_ok = False
                 for sel in email_selectors:
                     try:
@@ -263,9 +263,34 @@ class KiroBrowserRegister:
                             break
                     except Exception:
                         pass
-                # 即使没找到 email input 也继续（情况 c），直接点 Continue
+
+                # 如果没有 email input，检查是否有 name input（AWS 把 enter-email 和 enter-name 合并了）
                 if not email_ok:
-                    self.log("enter-email 页无邮箱输入框（可能已预填），直接提交")
+                    name = _random_name()
+                    name_filled = False
+                    # 单个 Name 框（placeholder "Maria José Silva"）
+                    single_name_sels = [
+                        'input[placeholder*="Maria"]',
+                        'input[placeholder*="name" i]',
+                        'input[name="name"]',
+                        'input[name="fullName"]',
+                    ]
+                    for sel in single_name_sels:
+                        try:
+                            el = page.query_selector(sel)
+                            if el and el.is_visible():
+                                el.click()
+                                time.sleep(0.1)
+                                el.fill(name)
+                                time.sleep(0.1)
+                                if el.input_value():
+                                    self.log(f"填写姓名: {name}")
+                                    name_filled = True
+                                    break
+                        except Exception:
+                            pass
+                    if not name_filled:
+                        self.log("enter-email 页无邮箱/姓名输入框，直接提交")
 
                 # 注意：新版 AWS enter-email 页面只有邮箱，姓名在下一步 enter-name
                 # 不要在这里填姓名——之前误匹配到 username/其它字段导致 AWS 拒绝提交
