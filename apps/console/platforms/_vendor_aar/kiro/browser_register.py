@@ -399,7 +399,15 @@ class KiroBrowserRegister:
                 continue
 
             # --- create-password 步 ---
-            if "create-password" in hash_part and "create-password" not in handled_steps:
+            # AWS 有时会在 verify-otp 成功后直接替换组件为密码页但不改 hash，
+            # 所以这里既匹配 hash 也主动查 DOM 上有没有可见的密码输入框。
+            page_has_pwd = False
+            try:
+                pwd_el_check = page.query_selector('input[type="password"]')
+                page_has_pwd = bool(pwd_el_check and pwd_el_check.is_visible())
+            except Exception:
+                page_has_pwd = False
+            if ("create-password" in hash_part or page_has_pwd) and "create-password" not in handled_steps:
                 self.log("AWS 步骤: 设置密码")
                 time.sleep(1)
                 pwd_fields = []
