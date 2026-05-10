@@ -38,7 +38,7 @@ class CerebrasPlatform(BasePlatform):
         return ProtocolMailboxAdapter(
             result_mapper=lambda ctx, result: self._map_result(result),
             worker_builder=lambda ctx, artifacts: __import__(
-                "platforms.cerebras.protocol_mailbox",
+                "platforms._vendor_aar.cerebras.protocol_mailbox",
                 fromlist=["CerebrasProtocolMailboxWorker"],
             ).CerebrasProtocolMailboxWorker(
                 executor=artifacts.executor,
