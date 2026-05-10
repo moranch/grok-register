@@ -245,7 +245,10 @@ class KiroBrowserRegister:
                     )
                 self.log(f"AWS 步骤: 确认邮箱 (第{enter_email_retries}次)")
                 time.sleep(1.5)  # 给 SPA 渲染时间
-                # 填邮箱（若为空）
+                # 填邮箱（若为空）—— profile.aws 的 enter-email 页面可能：
+                #   a) 有 email input 且预填了（从 signin.aws 带过来）→ 不用填
+                #   b) 有 email input 但空 → 填入
+                #   c) 根本没有 email input（只显示文本 + Continue）→ 直接 submit
                 email_ok = False
                 for sel in email_selectors:
                     try:
@@ -260,8 +263,9 @@ class KiroBrowserRegister:
                             break
                     except Exception:
                         pass
+                # 即使没找到 email input 也继续（情况 c），直接点 Continue
                 if not email_ok:
-                    self.log("⚠️ enter-email 未找到/填入邮箱输入框")
+                    self.log("enter-email 页无邮箱输入框（可能已预填），直接提交")
 
                 # 注意：新版 AWS enter-email 页面只有邮箱，姓名在下一步 enter-name
                 # 不要在这里填姓名——之前误匹配到 username/其它字段导致 AWS 拒绝提交
