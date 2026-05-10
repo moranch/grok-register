@@ -1412,10 +1412,41 @@ def _account_row_to_dict(r: sqlite3.Row) -> dict[str, Any]:
     lifecycle = _row_col(r, "lifecycle_status", "registered")
     plan = _row_col(r, "plan_state", "unknown")
     validity = _row_col(r, "validity_status", "unknown")
+    extra_raw = _row_col(r, "extra_json", "{}")
+    try:
+        extra = json.loads(extra_raw) if extra_raw else {}
+    except Exception:
+        extra = {}
+
+    # 从 sso + extra_json 拆出独立 token 字段
+    sso = r["sso"] or ""
+    tokens = {
+        "session_token": "",
+        "access_token": "",
+        "refresh_token": "",
+        "id_token": "",
+    }
+    # windsurf: sso 格式 "devin-session-token$eyJ..."
+    if sso.startswith("devin-session-token$"):
+        tokens["session_token"] = sso[len("devin-session-token$"):]
+    elif sso:
+        tokens["session_token"] = sso
+    # extra_json 里可能有更多 token
+    if extra.get("accessToken"):
+        tokens["access_token"] = extra["accessToken"]
+    if extra.get("refreshToken"):
+        tokens["refresh_token"] = extra["refreshToken"]
+    if extra.get("idToken"):
+        tokens["id_token"] = extra["idToken"]
+    if extra.get("session_token") and not tokens["session_token"]:
+        tokens["session_token"] = extra["session_token"]
+    if extra.get("auth_token") and not tokens["access_token"]:
+        tokens["access_token"] = extra["auth_token"]
+
     return {
         "id": int(r["id"]),
         "email": r["email"],
-        "sso": r["sso"],
+        "sso": sso,
         "password": _row_col(r, "password", ""),
         "task_id": r["task_id"],
         "proxy_url": r["proxy_url"] or "",
@@ -1425,10 +1456,11 @@ def _account_row_to_dict(r: sqlite3.Row) -> dict[str, Any]:
         "plan_state": plan,
         "validity_status": validity,
         "display_status": _derive_display_status(lifecycle, validity, plan),
+        "tokens": tokens,
         "last_error": _row_col(r, "last_error", ""),
         "last_checked_at": r["last_checked_at"] or "",
         "notes": _row_col(r, "notes", ""),
-        "extra_json": _row_col(r, "extra_json", "{}"),
+        "extra_json": extra_raw,
         "exporter_status_json": _row_col(r, "exporter_status_json", "{}"),
         "created_at": r["created_at"],
     }
