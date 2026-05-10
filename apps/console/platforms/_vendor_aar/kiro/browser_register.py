@@ -128,6 +128,10 @@ def _get_kiro_tokens(page, timeout: int = 30) -> dict:
                 for (const k of Object.keys(localStorage)) {
                     out[k] = localStorage.getItem(k);
                 }
+                // 也检查 sessionStorage
+                for (const k of Object.keys(sessionStorage)) {
+                    out['__session__' + k] = sessionStorage.getItem(k);
+                }
                 return out;
             }
             """)
@@ -142,6 +146,22 @@ def _get_kiro_tokens(page, timeout: int = 30) -> dict:
                     id_token = v
             if access:
                 return {"accessToken": access, "refreshToken": refresh, "idToken": id_token}
+            # 也尝试从 cookie 里找（某些版本 kiro 用 cookie 存 token）
+            try:
+                cookies = page.context.cookies()
+                for c in cookies:
+                    cn = c.get("name", "").lower()
+                    cv = c.get("value", "")
+                    if "accesstoken" in cn and not access:
+                        access = cv
+                    if "refreshtoken" in cn and not refresh:
+                        refresh = cv
+                    if "idtoken" in cn and not id_token:
+                        id_token = cv
+                if access:
+                    return {"accessToken": access, "refreshToken": refresh, "idToken": id_token}
+            except Exception:
+                pass
         except Exception:
             pass
         time.sleep(2)
@@ -572,7 +592,14 @@ class KiroBrowserRegister:
 
             # 8. 提取 Cognito tokens
             self.log("提取 Kiro 访问令牌...")
-            tokens = _get_kiro_tokens(page, timeout=20)
+            tokens = _get_kiro_tokens(page, timeout=60)
+            if not tokens:
+                # 打出 localStorage keys 帮助调试
+                try:
+                    keys = page.evaluate("() => Object.keys(localStorage)")
+                    self.log(f"⚠️ localStorage keys: {keys[:20]}")
+                except Exception:
+                    pass
 
             self.log(f"✓ 注册成功: {email}")
             return {
