@@ -436,7 +436,7 @@ def _handle_turnstile(
     return True
 
 
-def _headers(*, content_type: str, referer: str, account_id: str = "", org_id: str = "", auth1_token: str = "") -> dict[str, str]:
+def _headers(*, content_type: str, referer: str, account_id: str = "", org_id: str = "", auth1_token: str = "", session_token: str = "") -> dict[str, str]:
     headers = {
         "accept": "*/*",
         "content-type": content_type,
@@ -455,6 +455,10 @@ def _headers(*, content_type: str, referer: str, account_id: str = "", org_id: s
     if auth1_token:
         # WindsurfPostAuth 需要这个 header 来用 email/complete 返回的 token 换 session_token
         headers["x-devin-auth1-token"] = auth1_token
+    if session_token:
+        # GetCurrentUser / GetPlanStatus / SubscribeToPlan 等需要这两个 header
+        headers["x-devin-session-token"] = session_token
+        headers["x-auth-token"] = session_token
     return headers
 
 
@@ -485,6 +489,7 @@ class WindsurfBrowserApi:
         org_id: str = "",
         referer: str = "/profile",
         auth1_token: str = "",
+        session_token: str = "",
     ) -> bytes:
         response = self.page.request.post(
             f"{WINDSURF_BASE}{SEAT_SERVICE}/{method}",
@@ -494,6 +499,7 @@ class WindsurfBrowserApi:
                 account_id=account_id,
                 org_id=org_id,
                 auth1_token=auth1_token,
+                session_token=session_token,
             ),
             data=body,
         )
@@ -550,7 +556,7 @@ class WindsurfBrowserApi:
     def load_account_state(self, *, session_token: str, account_id: str, org_id: str, fallback_email: str) -> dict:
         auth_body = _field_string(1, session_token)
         current_user = parse_current_user_response(
-            self._proto_post("GetCurrentUser", auth_body, account_id=account_id, org_id=org_id)
+            self._proto_post("GetCurrentUser", auth_body, account_id=account_id, org_id=org_id, session_token=session_token)
         )
         plan_status = parse_plan_status_response(
             self._proto_post(
@@ -559,6 +565,7 @@ class WindsurfBrowserApi:
                 account_id=account_id,
                 org_id=org_id,
                 referer="/subscription/usage",
+                session_token=session_token,
             )
         )
         stripe_state = {}
@@ -570,6 +577,7 @@ class WindsurfBrowserApi:
                     account_id=account_id,
                     org_id=org_id,
                     referer="/subscription/manage-plan",
+                    session_token=session_token,
                 )
             )
         except Exception as exc:
@@ -598,6 +606,7 @@ class WindsurfBrowserApi:
             account_id=account_id,
             org_id=org_id,
             referer=f"/billing/individual?plan=9&turnstile_token={turnstile_token}",
+            session_token=session_token,
         )
         result = parse_subscribe_to_plan_response(content)
         if not result.get("checkout_url"):

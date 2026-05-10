@@ -61,8 +61,38 @@ class TaskSupervisor:
         self._stop = threading.Event()
 
     def start(self) -> None:
+        # 启动时清理"孤儿 running 任务"——上次容器意外终止（docker kill / docker 崩溃 /
+        # OOM / 宿主机重启）时留下的 running 状态记录。这些任务的真实线程/子进程早没了，
+        # 但 DB 里仍然标记为 running，如果不清会卡死前端列表和下次 launch 的并发上限。
+        try:
+            self._reap_orphan_tasks_on_startup()
+        except Exception as exc:
+            print(f"[supervisor] 启动清理孤儿任务失败（不阻塞）: {exc}")
+
         if not self._thread.is_alive():
             self._thread.start()
+
+    def _reap_orphan_tasks_on_startup(self) -> None:
+        """任何 running / stopping 状态的任务，启动时都视为孤儿并标记 stopped。"""
+        rows = fetch_all(
+            "SELECT id FROM tasks WHERE status IN (?, ?, ?)",
+            (STATUS_RUNNING, STATUS_STOPPING, "vendor_dispatch"),
+        )
+        if not rows:
+            return
+        for r in rows:
+            task_id = int(r["id"])
+            execute_no_return(
+                """
+                UPDATE tasks
+                SET status = ?, finished_at = ?, last_error = ?, current_phase = ?
+                WHERE id = ?
+                """,
+                (STATUS_STOPPED, now_iso(),
+                 "Task stopped (orphan after container restart/crash).",
+                 STATUS_STOPPED, task_id),
+            )
+        print(f"[supervisor] 启动时清理了 {len(rows)} 个孤儿任务")
 
     def stop(self) -> None:
         self._stop.set()
