@@ -187,9 +187,13 @@ class KiroBrowserRegister:
         ]
         name_selectors = [
             'input[placeholder*="Maria"]',
-            'input[placeholder*="name" i]',
+            'input[placeholder*="Your name" i]',
+            'input[placeholder*="Full name" i]',
+            'input[placeholder*="Full Name"]',
             'input[name="name"]',
             'input[name="fullName"]',
+            'input[name="full_name"]',
+            'input[id*="name" i]:not([id*="user" i]):not([id*="email" i]):not([id*="first" i]):not([id*="last" i])',
         ]
         otp_selectors = [
             'input[placeholder*="6"]',
@@ -252,10 +256,10 @@ class KiroBrowserRegister:
                             break
                     except Exception:
                         pass
-                # 等待姓名输入框出现（最多 15 秒）
+                # 等待姓名输入框出现（最多 8 秒；新版 AWS enter-email 页可能不带姓名框）
                 name = _random_name()
                 name_filled = False
-                name_deadline = time.time() + 15
+                name_deadline = time.time() + 8
                 while time.time() < name_deadline and not name_filled:
                     for sel in name_selectors:
                         try:
@@ -276,15 +280,25 @@ class KiroBrowserRegister:
                         time.sleep(0.5)
 
                 if not name_filled:
-                    self.log("⚠️ 未能填写姓名，尝试 JS 方式")
+                    # 新版 AWS：姓名不在 enter-email 页，留到 enter-name 再填
+                    self.log("enter-email 页未找到姓名框，留到 enter-name 再处理")
                     try:
                         page.evaluate(f"""
                         () => {{
                             const inputs = document.querySelectorAll('input[type="text"], input:not([type])');
                             for (const inp of inputs) {{
-                                const ph = inp.placeholder || '';
-                                if (ph.includes('Maria') || inp.closest('[class*="name"]') || 
-                                    inp.closest('[class*="Name"]')) {{
+                                const ph = (inp.placeholder || '').toLowerCase();
+                                const id_ = (inp.id || '').toLowerCase();
+                                // 过滤掉 username / email / first-name / last-name
+                                if (id_.includes('user') || id_.includes('email') ||
+                                    ph.includes('username') || ph.includes('email') ||
+                                    ph.includes('first') || ph.includes('last')) {{
+                                    continue;
+                                }}
+                                if (ph.includes('maria') || ph.includes('your name') ||
+                                    ph.includes('full name') || id_.includes('fullname') ||
+                                    inp.name === 'name' || inp.name === 'fullName' ||
+                                    inp.name === 'full_name') {{
                                     inp.focus();
                                     inp.value = {repr(name)};
                                     inp.dispatchEvent(new Event('input', {{bubbles: true}}));
@@ -345,7 +359,8 @@ class KiroBrowserRegister:
                 continue
 
             # --- verify-email 步 ---
-            if "verify-email" in hash_part and "verify-email" not in handled_steps:
+            # AWS 可能把这个步骤命名为 verify-email / verify-otp 两种 hash 之一（不同版本）
+            if ("verify-email" in hash_part or "verify-otp" in hash_part) and "verify-email" not in handled_steps:
                 self.log("AWS 步骤: 填写验证码")
                 # 等待 OTP 输入框出现
                 otp_el = None
