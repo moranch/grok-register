@@ -62,6 +62,7 @@ class KiroPlatform(BasePlatform):
                 "clientId": result.get("clientId", ""),
                 "clientSecret": result.get("clientSecret", ""),
                 "refreshToken": result.get("refreshToken", ""),
+                "account_overview": result.get("account_overview") or {},
             },
         )
 
