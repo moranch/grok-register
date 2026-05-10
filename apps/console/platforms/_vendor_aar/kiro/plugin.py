@@ -57,6 +57,7 @@ class KiroPlatform(BasePlatform):
                 "name": result.get("name", ""),
                 "accessToken": result.get("accessToken", ""),
                 "sessionToken": result.get("sessionToken", ""),
+                "authjs_session": result.get("authjs_session", ""),
                 "csrfToken": result.get("csrfToken", ""),
                 "oauthProvider": oauth_provider or result.get("oauthProvider", ""),
                 "clientId": result.get("clientId", ""),
@@ -275,7 +276,7 @@ class KiroPlatform(BasePlatform):
             refresh_token = extra.get("refreshToken", "")
             client_id = extra.get("clientId", "")
             client_secret = extra.get("clientSecret", "")
-            session_token = extra.get("sessionToken", "")
+            session_token = extra.get("authjs_session", "") or extra.get("sessionToken", "")
             profile_arn = extra.get("profileArn", "")
             current = read_current_kiro_account() or {}
             refresh_state = {"ok": False, "message": "当前账号未提供 refreshToken/clientId/clientSecret，无法执行远端刷新校验"}

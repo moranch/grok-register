@@ -494,19 +494,23 @@ class KiroBrowserRegister:
             # 尝试查询套餐信息（用 accessToken + sessionToken cookie）
             account_overview = {}
             access_token = tokens.get("accessToken", "")
-            session_token = ""
+            authjs_session = ""
+            aws_session = ""
             try:
                 cookies = page.context.cookies()
                 for c in cookies:
-                    if c.get("name") == "__Secure-authjs.session-token":
-                        session_token = c.get("value", "")
-                        break
-                    if c.get("name") == "SessionToken":
-                        session_token = c.get("value", "")
+                    cn = c.get("name", "")
+                    cv = c.get("value", "")
+                    if cn == "__Secure-authjs.session-token" and cv:
+                        authjs_session = cv
+                    elif cn == "SessionToken" and cv:
+                        aws_session = cv
             except Exception:
                 pass
 
-            if access_token and session_token:
+            # portal API 需要 authjs session（不是 AWS SSO bearer）
+            portal_session = authjs_session
+            if access_token and portal_session:
                 try:
                     from platforms._vendor_aar.kiro.switch import get_kiro_portal_state, summarize_kiro_usage
                     self.log("查询 Kiro 套餐信息...")
@@ -535,7 +539,8 @@ class KiroBrowserRegister:
                 "accessToken": access_token,
                 "refreshToken": tokens.get("refreshToken", ""),
                 "idToken": tokens.get("idToken", ""),
-                "sessionToken": session_token,
+                "sessionToken": aws_session or authjs_session,
+                "authjs_session": authjs_session,
                 "clientId": "",
                 "clientSecret": "",
                 "account_overview": account_overview,
