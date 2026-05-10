@@ -98,9 +98,10 @@ def api_account_query_state(request: Request, account_id: int) -> dict[str, Any]
 
     platform = row["platform"] or "grok"
 
-    # grok 没有 query_state（没有套餐/额度 API），直接返回
-    if platform == "grok":
-        return {"ok": False, "error": "Grok 平台不支持查询状态（无套餐/额度 API）"}
+    # grok / openblocklabs 等没有 query_state API 的平台直接返回
+    _no_query_platforms = {"grok", "openblocklabs", "cerebras", "blink", "anything"}
+    if platform in _no_query_platforms:
+        return {"ok": False, "error": f"{platform} 平台不支持查询状态"}
 
     runtime = PlatformRuntime()
     # 先查 vendor DB 里有没有这个 account（vendor 用自己的 account_manager.db）
