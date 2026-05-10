@@ -508,27 +508,56 @@ class KiroBrowserRegister:
             except Exception:
                 pass
 
-            # portal API 需要 authjs session（不是 AWS SSO bearer）
-            portal_session = authjs_session
-            if access_token and portal_session:
+            # 查询套餐：直接在浏览器里用 fetch 调 portal API（浏览器自动带 cookie）
+            # 不依赖我们提取的 cookie 值（headless 下 Secure cookie 经常拿不到）
+            if access_token:
                 try:
-                    from platforms._vendor_aar.kiro.switch import get_kiro_portal_state, summarize_kiro_usage
                     self.log("查询 Kiro 套餐信息...")
-                    portal_state = get_kiro_portal_state(access_token, session_token)
-                    if portal_state and portal_state.get("available"):
-                        summary = summarize_kiro_usage(portal_state)
-                        if summary:
-                            plan_title = summary.get("plan_title") or summary.get("subscription_type") or ""
-                            account_overview = {
-                                "plan_name": plan_title or "Free",
-                                "plan_state": "free" if "free" in (plan_title or "free").lower() else plan_title.lower(),
-                                "user_email": summary.get("user_email", ""),
-                                "user_status": summary.get("user_status", ""),
-                                "breakdowns": summary.get("breakdowns", []),
-                            }
-                            self.log(f"套餐: {plan_title or 'Free'}")
+                    usage_result = page.evaluate(f"""
+                    async () => {{
+                        try {{
+                            const r = await fetch(
+                                "https://app.kiro.dev/service/KiroWebPortalService/operation/GetUserUsageAndLimits",
+                                {{
+                                    method: "POST",
+                                    headers: {{
+                                        "Accept": "application/json",
+                                        "Content-Type": "application/json",
+                                    }},
+                                    credentials: "include",
+                                    body: JSON.stringify({{
+                                        "origin": "KIRO_IDE",
+                                        "isEmailRequired": true,
+                                        "profileArn": "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
+                                    }})
+                                }}
+                            );
+                            if (!r.ok) return {{"error": r.status}};
+                            return await r.json();
+                        }} catch(e) {{
+                            return {{"error": e.message}};
+                        }}
+                    }}
+                    """)
+                    if usage_result and not usage_result.get("error"):
+                        sub_info = usage_result.get("subscriptionInfo", {})
+                        plan_title = sub_info.get("subscriptionTitle", "") or sub_info.get("type", "")
+                        breakdowns = []
+                        for item in usage_result.get("usageBreakdownList", []):
+                            breakdowns.append({
+                                "display_name": item.get("displayName", ""),
+                                "current_usage": item.get("currentUsage"),
+                                "usage_limit": item.get("usageLimit"),
+                                "remaining_usage": (item.get("usageLimit") or 0) - (item.get("currentUsage") or 0),
+                            })
+                        account_overview = {
+                            "plan_name": plan_title or "Free",
+                            "plan_state": "free" if "free" in (plan_title or "free").lower() else (plan_title.lower() if plan_title else "unknown"),
+                            "breakdowns": breakdowns,
+                        }
+                        self.log(f"套餐: {plan_title or 'Free'}")
                     else:
-                        self.log(f"套餐查询返回空: {portal_state}")
+                        self.log(f"套餐查询失败: {usage_result}")
                 except Exception as exc:
                     self.log(f"查询套餐失败（不影响注册）: {exc}")
 
