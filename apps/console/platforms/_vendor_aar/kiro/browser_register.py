@@ -331,28 +331,82 @@ class KiroBrowserRegister:
                 continue
 
             # --- enter-name 步 ---
+            # 新版 AWS 把 First name / Last name 拆成两个独立输入框；
+            # 老版本是单个 Full name。两种都处理。
             if "enter-name" in hash_part and "enter-name" not in handled_steps:
                 self.log("AWS 步骤: 填写姓名")
                 time.sleep(1.5)
                 name = _random_name()
-                name_filled = False
-                name_deadline = time.time() + 15
-                while time.time() < name_deadline and not name_filled:
-                    for sel in name_selectors:
+                parts = name.split(" ", 1)
+                first_name = parts[0] if parts else "User"
+                last_name = parts[1] if len(parts) > 1 else "User"
+
+                # 先尝试两个独立框
+                first_sels = [
+                    'input[placeholder*="First" i]',
+                    'input[name*="first" i]',
+                    'input[id*="first" i]',
+                    'input[autocomplete="given-name"]',
+                ]
+                last_sels = [
+                    'input[placeholder*="Last" i]',
+                    'input[name*="last" i]',
+                    'input[id*="last" i]',
+                    'input[autocomplete="family-name"]',
+                ]
+
+                def _try_fill(sels, val):
+                    for sel in sels:
                         try:
                             el = page.query_selector(sel)
                             if el and el.is_visible():
                                 el.click()
-                                time.sleep(0.2)
-                                el.fill(name)
+                                time.sleep(0.1)
+                                el.fill(val)
+                                time.sleep(0.1)
                                 if el.input_value():
-                                    self.log(f"填写姓名: {name}")
-                                    name_filled = True
-                                    break
+                                    return True
                         except Exception:
                             pass
+                    return False
+
+                first_ok = False
+                last_ok = False
+                name_deadline = time.time() + 15
+                while time.time() < name_deadline and not (first_ok and last_ok):
+                    if not first_ok:
+                        first_ok = _try_fill(first_sels, first_name)
+                    if not last_ok:
+                        last_ok = _try_fill(last_sels, last_name)
+                    if first_ok and last_ok:
+                        break
+                    time.sleep(0.3)
+
+                if first_ok and last_ok:
+                    self.log(f"填写 First/Last name: {first_name} / {last_name}")
+                else:
+                    # Fallback：老版单 Full name
+                    name_filled = False
+                    fallback_deadline = time.time() + 10
+                    while time.time() < fallback_deadline and not name_filled:
+                        for sel in name_selectors:
+                            try:
+                                el = page.query_selector(sel)
+                                if el and el.is_visible():
+                                    el.click()
+                                    time.sleep(0.2)
+                                    el.fill(name)
+                                    if el.input_value():
+                                        self.log(f"填写 Full name: {name}")
+                                        name_filled = True
+                                        break
+                            except Exception:
+                                pass
+                        if not name_filled:
+                            time.sleep(0.5)
                     if not name_filled:
-                        time.sleep(0.5)
+                        self.log("⚠️ enter-name 未找到姓名输入框")
+
                 _click_submit_button(page, timeout=5)
                 handled_steps.add("enter-name")
                 time.sleep(2)
