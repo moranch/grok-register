@@ -48,7 +48,6 @@ def _wait_for_url(page, substring: str, timeout: int = 60) -> bool:
 
 
 def _js_click_by_text(page, *texts) -> bool:
-    """用 JS 找到 textContent 精确匹配的最小叶节点并点击。"""
     for text in texts:
         try:
             clicked = page.evaluate(f"""
@@ -74,10 +73,16 @@ def _js_click_by_text(page, *texts) -> bool:
 
 
 def _click_submit_button(page, timeout: int = 8) -> bool:
-    """点击 submit 按钮（AWS 页面用 button[type=submit]）。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        # 1. 优先 button[type=submit]（最可靠，AWS 主 Continue 按钮都是 submit）
+        for text in ["Continue", "Next", "Verify", "Create account", "Sign in", "Submit"]:
+            try:
+                el = page.locator(f'text="{text}"').last
+                if el.is_visible():
+                    el.click()
+                    return True
+            except Exception:
+                pass
         try:
             el = page.query_selector('button[type="submit"]:not([disabled])')
             if el and el.is_visible():
@@ -85,16 +90,6 @@ def _click_submit_button(page, timeout: int = 8) -> bool:
                 return True
         except Exception:
             pass
-        # 2. Playwright locator text 精确匹配（用 .first 避免匹配到 "Continue with Google"）
-        for text in ["Continue", "Next", "Verify", "Create account", "Sign in", "Submit"]:
-            try:
-                el = page.locator(f'button:has-text("{text}")').first
-                if el.is_visible():
-                    el.click()
-                    return True
-            except Exception:
-                pass
-        # 3. JS text walker
         if _js_click_by_text(page, "Continue", "Next", "Verify", "Create account"):
             return True
         time.sleep(0.5)
@@ -117,8 +112,7 @@ def _fill_input_wait(page, selectors: list, value: str, timeout: int = 20) -> bo
     return False
 
 
-def _get_kiro_tokens(page, timeout: int = 30) -> dict:
-    """从 localStorage 提取 Cognito accessToken / refreshToken。"""
+def _get_kiro_tokens(page, timeout: int = 60) -> dict:
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -128,7 +122,6 @@ def _get_kiro_tokens(page, timeout: int = 30) -> dict:
                 for (const k of Object.keys(localStorage)) {
                     out[k] = localStorage.getItem(k);
                 }
-                // 也检查 sessionStorage
                 for (const k of Object.keys(sessionStorage)) {
                     out['__session__' + k] = sessionStorage.getItem(k);
                 }
@@ -146,7 +139,7 @@ def _get_kiro_tokens(page, timeout: int = 30) -> dict:
                     id_token = v
             if access:
                 return {"accessToken": access, "refreshToken": refresh, "idToken": id_token}
-            # 也尝试从 cookie 里找（某些版本 kiro 用 cookie 存 token）
+            # cookie fallback
             try:
                 cookies = page.context.cookies()
                 for c in cookies:
@@ -189,15 +182,7 @@ class KiroBrowserRegister:
         self.log = log_fn
 
     def _handle_aws_profile_spa(self, page, email: str, password: str) -> None:
-        """处理 profile.aws.amazon.com 上的多步注册 SPA。
-        
-        步骤对应 URL hash：
-          #/signup/enter-email  → 填/确认邮箱 → Continue
-          #/signup/enter-name   → 填姓名 → Continue
-          #/signup/verify-email → 填 OTP → Continue
-          #/signup/create-password → 填密码 → Continue (可选)
-        """
-        deadline = time.time() + 300  # 最多等 5 分钟完成整个流程
+        deadline = time.time() + 300
 
         email_selectors = [
             'input[placeholder*="username@example.com"]',
@@ -207,13 +192,9 @@ class KiroBrowserRegister:
         ]
         name_selectors = [
             'input[placeholder*="Maria"]',
-            'input[placeholder*="Your name" i]',
-            'input[placeholder*="Full name" i]',
-            'input[placeholder*="Full Name"]',
+            'input[placeholder*="name" i]',
             'input[name="name"]',
             'input[name="fullName"]',
-            'input[name="full_name"]',
-            'input[id*="name" i]:not([id*="user" i]):not([id*="email" i]):not([id*="first" i]):not([id*="last" i])',
         ]
         otp_selectors = [
             'input[placeholder*="6"]',
@@ -237,72 +218,51 @@ class KiroBrowserRegister:
             url = page.url
             hash_part = url.split("#")[-1] if "#" in url else ""
 
-            # 跳回了 kiro.dev -> 完成
             if "kiro.dev" in url and "profile.aws" not in url and "signin.aws" not in url:
                 return
 
-            # 检测 hash 是否卡住（同一 hash 停留过久且已处理过）→ 允许重试
             if hash_part == prev_hash:
                 if hash_stuck_since is None:
                     hash_stuck_since = time.time()
                 elif time.time() - hash_stuck_since > 20:
                     step_key = hash_part.split("/")[-1]
                     if step_key in handled_steps:
-                        self.log(f"⚠️ 步骤 {step_key} 卡住 20 秒，移除标记以重试")
+                        self.log(f"步骤 {step_key} 卡住 20 秒，重试")
                         handled_steps.discard(step_key)
                         hash_stuck_since = None
             else:
                 prev_hash = hash_part
                 hash_stuck_since = None
 
-            # --- enter-email 步（邮箱+姓名在同一页）---
+            # --- enter-email ---
             if "enter-email" in hash_part and "enter-email" not in handled_steps:
                 enter_email_retries += 1
                 if enter_email_retries > 5:
-                    raise RuntimeError(
-                        f"AWS enter-email 步骤重试超 5 次仍无法前进 — "
-                        f"邮箱域名可能被 AWS 拒绝 (url={page.url})"
-                    )
-                self.log(f"AWS 步骤: 确认邮箱 (第{enter_email_retries}次)")
-                time.sleep(1.5)  # 给 SPA 渲染时间
-                # profile.aws 的 #/signup/enter-email 页面实际可能是：
-                #   - 填邮箱（有 email input）
-                #   - 填名字（显示邮箱文本 + Name input，placeholder "Maria José Silva"）
-                # 两种都处理
-                email_ok = False
+                    raise RuntimeError(f"enter-email 重试超 5 次: {page.url}")
+                self.log(f"AWS: enter-email (第{enter_email_retries}次)")
+                time.sleep(1.5)
                 for sel in email_selectors:
                     try:
                         el = page.query_selector(sel)
                         if el and el.is_visible():
                             cur = el.input_value() or ""
                             if not cur:
-                                el.click()
                                 el.fill(email)
-                                time.sleep(0.2)
-                            email_ok = bool(el.input_value())
                             break
                     except Exception:
                         pass
-
-                # 如果没有 email input，检查是否有 name input（AWS 把 enter-email 和 enter-name 合并了）
-                if not email_ok:
-                    name = _random_name()
-                    name_filled = False
-                    # 单个 Name 框（placeholder "Maria José Silva"）
-                    single_name_sels = [
-                        'input[placeholder*="Maria"]',
-                        'input[placeholder*="name" i]',
-                        'input[name="name"]',
-                        'input[name="fullName"]',
-                    ]
-                    for sel in single_name_sels:
+                # 同页可能有 name 输入框
+                name = _random_name()
+                name_filled = False
+                name_deadline = time.time() + 10
+                while time.time() < name_deadline and not name_filled:
+                    for sel in name_selectors:
                         try:
                             el = page.query_selector(sel)
                             if el and el.is_visible():
                                 el.click()
-                                time.sleep(0.1)
+                                time.sleep(0.2)
                                 el.fill(name)
-                                time.sleep(0.1)
                                 if el.input_value():
                                     self.log(f"填写姓名: {name}")
                                     name_filled = True
@@ -310,117 +270,55 @@ class KiroBrowserRegister:
                         except Exception:
                             pass
                     if not name_filled:
-                        self.log("enter-email 页无邮箱/姓名输入框，直接提交")
-
-                # 注意：新版 AWS enter-email 页面只有邮箱，姓名在下一步 enter-name
-                # 不要在这里填姓名——之前误匹配到 username/其它字段导致 AWS 拒绝提交
+                        time.sleep(0.5)
+                if not name_filled:
+                    self.log("enter-email 页无姓名框，直接提交")
                 time.sleep(0.5)
                 _click_submit_button(page, timeout=8)
                 handled_steps.add("enter-email")
-                # 等待 hash 变化（最多 20 秒）。AWS 有时响应慢。
                 start_wait = time.time()
-                advanced = False
-                while time.time() - start_wait < 20:
+                while time.time() - start_wait < 15:
                     time.sleep(0.5)
-                    new_url = page.url
-                    new_hash = new_url.split("#")[-1] if "#" in new_url else ""
+                    new_hash = page.url.split("#")[-1] if "#" in page.url else ""
                     if new_hash != hash_part:
-                        advanced = True
-                        break  # hash 变了，进入下一步
-                if not advanced:
-                    # 20 秒后 hash 未变，提交可能失败，允许重试
-                    self.log("⚠️ enter-email 提交后 URL 未变化，将重试")
+                        break
+                else:
+                    self.log("enter-email 提交后 URL 未变化，重试")
                     handled_steps.discard("enter-email")
                     hash_stuck_since = time.time()
                 continue
 
-            # --- enter-name 步 ---
-            # 新版 AWS 把 First name / Last name 拆成两个独立输入框；
-            # 老版本是单个 Full name。两种都处理。
+            # --- enter-name ---
             if "enter-name" in hash_part and "enter-name" not in handled_steps:
-                self.log("AWS 步骤: 填写姓名")
+                self.log("AWS: enter-name")
                 time.sleep(1.5)
                 name = _random_name()
-                parts = name.split(" ", 1)
-                first_name = parts[0] if parts else "User"
-                last_name = parts[1] if len(parts) > 1 else "User"
-
-                # 先尝试两个独立框
-                first_sels = [
-                    'input[placeholder*="First" i]',
-                    'input[name*="first" i]',
-                    'input[id*="first" i]',
-                    'input[autocomplete="given-name"]',
-                ]
-                last_sels = [
-                    'input[placeholder*="Last" i]',
-                    'input[name*="last" i]',
-                    'input[id*="last" i]',
-                    'input[autocomplete="family-name"]',
-                ]
-
-                def _try_fill(sels, val):
-                    for sel in sels:
+                name_filled = False
+                name_deadline = time.time() + 15
+                while time.time() < name_deadline and not name_filled:
+                    for sel in name_selectors:
                         try:
                             el = page.query_selector(sel)
                             if el and el.is_visible():
                                 el.click()
-                                time.sleep(0.1)
-                                el.fill(val)
-                                time.sleep(0.1)
+                                time.sleep(0.2)
+                                el.fill(name)
                                 if el.input_value():
-                                    return True
+                                    self.log(f"填写姓名: {name}")
+                                    name_filled = True
+                                    break
                         except Exception:
                             pass
-                    return False
-
-                first_ok = False
-                last_ok = False
-                name_deadline = time.time() + 15
-                while time.time() < name_deadline and not (first_ok and last_ok):
-                    if not first_ok:
-                        first_ok = _try_fill(first_sels, first_name)
-                    if not last_ok:
-                        last_ok = _try_fill(last_sels, last_name)
-                    if first_ok and last_ok:
-                        break
-                    time.sleep(0.3)
-
-                if first_ok and last_ok:
-                    self.log(f"填写 First/Last name: {first_name} / {last_name}")
-                else:
-                    # Fallback：老版单 Full name
-                    name_filled = False
-                    fallback_deadline = time.time() + 10
-                    while time.time() < fallback_deadline and not name_filled:
-                        for sel in name_selectors:
-                            try:
-                                el = page.query_selector(sel)
-                                if el and el.is_visible():
-                                    el.click()
-                                    time.sleep(0.2)
-                                    el.fill(name)
-                                    if el.input_value():
-                                        self.log(f"填写 Full name: {name}")
-                                        name_filled = True
-                                        break
-                            except Exception:
-                                pass
-                        if not name_filled:
-                            time.sleep(0.5)
                     if not name_filled:
-                        self.log("⚠️ enter-name 未找到姓名输入框")
-
+                        time.sleep(0.5)
                 _click_submit_button(page, timeout=5)
                 handled_steps.add("enter-name")
                 time.sleep(2)
                 continue
 
-            # --- verify-email 步 ---
-            # AWS 可能把这个步骤命名为 verify-email / verify-otp 两种 hash 之一（不同版本）
+            # --- verify-email / verify-otp ---
             if ("verify-email" in hash_part or "verify-otp" in hash_part) and "verify-email" not in handled_steps:
-                self.log("AWS 步骤: 填写验证码")
-                # 等待 OTP 输入框出现
+                self.log("AWS: verify-email")
                 otp_el = None
                 otp_deadline = time.time() + 30
                 while time.time() < otp_deadline:
@@ -435,16 +333,13 @@ class KiroBrowserRegister:
                     if otp_el:
                         break
                     time.sleep(1)
-
                 if not otp_el:
                     raise RuntimeError(f"未出现验证码输入框: {page.url}")
-
                 if not self.otp_callback:
-                    raise RuntimeError("Kiro 注册需要邮箱验证码但未提供 otp_callback")
-
+                    raise RuntimeError("需要 otp_callback")
                 code = self.otp_callback()
                 if not code:
-                    raise RuntimeError("未获取到邮箱验证码")
+                    raise RuntimeError("未获取到验证码")
                 self.log(f"填写验证码: {code}")
                 otp_el.click()
                 for digit in str(code).strip():
@@ -456,17 +351,15 @@ class KiroBrowserRegister:
                 time.sleep(2)
                 continue
 
-            # --- create-password 步 ---
-            # AWS 有时会在 verify-otp 成功后直接替换组件为密码页但不改 hash，
-            # 所以这里既匹配 hash 也主动查 DOM 上有没有可见的密码输入框。
+            # --- create-password (hash or DOM) ---
             page_has_pwd = False
             try:
-                pwd_el_check = page.query_selector('input[type="password"]')
-                page_has_pwd = bool(pwd_el_check and pwd_el_check.is_visible())
+                pwd_check = page.query_selector('input[type="password"]')
+                page_has_pwd = bool(pwd_check and pwd_check.is_visible())
             except Exception:
-                page_has_pwd = False
+                pass
             if ("create-password" in hash_part or page_has_pwd) and "create-password" not in handled_steps:
-                self.log("AWS 步骤: 设置密码")
+                self.log("AWS: create-password")
                 time.sleep(1)
                 pwd_fields = []
                 for sel in pwd_selectors:
@@ -489,14 +382,13 @@ class KiroBrowserRegister:
                 time.sleep(2)
                 continue
 
-            # 没有 hash 的情况：可能在中间跳转页，等待
             time.sleep(1)
 
         raise RuntimeError(f"AWS Builder ID 注册未在规定时间内完成: {page.url}")
 
     def run(self, email: str, password: str) -> dict:
         if not self.otp_callback:
-            raise RuntimeError("Kiro 注册需要邮箱验证码但未提供 otp_callback")
+            raise RuntimeError("需要 otp_callback")
 
         if not password:
             password = (
@@ -519,12 +411,11 @@ class KiroBrowserRegister:
             page.goto(f"{KIRO_URL}/signin", wait_until="domcontentloaded", timeout=30000)
             time.sleep(2)
 
-            # 2. 点击 AWS Builder ID 选项
+            # 2. 点击 AWS Builder ID
             self.log("选择 AWS Builder ID 登录方式")
             builder_clicked = False
             deadline_builder = time.time() + 15
             while time.time() < deadline_builder and not builder_clicked:
-                # Playwright locator 文本精确匹配
                 for text in ["Builder ID", "AWS Builder ID"]:
                     try:
                         el = page.locator(f'text="{text}"').last
@@ -536,7 +427,6 @@ class KiroBrowserRegister:
                     except Exception:
                         pass
                 if not builder_clicked:
-                    # JS walker fallback
                     builder_clicked = _js_click_by_text(page, "Builder ID", "AWS Builder ID")
                     if builder_clicked:
                         self.log("点击了 Builder ID (JS)")
@@ -545,19 +435,19 @@ class KiroBrowserRegister:
 
             time.sleep(2)
 
-            # 3. 可能有二级 "Sign in" 箭头（Kiro 的选项卡 UI）
+            # 3. 可能有二级 Sign in 按钮
             _click_submit_button(page, timeout=5)
             time.sleep(2)
 
-            # 4. 等待进入 AWS 域名
+            # 4. 等待 AWS 域名
             self.log("等待 AWS 登录页...")
             if not _wait_for_url(page, AWS_SIGNIN_DOMAIN, timeout=30):
                 if AWS_PROFILE_DOMAIN not in page.url:
-                    raise RuntimeError(f"未跳转到 AWS 登录页: {page.url}")
+                    raise RuntimeError(f"未跳转到 AWS: {page.url}")
 
             time.sleep(2)
 
-            # 5. 如果落在 signin.aws（已有账号登录页），先填邮箱提交
+            # 5. signin.aws 填邮箱
             if AWS_SIGNIN_DOMAIN in page.url:
                 self.log(f"填写邮箱: {email}")
                 email_selectors = [
@@ -572,11 +462,10 @@ class KiroBrowserRegister:
                 _click_submit_button(page, timeout=8)
                 time.sleep(3)
 
-            # 6. 填完邮箱 submit 后，AWS 会跳转到 profile.aws
-            # 但跳转方式可能是 SPA 内部路由，page.url 不一定立刻变
-            # 所以不死等 URL，直接短暂等待后进入 SPA 处理主循环
+            # 6. signin.aws 填完邮箱后页面会跳到 profile.aws
+            # 某些环境 page.url 不会立刻更新，所以不死等 URL
+            # 短暂等待后直接进入 SPA 主循环（它自己会读 page.url / hash）
             time.sleep(5)
-            # 如果已有账号直接跳回了 kiro.dev，不用走注册流程
             if "kiro.dev" in page.url:
                 self.log("已有账号，直接登录成功")
             else:
@@ -590,14 +479,13 @@ class KiroBrowserRegister:
 
             time.sleep(3)
 
-            # 8. 提取 Cognito tokens
+            # 8. 提取 tokens
             self.log("提取 Kiro 访问令牌...")
             tokens = _get_kiro_tokens(page, timeout=60)
             if not tokens:
-                # 打出 localStorage keys 帮助调试
                 try:
                     keys = page.evaluate("() => Object.keys(localStorage)")
-                    self.log(f"⚠️ localStorage keys: {keys[:20]}")
+                    self.log(f"localStorage keys: {keys[:20]}")
                 except Exception:
                     pass
 
