@@ -505,9 +505,28 @@ class TaskSupervisor:
 
                     try:
                         account = instance.register(email=None, password=None)
-                        completed += 1
                         email = getattr(account, "email", "") or ""
                         token = getattr(account, "token", "") or ""
+                        # vendor 有时会返回"部分成功"的 Account（token 为空但没 raise），
+                        # 这种不能算成功账号，更不能入库——直接跳过本轮
+                        extra_check = dict(getattr(account, "extra", {}) or {})
+                        _has_credential = bool(
+                            token
+                            or extra_check.get("accessToken")
+                            or extra_check.get("refreshToken")
+                            or extra_check.get("session_token")
+                            or extra_check.get("auth_token")
+                        )
+                        if not _has_credential:
+                            failed += 1
+                            last_error = f"账号无有效凭证(token/accessToken/refreshToken 均为空)，跳过入库"
+                            with console_path.open("a", encoding="utf-8") as log:
+                                log.write(
+                                    f"[{now_iso()}] [Error] 第 {round_no} 轮失败: {last_error}\n"
+                                )
+                            continue
+
+                        completed += 1
                         last_email = email
 
                         # 从 vendor Account 提取 lifecycle / plan / validity
@@ -516,7 +535,7 @@ class TaskSupervisor:
                         lifecycle_status = str(
                             getattr(_status, "value", _status) or "registered"
                         )
-                        extra = dict(getattr(account, "extra", {}) or {})
+                        extra = extra_check
                         overview = extra.get("account_overview") or {}
                         if not isinstance(overview, dict):
                             overview = {}

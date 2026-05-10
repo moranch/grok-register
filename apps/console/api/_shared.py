@@ -223,6 +223,9 @@ class AccountUpdate(BaseModel):
     validity_status: str | None = Field(None, pattern="^(valid|invalid|unknown)$")
     notes: str | None = None
     last_error: str | None = None
+    sso: str | None = None
+    email: str | None = None
+    password: str | None = None
 
 
 # ================================================================
@@ -1459,6 +1462,9 @@ def account_update(
     validity_status: str | None = None,
     notes: str | None = None,
     last_error: str | None = None,
+    sso: str | None = None,
+    email: str | None = None,
+    password: str | None = None,
 ) -> dict[str, Any]:
     row = fetch_one("SELECT * FROM accounts WHERE id = ?", (account_id,))
     if not row:
@@ -1480,6 +1486,15 @@ def account_update(
     if last_error is not None:
         fields.append("last_error = ?")
         params.append(last_error)
+    if sso is not None:
+        fields.append("sso = ?")
+        params.append(sso)
+    if email is not None:
+        fields.append("email = ?")
+        params.append(email)
+    if password is not None:
+        fields.append("password = ?")
+        params.append(password)
     if not fields:
         return _account_row_to_dict(row)
     params.append(account_id)

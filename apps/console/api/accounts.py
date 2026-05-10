@@ -68,6 +68,9 @@ def api_account_update(
         validity_status=payload.validity_status,
         notes=payload.notes,
         last_error=payload.last_error,
+        sso=payload.sso,
+        email=payload.email,
+        password=payload.password,
     )
     return {"account": row}
 
