@@ -1429,19 +1429,20 @@ def _account_row_to_dict(r: sqlite3.Row) -> dict[str, Any]:
     # windsurf: sso 格式 "devin-session-token$eyJ..."
     if sso.startswith("devin-session-token$"):
         tokens["session_token"] = sso[len("devin-session-token$"):]
-    elif sso:
-        tokens["session_token"] = sso
-    # extra_json 里可能有更多 token
+    # extra_json 里的 token 优先（更精确）
     if extra.get("accessToken"):
         tokens["access_token"] = extra["accessToken"]
     if extra.get("refreshToken"):
         tokens["refresh_token"] = extra["refreshToken"]
     if extra.get("idToken"):
         tokens["id_token"] = extra["idToken"]
-    if extra.get("session_token") and not tokens["session_token"]:
+    if extra.get("session_token"):
         tokens["session_token"] = extra["session_token"]
-    if extra.get("auth_token") and not tokens["access_token"]:
-        tokens["access_token"] = extra["auth_token"]
+    if extra.get("auth_token") and not tokens["session_token"]:
+        tokens["session_token"] = extra["auth_token"]
+    # 如果 extra 里没拆出 access_token，且 sso 不是 session 格式，当作 access_token
+    if not tokens["access_token"] and sso and not sso.startswith("devin-session-token$"):
+        tokens["access_token"] = sso
 
     return {
         "id": int(r["id"]),
