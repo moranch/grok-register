@@ -263,7 +263,7 @@ class KiroPlatform(BasePlatform):
                 }
             return {"ok": False, "error": result.get("error", "刷新失败")}
 
-        elif action_id == "get_account_state":
+        elif action_id in ("get_account_state", "query_state"):
             from platforms._vendor_aar.kiro.switch import (
                 get_kiro_portal_state,
                 read_current_kiro_account,
