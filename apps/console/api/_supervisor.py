@@ -489,7 +489,7 @@ class TaskSupervisor:
                 for round_no in range(1, target_count + 1):
                     # 检查停止信号
                     if stop_event.is_set():
-                        last_error = "Task stopped by user"
+                        last_error = ""  # 用户主动停止不算错误
                         with console_path.open("a", encoding="utf-8") as log:
                             log.write(f"[{now_iso()}] [Stopped] 用户手动停止\n")
                         break
@@ -605,6 +605,9 @@ class TaskSupervisor:
                         break
 
                     except Exception as e:
+                        # 用户停止触发的异常不算失败
+                        if stop_event.is_set() and "stopped" in str(e).lower():
+                            break
                         failed += 1
                         last_error = f"{type(e).__name__}: {e}"
                         with console_path.open("a", encoding="utf-8") as log:
