@@ -240,17 +240,31 @@ class BridgeMailbox(BaseMailbox):
                             logger.debug(f"拉邮件详情异常 id={mail_id}: {e}")
                             continue
 
+                        # ★ 最高优先级：TMail API 自己提取的验证码（code_found=true）
+                        # TMail v3 对 AWS/Windsurf/Kiro 等常见邮件格式有服务端解析
+                        server_code = str(d.get("code") or "").strip()
+                        code_found = bool(d.get("code_found"))
+                        if code_found and server_code and pattern.fullmatch(server_code):
+                            return server_code
+
                         content = str(d.get("content", ""))
-                        # 先从 content 正则抓 6 位数字
-                        m = pattern.search(content)
+                        # 把 HTML 的 style 块、CSS 注释、内联样式整体移除，
+                        # 避免正则错抓到 color: #555555 这类十六进制颜色。
+                        cleaned = re.sub(r"<style[^>]*>.*?</style>", " ", content, flags=re.I | re.S)
+                        cleaned = re.sub(r'\bstyle="[^"]*"', " ", cleaned, flags=re.I)
+                        cleaned = re.sub(r"\bstyle='[^']*'", " ", cleaned, flags=re.I)
+                        # 剥 HTML 标签
+                        cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+
+                        # 再从清理过的正文里抓 6 位数字
+                        m = pattern.search(cleaned)
                         if m:
                             code = m.group(1) if m.groups() else m.group(0)
                             if code and code.lower() != "none":
                                 return code
 
                         # 兜底：subject 里有时也带验证码（比如 "Verify ... - 368905"）
-                        full_text = f"{subject} {content}"
-                        m2 = pattern.search(full_text)
+                        m2 = pattern.search(subject)
                         if m2:
                             code = m2.group(1) if m2.groups() else m2.group(0)
                             if code and code.lower() != "none":
