@@ -143,7 +143,12 @@ def api_account_query_state(request: Request, account_id: int) -> dict[str, Any]
         action_id="query_state",
         params={},
     )
-    result = runtime.execute_action(cmd)
+    try:
+        result = runtime.execute_action(cmd)
+    except NotImplementedError as exc:
+        return {"ok": False, "error": f"该平台不支持查询状态: {exc}"}
+    except Exception as exc:
+        return {"ok": False, "error": f"查询失败: {exc}"}
 
     if result.ok and isinstance(result.data, dict):
         # 把结果写回我们的 accounts 表
