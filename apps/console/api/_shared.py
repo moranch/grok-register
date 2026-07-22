@@ -70,7 +70,7 @@ DOWNLOAD_GATE_INTERNAL_URL = os.getenv(
 ).rstrip("/")
 DOWNLOAD_GATE_INTERNAL_TOKEN = os.getenv("DOWNLOAD_GATE_INTERNAL_TOKEN", "").strip()
 DOWNLOAD_GATE_PUBLIC_URL = os.getenv(
-    "DOWNLOAD_GATE_PUBLIC_URL", "http://localhost:8787"
+    "DOWNLOAD_GATE_PUBLIC_URL", "http://localhost:18787"
 ).rstrip("/")
 CPA_AUTH_DIR = Path(
     os.getenv("GROK_REGISTER_CPA_AUTH_DIR", str(REPO_ROOT / "runtime" / "cpa-auth"))
