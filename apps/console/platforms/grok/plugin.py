@@ -67,7 +67,7 @@ class GrokPlatform(BasePlatform):
         ),
     ]
     preferred_captcha_strategies = ["browser", "token"]
-    supported_exporters = ["any2api", "grok2api"]
+    supported_exporters = ["any2api", "grok2api", "cpa"]
     default_extra_schema = {
         "type": "object",
         "properties": {

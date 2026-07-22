@@ -1,0 +1,100 @@
+import gc
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from api import _shared
+from api._cpa_runtime import CpaMintRuntime
+
+
+class CpaRuntimeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.old_db_path = _shared.DB_PATH
+        _shared.DB_PATH = Path(self.temp.name) / "console.db"
+        _shared.init_db()
+        self.runtime = CpaMintRuntime()
+        self.config = {
+            "enabled": True,
+            "endpoint": "",
+            "extra": {
+                "auth_dir": self.temp.name,
+                "base_url": "https://cli-chat-proxy.grok.com/v1",
+                "prevalidate_enabled": True,
+                "prevalidate_ttl_minutes": 60,
+                "prevalidate_batch_size": 10,
+                "prevalidate_scan_seconds": 30,
+            },
+        }
+
+    def tearDown(self):
+        _shared.DB_PATH = self.old_db_path
+        gc.collect()
+        self.temp.cleanup()
+
+    def add_account(self) -> int:
+        return _shared.execute(
+            """
+            INSERT INTO accounts
+                (platform, email, sso, extra_json, status, lifecycle_status,
+                 validity_status, created_at)
+            VALUES ('grok', 'prevalidate@example.com', 'sso', ?, 'active',
+                    'registered', 'valid', ?)
+            """,
+            (
+                json.dumps(
+                    {
+                        "access_token": "existing-access",
+                        "refresh_token": "existing-refresh",
+                        "cpa": {
+                            "status": "ready",
+                            "probe": {"ok": True, "has_grok_45": True},
+                            "updated_at": "2020-01-01 00:00:00",
+                        },
+                    }
+                ),
+                _shared.now_iso(),
+            ),
+        )
+
+    def test_existing_valid_token_is_probed_without_mint(self):
+        account_id = self.add_account()
+        probe = {
+            "ok": True,
+            "status": 200,
+            "model_ids": ["grok-4.5"],
+            "has_grok_45": True,
+            "probe_kind": "account_response",
+            "probe_version": 2,
+        }
+        with (
+            patch.object(self.runtime, "config", return_value=self.config),
+            patch("api._cpa_runtime.probe_cpa_models", return_value=probe) as live_probe,
+            patch("api._cpa_runtime.exchange_sso_for_token") as mint,
+        ):
+            ok, error = self.runtime._mint_account(account_id, force=False)
+
+        self.assertTrue(ok)
+        self.assertEqual(error, "")
+        live_probe.assert_called_once()
+        mint.assert_not_called()
+        row = _shared.fetch_one("SELECT extra_json FROM accounts WHERE id=?", (account_id,))
+        cpa = json.loads(row["extra_json"])["cpa"]
+        self.assertTrue(cpa["probe"]["has_grok_45"])
+        self.assertTrue(cpa["probe_checked_at"])
+
+    def test_scheduler_enqueues_stale_undelivered_account(self):
+        account_id = self.add_account()
+        with (
+            patch.object(self.runtime, "config", return_value=self.config),
+            patch.object(self.runtime, "enqueue", wraps=self.runtime.enqueue) as enqueue,
+        ):
+            self.runtime._schedule_prevalidation()
+
+        enqueue.assert_called_once_with(account_id, force=False)
+
+
+if __name__ == "__main__":
+    unittest.main()

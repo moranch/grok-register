@@ -15,6 +15,11 @@ from ._shared import WEBUI_DIR
 
 root_router = APIRouter(tags=["frontend"])
 spa_router = APIRouter(tags=["frontend"])
+NO_STORE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
 
 
 @root_router.get("/", response_class=HTMLResponse)
@@ -22,7 +27,10 @@ def index(request: Request) -> HTMLResponse:
     """返回前端 index.html。登录重定向由前端自己处理（通过 /api/auth/status 检查）。"""
     new_frontend = WEBUI_DIR / "index.html"
     if new_frontend.exists():
-        return HTMLResponse(content=new_frontend.read_text(encoding="utf-8"))
+        return HTMLResponse(
+            content=new_frontend.read_text(encoding="utf-8"),
+            headers=NO_STORE_HEADERS,
+        )
     return HTMLResponse(
         status_code=503,
         content=(
@@ -40,7 +48,10 @@ def spa_fallback(full_path: str) -> HTMLResponse:
         raise HTTPException(status_code=404, detail=f"API 路由不存在: /{full_path}")
     new_frontend = WEBUI_DIR / "index.html"
     if new_frontend.exists():
-        return HTMLResponse(content=new_frontend.read_text(encoding="utf-8"))
+        return HTMLResponse(
+            content=new_frontend.read_text(encoding="utf-8"),
+            headers=NO_STORE_HEADERS,
+        )
     return HTMLResponse(
         status_code=503,
         content=(

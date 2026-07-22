@@ -1115,6 +1115,15 @@ def append_sso_to_txt(sso_value, output_path=DEFAULT_SSO_FILE):
 
 
 def push_sso_to_api(new_tokens: list):
+    # Console supervisor owns durable per-account delivery. Keeping the legacy
+    # in-task sender enabled would call the removed grok2api 2.x endpoint and
+    # then duplicate the supervisor's v3 import.
+    if str(os.getenv("GROK_REGISTER_DEFER_API_PUSH", "")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        print("[*] 注册结果已交由 Console Supervisor 逐账号推送。")
+        return
+
     # 推送 SSO token 到 grok2api 管理接口。
     # append=false：直接将本次 token 列表全量推送（覆盖）。
     # append=true（默认）：先 GET 查询线上现有 token，合并本次后全量推送。
@@ -1145,6 +1154,30 @@ def push_sso_to_api(new_tokens: list):
     }
 
     tokens_to_push = [t for t in new_tokens if t]
+
+    # grok2api 2.x 的 /admin/api/tokens/add 本身就是增量接口，
+    # 不需要先 GET 全量再覆盖。
+    if endpoint.rstrip("/").endswith("/admin/api/tokens/add"):
+        try:
+            resp = requests.post(
+                endpoint,
+                json={"tokens": tokens_to_push, "pool": "auto", "tags": ["grok-register"]},
+                headers=headers,
+                timeout=90,
+                verify=False,
+            )
+            if resp.status_code == 200:
+                data = resp.json() if resp.content else {}
+                print(
+                    f"[*] SSO token 已增量推送到 grok2api 2.x "
+                    f"(added={data.get('count', len(tokens_to_push))}, "
+                    f"skipped={data.get('skipped', 0)})"
+                )
+            else:
+                print(f"[Warn] grok2api 2.x 推送失败: HTTP {resp.status_code} {resp.text[:200]}")
+        except Exception as e:
+            print(f"[Warn] grok2api 2.x 推送异常: {e}")
+        return
 
     if append_mode:
         try:

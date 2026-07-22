@@ -14,10 +14,11 @@ import sqlite3
 import subprocess
 import threading
 import time
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import requests
@@ -44,6 +45,7 @@ SUPERVISOR_INTERVAL = max(1.0, float(os.getenv("GROK_REGISTER_CONSOLE_POLL_INTER
 
 PROJECT_FILES = ("DrissionPage_example.py", "email_register.py")
 PROJECT_DIRS = ("turnstilePatch",)
+PROJECT_AUX_FILES = ((APP_DIR / "core" / "hotmail_pool.py", "hotmail_pool.py"),)
 
 STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
@@ -54,13 +56,25 @@ STATUS_FAILED = "failed"
 STATUS_STOPPED = "stopped"
 
 LINE_RE_ROUND = re.compile(r"开始第\s*(\d+)\s*轮注册")
-LINE_RE_SUCCESS = re.compile(r"注册成功\s*\|\s*email=([^|\s]+)")
+LINE_RE_SUCCESS = re.compile(
+    r"注册成功\s*\|\s*email=([^|\s]+)(?:\s*\|\s*password=([^|\s]*))?"
+)
 LINE_RE_ERROR = re.compile(r"\[Error\]\s*第\s*(\d+)\s*轮失败:\s*(.+)")
 LINE_RE_TEMP_EMAIL = re.compile(r"临时邮箱创建成功:\s*([^\s]+)")
 LINE_RE_FILLED_EMAIL = re.compile(r"已填写邮箱并点击注册:\s*([^\s]+)")
 LINE_RE_PUSH = re.compile(r"SSO token 已推送到 API")
 
 CONSOLE_PASSWORD = os.getenv("GROK_REGISTER_CONSOLE_PASSWORD", "")
+DOWNLOAD_GATE_INTERNAL_URL = os.getenv(
+    "DOWNLOAD_GATE_INTERNAL_URL", "http://download-gate:8787"
+).rstrip("/")
+DOWNLOAD_GATE_INTERNAL_TOKEN = os.getenv("DOWNLOAD_GATE_INTERNAL_TOKEN", "").strip()
+DOWNLOAD_GATE_PUBLIC_URL = os.getenv(
+    "DOWNLOAD_GATE_PUBLIC_URL", "http://localhost:8787"
+).rstrip("/")
+CPA_AUTH_DIR = Path(
+    os.getenv("GROK_REGISTER_CPA_AUTH_DIR", str(REPO_ROOT / "runtime" / "cpa-auth"))
+).expanduser().resolve()
 
 
 # ================================================================
@@ -86,24 +100,24 @@ def get_conn() -> sqlite3.Connection:
 
 
 def fetch_all(query: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
-    with db_lock, get_conn() as conn:
+    with db_lock, closing(get_conn()) as conn:
         return conn.execute(query, params).fetchall()
 
 
 def fetch_one(query: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
-    with db_lock, get_conn() as conn:
+    with db_lock, closing(get_conn()) as conn:
         return conn.execute(query, params).fetchone()
 
 
 def execute(query: str, params: tuple[Any, ...] = ()) -> int:
-    with db_lock, get_conn() as conn:
+    with db_lock, closing(get_conn()) as conn:
         cur = conn.execute(query, params)
         conn.commit()
         return int(cur.lastrowid)
 
 
 def execute_no_return(query: str, params: tuple[Any, ...] = ()) -> None:
-    with db_lock, get_conn() as conn:
+    with db_lock, closing(get_conn()) as conn:
         conn.execute(query, params)
         conn.commit()
 
@@ -193,22 +207,24 @@ class MailboxItem(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
     provider_type: str = Field(
         "tmail",
-        pattern="^(tmail|duckmail|moemail|laoudo|cloudflare_worker|freemail|testmail|tempmail_lol|duckduckgo|custom)$",
+        pattern="^(tmail|duckmail|moemail|hotmail|outlookmail|laoudo|cloudflare_worker|freemail|testmail|tempmail_lol|duckduckgo|custom)$",
     )
     api_base: str = Field(..., min_length=1)
     admin_password: str = ""
     domain: str = ""
     site_password: str = ""
+    config: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
 
 
 class MailboxUpdate(BaseModel):
     name: str | None = None
-    provider_type: str | None = Field(None, pattern="^(tmail|duckmail|moemail|custom)$")
+    provider_type: str | None = Field(None, pattern="^(tmail|duckmail|moemail|hotmail|outlookmail|custom)$")
     api_base: str | None = None
     admin_password: str | None = None
     domain: str | None = None
     site_password: str | None = None
+    config: dict[str, Any] | None = None
     enabled: bool | None = None
     reset_stats: bool | None = None
 
@@ -226,6 +242,16 @@ class AccountUpdate(BaseModel):
     sso: str | None = None
     email: str | None = None
     password: str | None = None
+    session_token: str | None = None
+    access_token: str | None = None
+    refresh_token: str | None = None
+    id_token: str | None = None
+
+
+class AccountDeliveryCreate(BaseModel):
+    account_ids: list[int] = Field(..., min_length=1, max_length=500)
+    title: str | None = Field(None, max_length=80)
+    pack_mode: Literal["bundle"] = "bundle"
 
 
 # ================================================================
@@ -328,10 +354,27 @@ def merged_defaults() -> dict[str, Any]:
         if key in saved:
             base[key] = str(saved.get(key, ""))
     api_base = dict(base.get("api") or {})
-    if "api_endpoint" in saved:
-        api_base["endpoint"] = str(saved.get("api_endpoint", ""))
-    if "api_token" in saved:
-        api_base["token"] = str(saved.get("api_token", ""))
+    saved_endpoint = str(saved.get("api_endpoint", "") or "").strip()
+    saved_token = str(saved.get("api_token", "") or "").strip()
+    if saved_endpoint:
+        api_base["endpoint"] = saved_endpoint
+    if saved_token:
+        api_base["token"] = saved_token
+
+    # 旧 system settings 可能保存了空 endpoint。启用 grok2api Exporter 时，
+    # 复用同一份端点/口令，避免健康检查与注册任务配置出现两套真相。
+    if not str(api_base.get("endpoint", "") or "").strip():
+        exporter_row = fetch_one("SELECT value FROM settings WHERE key = ?", ("exporter_grok2api",))
+        if exporter_row:
+            try:
+                exporter_config = json.loads(exporter_row["value"] or "{}")
+            except Exception:
+                exporter_config = {}
+            if exporter_config.get("enabled"):
+                api_base["endpoint"] = str(exporter_config.get("endpoint") or "").strip()
+                exporter_extra = exporter_config.get("extra") or {}
+                if not str(api_base.get("token", "") or "").strip():
+                    api_base["token"] = str(exporter_extra.get("auth_token") or "").strip()
     if "api_append" in saved:
         api_base["append"] = bool(saved.get("api_append", True))
     base["api"] = api_base
@@ -519,6 +562,8 @@ def copy_source_to_task_dir(task_dir: Path, task_config: dict[str, Any]) -> None
     task_dir.mkdir(parents=True, exist_ok=True)
     for file_name in PROJECT_FILES:
         shutil.copy2(SOURCE_PROJECT / file_name, task_dir / file_name)
+    for source, target_name in PROJECT_AUX_FILES:
+        shutil.copy2(source, task_dir / target_name)
     for dir_name in PROJECT_DIRS:
         src = SOURCE_PROJECT / dir_name
         dst = task_dir / dir_name
@@ -683,7 +728,7 @@ if not WEBUI_DIR.exists():
 def init_db() -> None:
     """初始化数据库结构：创建 settings / tasks / proxies / register_events / accounts / mailbox_providers 表。"""
     ensure_dirs()
-    with db_lock, get_conn() as conn:
+    with db_lock, closing(get_conn()) as conn:
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS settings (
@@ -767,6 +812,57 @@ def init_db() -> None:
                 UNIQUE(email, sso)
             );
 
+            CREATE TABLE IF NOT EXISTS delivery_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                card_key TEXT NOT NULL UNIQUE,
+                platform TEXT NOT NULL DEFAULT 'grok',
+                required_model TEXT NOT NULL DEFAULT 'grok-4.5',
+                state TEXT NOT NULL DEFAULT 'pending',
+                source TEXT NOT NULL DEFAULT 'dynamic',
+                title TEXT NOT NULL DEFAULT '',
+                bundle_id TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                committed_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS account_delivery_leases (
+                id TEXT PRIMARY KEY,
+                order_id INTEGER NOT NULL,
+                account_id INTEGER NOT NULL,
+                lease_token TEXT NOT NULL,
+                state TEXT NOT NULL,
+                probe_json TEXT NOT NULL DEFAULT '{}',
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                expires_at TEXT,
+                FOREIGN KEY(order_id) REFERENCES delivery_orders(id),
+                FOREIGN KEY(account_id) REFERENCES accounts(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS account_delivery_consumptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL,
+                lease_id TEXT,
+                account_id INTEGER NOT NULL UNIQUE,
+                card_key TEXT NOT NULL,
+                bundle_id TEXT NOT NULL DEFAULT '',
+                document_json TEXT NOT NULL,
+                consumed_at TEXT NOT NULL,
+                FOREIGN KEY(order_id) REFERENCES delivery_orders(id),
+                FOREIGN KEY(lease_id) REFERENCES account_delivery_leases(id),
+                FOREIGN KEY(account_id) REFERENCES accounts(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_delivery_consumptions_card
+                ON account_delivery_consumptions(card_key);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_active_account
+                ON account_delivery_leases(account_id)
+                WHERE state IN ('probing', 'ready', 'packing');
+            CREATE INDEX IF NOT EXISTS idx_delivery_leases_order
+                ON account_delivery_leases(order_id);
+
             CREATE TABLE IF NOT EXISTS mailbox_providers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -775,6 +871,7 @@ def init_db() -> None:
                 admin_password TEXT NOT NULL DEFAULT '',
                 domain TEXT NOT NULL DEFAULT '',
                 site_password TEXT NOT NULL DEFAULT '',
+                config_json TEXT NOT NULL DEFAULT '{}',
                 enabled INTEGER NOT NULL DEFAULT 1,
                 success_count INTEGER NOT NULL DEFAULT 0,
                 failure_count INTEGER NOT NULL DEFAULT 0,
@@ -809,6 +906,13 @@ def init_db() -> None:
                 except sqlite3.OperationalError:
                     pass
 
+        _mailbox_cols = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(mailbox_providers)").fetchall()
+        }
+        if "config_json" not in _mailbox_cols:
+            conn.execute("ALTER TABLE mailbox_providers ADD COLUMN config_json TEXT NOT NULL DEFAULT '{}'")
+
         # 兼容迁移：给旧的 tasks 表补多平台字段
         _task_cols = {
             r["name"]
@@ -826,6 +930,43 @@ def init_db() -> None:
                     conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {col_type}")
                 except sqlite3.OperationalError:
                     pass
+
+        # 交付卡密必须绑定目标平台。旧订单保持 Grok 语义，避免升级后串池。
+        _delivery_order_cols = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(delivery_orders)").fetchall()
+        }
+        if "platform" not in _delivery_order_cols:
+            try:
+                conn.execute(
+                    "ALTER TABLE delivery_orders "
+                    "ADD COLUMN platform TEXT NOT NULL DEFAULT 'grok'"
+                )
+            except sqlite3.OperationalError:
+                pass
+        # 老的手动交付订单可从租约账号恢复平台；历史动态卡保持 Grok 默认值。
+        conn.execute(
+            """
+            UPDATE delivery_orders
+            SET platform = COALESCE(
+                (
+                    SELECT a.platform
+                    FROM account_delivery_leases l
+                    JOIN accounts a ON a.id = l.account_id
+                    WHERE l.order_id = delivery_orders.id
+                    ORDER BY l.created_at, l.account_id
+                    LIMIT 1
+                ),
+                platform,
+                'grok'
+            )
+            WHERE source = 'manual'
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_delivery_orders_platform_state "
+            "ON delivery_orders(platform, state)"
+        )
         conn.commit()
 
 
@@ -1162,6 +1303,8 @@ def copy_source_to_task_dir(task_dir: Path, task_config: dict[str, Any]) -> None
     task_dir.mkdir(parents=True, exist_ok=True)
     for file_name in PROJECT_FILES:
         shutil.copy2(SOURCE_PROJECT / file_name, task_dir / file_name)
+    for source, target_name in PROJECT_AUX_FILES:
+        shutil.copy2(source, task_dir / target_name)
     for dir_name in PROJECT_DIRS:
         src = SOURCE_PROJECT / dir_name
         dst = task_dir / dir_name
@@ -1183,6 +1326,11 @@ def copy_source_to_task_dir(task_dir: Path, task_config: dict[str, Any]) -> None
 def _mailbox_from_row(row: sqlite3.Row) -> dict[str, Any]:
     total = int(row["success_count"]) + int(row["failure_count"])
     success_rate = (int(row["success_count"]) / total * 100.0) if total else 0.0
+    keys = set(row.keys())
+    try:
+        config = json.loads(row["config_json"] or "{}") if "config_json" in keys else {}
+    except Exception:
+        config = {}
     return {
         "id": int(row["id"]),
         "name": row["name"],
@@ -1191,6 +1339,7 @@ def _mailbox_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "admin_password": row["admin_password"] or "",
         "domain": row["domain"] or "",
         "site_password": row["site_password"] or "",
+        "config": config,
         "enabled": bool(row["enabled"]),
         "success_count": int(row["success_count"]),
         "failure_count": int(row["failure_count"]),
@@ -1210,8 +1359,8 @@ def mailbox_add(payload: "MailboxItem") -> dict[str, Any]:
     execute(
         """
         INSERT INTO mailbox_providers
-            (name, provider_type, api_base, admin_password, domain, site_password, enabled, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (name, provider_type, api_base, admin_password, domain, site_password, config_json, enabled, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             payload.name.strip(),
@@ -1220,6 +1369,7 @@ def mailbox_add(payload: "MailboxItem") -> dict[str, Any]:
             payload.admin_password,
             payload.domain.strip(),
             payload.site_password,
+            json.dumps(payload.config or {}, ensure_ascii=False),
             1 if payload.enabled else 0,
             now_iso(),
         ),
@@ -1241,27 +1391,30 @@ def mailbox_update(mbox_id: int, payload: "MailboxUpdate") -> dict[str, Any]:
     new_admin = row["admin_password"] if payload.admin_password is None else payload.admin_password
     new_domain = row["domain"] if payload.domain is None else payload.domain.strip()
     new_site = row["site_password"] if payload.site_password is None else payload.site_password
+    row_keys = set(row.keys())
+    old_config = row["config_json"] if "config_json" in row_keys else "{}"
+    new_config = old_config if payload.config is None else json.dumps(payload.config, ensure_ascii=False)
     new_enabled = int(row["enabled"]) if payload.enabled is None else (1 if payload.enabled else 0)
     if payload.reset_stats:
         execute_no_return(
             """
             UPDATE mailbox_providers
             SET name = ?, provider_type = ?, api_base = ?, admin_password = ?,
-                domain = ?, site_password = ?, enabled = ?,
+                domain = ?, site_password = ?, config_json = ?, enabled = ?,
                 success_count = 0, failure_count = 0, consecutive_failures = 0
             WHERE id = ?
             """,
-            (new_name, new_type, new_api, new_admin, new_domain, new_site, new_enabled, mbox_id),
+            (new_name, new_type, new_api, new_admin, new_domain, new_site, new_config, new_enabled, mbox_id),
         )
     else:
         execute_no_return(
             """
             UPDATE mailbox_providers
             SET name = ?, provider_type = ?, api_base = ?, admin_password = ?,
-                domain = ?, site_password = ?, enabled = ?
+                domain = ?, site_password = ?, config_json = ?, enabled = ?
             WHERE id = ?
             """,
-            (new_name, new_type, new_api, new_admin, new_domain, new_site, new_enabled, mbox_id),
+            (new_name, new_type, new_api, new_admin, new_domain, new_site, new_config, new_enabled, mbox_id),
         )
     row = fetch_one("SELECT * FROM mailbox_providers WHERE id = ?", (mbox_id,))
     assert row is not None
@@ -1426,22 +1579,21 @@ def _account_row_to_dict(r: sqlite3.Row) -> dict[str, Any]:
         "refresh_token": "",
         "id_token": "",
     }
+    platform = _row_col(r, "platform", "grok")
+
     # windsurf: sso 格式 "devin-session-token$eyJ..."
     if sso.startswith("devin-session-token$"):
         tokens["session_token"] = sso[len("devin-session-token$"):]
     # extra_json 里的 token 优先（更精确）
-    if extra.get("accessToken"):
-        tokens["access_token"] = extra["accessToken"]
-    if extra.get("refreshToken"):
-        tokens["refresh_token"] = extra["refreshToken"]
-    if extra.get("idToken"):
-        tokens["id_token"] = extra["idToken"]
-    if extra.get("session_token"):
-        tokens["session_token"] = extra["session_token"]
+    tokens["access_token"] = str(extra.get("access_token") or extra.get("accessToken") or "")
+    tokens["refresh_token"] = str(extra.get("refresh_token") or extra.get("refreshToken") or "")
+    tokens["id_token"] = str(extra.get("id_token") or extra.get("idToken") or "")
+    if extra.get("session_token") or extra.get("sessionToken"):
+        tokens["session_token"] = str(extra.get("session_token") or extra.get("sessionToken"))
     if extra.get("auth_token") and not tokens["session_token"]:
         tokens["session_token"] = extra["auth_token"]
-    # 如果 extra 里没拆出 access_token，且 sso 不是 session 格式，当作 access_token
-    if not tokens["access_token"] and sso and not sso.startswith("devin-session-token$"):
+    # 其它平台沿用旧兼容逻辑：没有独立 access_token 时把 sso 当作 access_token。
+    if not tokens["access_token"] and sso and platform != "grok" and not sso.startswith("devin-session-token$"):
         tokens["access_token"] = sso
 
     return {
@@ -1452,7 +1604,7 @@ def _account_row_to_dict(r: sqlite3.Row) -> dict[str, Any]:
         "task_id": r["task_id"],
         "proxy_url": r["proxy_url"] or "",
         "status": r["status"],
-        "platform": _row_col(r, "platform", "grok"),
+        "platform": platform,
         "lifecycle_status": lifecycle,
         "plan_state": plan,
         "validity_status": validity,
@@ -1487,6 +1639,119 @@ def account_list(limit: int = 500) -> list[dict[str, Any]]:
     return [_account_row_to_dict(r) for r in rows]
 
 
+def account_list_by_ids(account_ids: list[int]) -> list[dict[str, Any]]:
+    ordered_ids = list(dict.fromkeys(int(account_id) for account_id in account_ids))
+    if not ordered_ids:
+        return []
+    placeholders = ",".join("?" for _ in ordered_ids)
+    rows = fetch_all(
+        f"SELECT * FROM accounts WHERE id IN ({placeholders})",
+        tuple(ordered_ids),
+    )
+    accounts_by_id = {
+        int(row["id"]): _account_row_to_dict(row)
+        for row in rows
+    }
+    return [accounts_by_id[account_id] for account_id in ordered_ids if account_id in accounts_by_id]
+
+
+def account_delivery_document(account: dict[str, Any]) -> dict[str, Any]:
+    try:
+        extra = json.loads(account.get("extra_json") or "{}")
+    except Exception:
+        extra = {}
+    try:
+        exporter_status = json.loads(account.get("exporter_status_json") or "{}")
+    except Exception:
+        exporter_status = {}
+    tokens = account.get("tokens") if isinstance(account.get("tokens"), dict) else {}
+    cpa_auth: dict[str, Any] = {}
+    cpa_meta = extra.get("cpa") if isinstance(extra.get("cpa"), dict) else {}
+    cpa_filename = Path(str(cpa_meta.get("filename") or "")).name
+    if cpa_filename:
+        cpa_path = CPA_AUTH_DIR / cpa_filename
+        try:
+            loaded = json.loads(cpa_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                cpa_auth = loaded
+        except (OSError, ValueError):
+            cpa_auth = {}
+    if not cpa_auth and tokens.get("access_token") and tokens.get("refresh_token"):
+        try:
+            from core.cpa_auth import token_to_cpa_record
+
+            cpa_auth = token_to_cpa_record(
+                {
+                    **extra,
+                    "access_token": tokens.get("access_token"),
+                    "refresh_token": tokens.get("refresh_token"),
+                    "id_token": tokens.get("id_token"),
+                },
+                str(account.get("email") or ""),
+                base_url=str(extra.get("base_url") or ""),
+            )
+        except (ImportError, TypeError, ValueError):
+            cpa_auth = {}
+    external_account_id = str(cpa_auth.get("sub") or extra.get("sub") or "")
+    document: dict[str, Any] = {
+        "schema": "grok-register.account-delivery.v1",
+        "account_id": external_account_id,
+        "platform": account.get("platform") or "grok",
+        "email": account.get("email") or "",
+        "password": account.get("password") or "",
+        "sso": account.get("sso") or "",
+        "session_token": tokens.get("session_token") or "",
+        "access_token": tokens.get("access_token") or "",
+        "refresh_token": tokens.get("refresh_token") or "",
+        "id_token": tokens.get("id_token") or "",
+        "lifecycle_status": account.get("lifecycle_status") or "registered",
+        "plan_state": account.get("plan_state") or "unknown",
+        "validity_status": account.get("validity_status") or "unknown",
+        "created_at": account.get("created_at") or "",
+        "credentials": {
+            "password": account.get("password") or "",
+            "sso": account.get("sso") or "",
+            "session_token": tokens.get("session_token") or "",
+            "access_token": tokens.get("access_token") or "",
+            "refresh_token": tokens.get("refresh_token") or "",
+            "id_token": tokens.get("id_token") or "",
+            "token_type": extra.get("token_type") or "",
+            "expires_in": extra.get("expires_in"),
+            "expired": extra.get("expired"),
+        },
+        "cpa_auth": cpa_auth,
+        "account_state": {
+            "source_id": account.get("id"),
+            "task_id": account.get("task_id"),
+            "proxy_url": account.get("proxy_url") or "",
+            "status": account.get("status") or "",
+            "lifecycle_status": account.get("lifecycle_status") or "registered",
+            "plan_state": account.get("plan_state") or "unknown",
+            "validity_status": account.get("validity_status") or "unknown",
+            "last_error": account.get("last_error") or "",
+            "last_checked_at": account.get("last_checked_at") or "",
+            "notes": account.get("notes") or "",
+            "created_at": account.get("created_at") or "",
+        },
+        "extra": extra,
+        "exporter_status": exporter_status,
+    }
+    for key in (
+        "base_url",
+        "token_endpoint",
+        "redirect_uri",
+        "headers",
+        "expired",
+        "expires_in",
+        "sub",
+        "token_type",
+        "cpa",
+    ):
+        if key in extra:
+            document[key] = extra[key]
+    return document
+
+
 def account_update(
     account_id: int,
     *,
@@ -1498,6 +1763,10 @@ def account_update(
     sso: str | None = None,
     email: str | None = None,
     password: str | None = None,
+    session_token: str | None = None,
+    access_token: str | None = None,
+    refresh_token: str | None = None,
+    id_token: str | None = None,
 ) -> dict[str, Any]:
     row = fetch_one("SELECT * FROM accounts WHERE id = ?", (account_id,))
     if not row:
@@ -1528,6 +1797,22 @@ def account_update(
     if password is not None:
         fields.append("password = ?")
         params.append(password)
+    token_updates = {
+        "session_token": session_token,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "id_token": id_token,
+    }
+    if any(value is not None for value in token_updates.values()):
+        try:
+            extra = json.loads(_row_col(row, "extra_json", "{}") or "{}")
+        except Exception:
+            extra = {}
+        for key, value in token_updates.items():
+            if value is not None:
+                extra[key] = value
+        fields.append("extra_json = ?")
+        params.append(json.dumps(extra, ensure_ascii=False))
     if not fields:
         return _account_row_to_dict(row)
     params.append(account_id)
@@ -1691,6 +1976,104 @@ def _harvest_log_events(task_id: int, console_path: Path, last_line_no: int, pro
     return len(lines)
 
 
+def record_exporter_result(
+    account_id: int,
+    exporter_id: str,
+    *,
+    success: bool,
+    message: str = "",
+    data: dict[str, Any] | None = None,
+) -> None:
+    """Persist one exporter result without overwriting concurrent exporter state."""
+    with db_lock, closing(get_conn()) as conn:
+        row = conn.execute(
+            "SELECT exporter_status_json FROM accounts WHERE id = ?",
+            (int(account_id),),
+        ).fetchone()
+        if not row:
+            return
+        try:
+            status = json.loads(row["exporter_status_json"] or "{}")
+        except Exception:
+            status = {}
+        status[str(exporter_id)] = {
+            "ok": bool(success),
+            "status": "pushed" if success else "failed",
+            "message": str(message or "")[:1000],
+            "last_pushed_at": now_iso(),
+            "data": data if isinstance(data, dict) else {},
+        }
+        conn.execute(
+            "UPDATE accounts SET exporter_status_json = ? WHERE id = ?",
+            (json.dumps(status, ensure_ascii=False), int(account_id)),
+        )
+        conn.commit()
+
+
+def push_account_to_grok2api(account_id: int):
+    """Push a stored Grok account with the configured exporter and record the result."""
+    setting = fetch_one("SELECT value FROM settings WHERE key = 'exporter_grok2api'")
+    if not setting:
+        return None
+    try:
+        raw_config = json.loads(setting["value"] or "{}")
+    except Exception:
+        raw_config = {}
+    if not isinstance(raw_config, dict) or not raw_config.get("enabled"):
+        return None
+
+    account = fetch_one(
+        "SELECT id, email, sso, password, extra_json FROM accounts WHERE id = ?",
+        (int(account_id),),
+    )
+    if not account:
+        return None
+
+    from core.base_exporter import ExporterConfig, PushResult
+    from exporters.grok2api import Grok2APIExporter
+
+    extra_config = raw_config.get("extra")
+    if not isinstance(extra_config, dict):
+        extra_config = {}
+    try:
+        account_extra = json.loads(account["extra_json"] or "{}")
+    except Exception:
+        account_extra = {}
+    config = ExporterConfig(
+        exporter_id="grok2api",
+        enabled=True,
+        endpoint=str(raw_config.get("endpoint") or ""),
+        api_append=bool(raw_config.get("api_append", True)),
+        template=str(raw_config.get("template") or ""),
+        extra=extra_config,
+    )
+    try:
+        result = Grok2APIExporter().push(
+            {
+                "platform": "grok",
+                "email": account["email"] or "",
+                "password": account["password"] or "",
+                "sso": account["sso"] or "",
+                "extra": account_extra if isinstance(account_extra, dict) else {},
+            },
+            config,
+        )
+    except Exception as exc:
+        result = PushResult(
+            success=False,
+            exporter_id="grok2api",
+            message=f"grok2api push raised {type(exc).__name__}: {exc}",
+        )
+    record_exporter_result(
+        int(account["id"]),
+        "grok2api",
+        success=bool(result.success),
+        message=result.message,
+        data=result.data,
+    )
+    return result
+
+
 def _harvest_task_accounts(task_id: int, task_dir: Path, proxy_url: str = "") -> None:
     """从 sso 文件把账号入库。"""
     sso_file = task_dir / "sso" / f"task_{task_id}.txt"
@@ -1706,29 +2089,82 @@ def _harvest_task_accounts(task_id: int, task_dir: Path, proxy_url: str = "") ->
     )
     emails = [r["email"] for r in email_rows if r["email"]]
     sso_list = [s.strip() for s in content.splitlines() if s.strip()]
+    passwords: dict[str, str] = {}
+    console_path = task_dir / "console.log"
+    if console_path.exists():
+        try:
+            log_text = console_path.read_text(encoding="utf-8", errors="replace")
+            passwords = {
+                match.group(1): match.group(2) or ""
+                for match in LINE_RE_SUCCESS.finditer(log_text)
+            }
+        except Exception:
+            passwords = {}
     # grok 子进程跑完没有 Account 对象可读，默认值如下：
     #   platform='grok'；token 能拿到说明注册流程完整 → validity='valid'
     #   plan_state 未知；lifecycle_status='registered'
     for idx, sso in enumerate(sso_list):
         email = emails[idx] if idx < len(emails) else ""
+        password = passwords.get(email, "")
+        existing = fetch_one(
+            "SELECT id FROM accounts WHERE email = ? AND sso = ?",
+            (email, sso),
+        )
         execute_no_return(
             """
             INSERT OR IGNORE INTO accounts
-                (email, sso, task_id, proxy_url, platform, status,
+                (email, sso, password, task_id, proxy_url, platform, status,
                  lifecycle_status, plan_state, validity_status,
                  last_checked_at, created_at)
-            VALUES (?, ?, ?, ?, 'grok', 'active',
+            VALUES (?, ?, ?, ?, ?, 'grok', 'active',
                     'registered', 'unknown', 'valid',
                     ?, ?)
             """,
-            (email, sso, task_id, proxy_url, now_iso(), now_iso()),
+            (email, sso, password, task_id, proxy_url, now_iso(), now_iso()),
         )
+        if password:
+            execute_no_return(
+                "UPDATE accounts SET password = CASE WHEN password = '' THEN ? ELSE password END "
+                "WHERE email = ? AND sso = ?",
+                (password, email, sso),
+            )
+        if existing is None:
+            saved = fetch_one(
+                "SELECT id FROM accounts WHERE email = ? AND sso = ?",
+                (email, sso),
+            )
+            if saved:
+                try:
+                    push_result = push_account_to_grok2api(int(saved["id"]))
+                    if push_result is not None:
+                        marker = "API push succeeded" if push_result.success else "API push failed"
+                        with console_path.open("a", encoding="utf-8") as log:
+                            log.write(f"[{now_iso()}] [{marker}] {email}: {push_result.message}\n")
+                except Exception as push_exc:
+                    with console_path.open("a", encoding="utf-8") as log:
+                        log.write(
+                            f"[{now_iso()}] [API push failed] {email}: "
+                            f"{type(push_exc).__name__}: {push_exc}\n"
+                        )
+                try:
+                    from ._cpa_runtime import cpa_mint_runtime
+
+                    if cpa_mint_runtime.is_auto_enabled():
+                        cpa_mint_runtime.enqueue(int(saved["id"]))
+                except Exception:
+                    pass
 
 
 def export_accounts(fmt: str = "json") -> tuple[str, str, str]:
     rows = account_list(5000)
     fmt = (fmt or "json").lower()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if fmt == "backup":
+        return (
+            json.dumps(rows, ensure_ascii=False, indent=2),
+            "application/json; charset=utf-8",
+            f"grok-accounts-backup-{ts}.json",
+        )
     if fmt == "csv":
         lines = [
             "id,email,sso,task_id,proxy_url,status,lifecycle_status,plan_state,validity_status,created_at"
@@ -1744,8 +2180,25 @@ def export_accounts(fmt: str = "json") -> tuple[str, str, str]:
     if fmt == "sso":
         content = "\n".join(r["sso"] for r in rows) + "\n"
         return content, "text/plain; charset=utf-8", f"grok-sso-{ts}.txt"
+    exported = []
+    for row in rows:
+        tokens = row.get("tokens") if isinstance(row.get("tokens"), dict) else {}
+        compact_tokens = {
+            key: value
+            for key, value in tokens.items()
+            if value not in (None, "", [], {})
+        }
+        item = {
+            "email": row.get("email", ""),
+            "password": row.get("password", ""),
+            "sso": row.get("sso", ""),
+            "platform": row.get("platform", "grok"),
+            "tokens": compact_tokens,
+            "created_at": row.get("created_at", ""),
+        }
+        exported.append(item)
     return (
-        json.dumps(rows, ensure_ascii=False, indent=2),
+        json.dumps(exported, ensure_ascii=False, indent=2),
         "application/json; charset=utf-8",
         f"grok-accounts-{ts}.json",
     )

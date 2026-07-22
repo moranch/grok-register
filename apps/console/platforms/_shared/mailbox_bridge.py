@@ -38,6 +38,8 @@ class BridgeMailbox(BaseMailbox):
         # stop_event (threading.Event) 由 supervisor 注入，让 wait_for_code
         # 能在用户手动停止任务时立刻醒过来，而不是等满 120 秒。
         self._stop_event = stop_event
+        self._hotmail_pool = None
+        self._hotmail_accounts: dict[str, dict] = {}
 
     def _get_provider(self) -> dict:
         if self._provider is None:
@@ -63,6 +65,41 @@ class BridgeMailbox(BaseMailbox):
         provider_id = int(provider.get("id", 0))
 
         session = self._session()
+
+        if provider_type in ("hotmail", "outlookmail"):
+            from core.hotmail_pool import HotmailPool
+
+            cfg = dict(provider.get("config") or {})
+            credentials_path = str(provider.get("api_base") or "").strip()
+            hosts_raw = cfg.get("imap_hosts") or "outlook.office365.com,imap-mail.outlook.com"
+            hosts = [part.strip() for part in str(hosts_raw).replace("，", ",").split(",") if part.strip()]
+            self._hotmail_pool = HotmailPool(
+                credentials_path,
+                state_path=str(cfg.get("state_path") or ""),
+                max_aliases=int(cfg.get("max_aliases", 5) or 5),
+                alias_mode=str(cfg.get("alias_mode") or "random"),
+                alias_length=int(cfg.get("alias_length", 8) or 8),
+                poll_interval=float(cfg.get("poll_interval", 5) or 5),
+                recent_seconds=int(cfg.get("recent_seconds", 900) or 900),
+                imap_last_n=int(cfg.get("imap_last_n", 30) or 30),
+                imap_hosts=hosts,
+                require_recipient_match=bool(cfg.get("require_recipient_match", True)),
+                proxy=self.proxy,
+                stop_event=self._stop_event,
+                log=lambda message: logger.info(message),
+            )
+            email, account = self._hotmail_pool.acquire()
+            self._hotmail_accounts[email.lower()] = account
+            return MailboxAccount(
+                email=email,
+                password=account.get("password", ""),
+                account_id=account.get("email", ""),
+                extra={
+                    "provider_id": provider_id,
+                    "provider_type": provider_type,
+                    "main_email": account.get("email", ""),
+                },
+            )
 
         if provider_type in ("tmail", "moemail"):
             # TMail v3 (mail.nnioj.com 这类 Astro 前端的临时邮箱服务):
@@ -139,6 +176,8 @@ class BridgeMailbox(BaseMailbox):
 
     def get_current_ids(self, account: MailboxAccount) -> Set:
         """获取当前邮件 ID 列表（TMail /api/fetch?to=<email>）。"""
+        if self._hotmail_pool is not None and account.email.lower() in self._hotmail_accounts:
+            return set()
         extra = account.extra or {}
         api_base = extra.get("api_base", "")
         if not api_base:
@@ -183,6 +222,23 @@ class BridgeMailbox(BaseMailbox):
         所以不能只靠 list 接口——必须 follow up 拉详情。
         """
         import re
+
+        if self._hotmail_pool is not None:
+            hotmail_account = self._hotmail_accounts.get(account.email.lower())
+            if hotmail_account:
+                try:
+                    code = self._hotmail_pool.wait_for_code(account.email, hotmail_account, timeout=timeout)
+                    provider_id = int((account.extra or {}).get("provider_id", 0) or 0)
+                    if provider_id:
+                        from api._shared import mailbox_report_success
+                        mailbox_report_success(provider_id)
+                    return code
+                except Exception:
+                    provider_id = int((account.extra or {}).get("provider_id", 0) or 0)
+                    if provider_id:
+                        from api._shared import mailbox_report_failure
+                        mailbox_report_failure(provider_id)
+                    raise
 
         extra = account.extra or {}
         api_base = extra.get("api_base", "")

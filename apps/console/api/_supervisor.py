@@ -38,6 +38,7 @@ from ._shared import (
     copy_source_to_task_dir,
     execute_no_return,
     fetch_all,
+    fetch_one,
     mailbox_pick_best,
     mailbox_report_failure,
     mailbox_report_success,
@@ -221,6 +222,22 @@ class TaskSupervisor:
             task_config["temp_mail_domain"] = pool_mailbox["domain"]
             task_config["temp_mail_site_password"] = pool_mailbox["site_password"]
             task_config["temp_mail_provider"] = pool_mailbox["provider_type"]
+            if pool_mailbox["provider_type"] in {"hotmail", "outlookmail"}:
+                hotmail_config = dict(pool_mailbox.get("config") or {})
+                task_config["hotmail_accounts_file"] = pool_mailbox["api_base"]
+                task_config["hotmail_alias_mode"] = hotmail_config.get("alias_mode", "random")
+                task_config["hotmail_max_aliases_per_account"] = hotmail_config.get("max_aliases", 5)
+                task_config["hotmail_alias_random_length"] = hotmail_config.get("alias_length", 8)
+                task_config["hotmail_poll_interval"] = hotmail_config.get("poll_interval", 5)
+                task_config["hotmail_recent_seconds"] = hotmail_config.get("recent_seconds", 900)
+                task_config["hotmail_imap_last_n"] = hotmail_config.get("imap_last_n", 30)
+                task_config["hotmail_imap_hosts"] = hotmail_config.get(
+                    "imap_hosts", "outlook.office365.com,imap-mail.outlook.com"
+                )
+                task_config["hotmail_require_recipient_match"] = hotmail_config.get(
+                    "require_recipient_match", True
+                )
+                task_config["hotmail_state_path"] = hotmail_config.get("state_path", "")
 
         copy_source_to_task_dir(task_dir, task_config)
 
@@ -509,13 +526,20 @@ class TaskSupervisor:
                     try:
                         account = instance.register(email=None, password=None)
                         email = getattr(account, "email", "") or ""
-                        token = getattr(account, "token", "") or ""
+                        extra_check = dict(getattr(account, "extra", {}) or {})
+                        token = (
+                            getattr(account, "token", "")
+                            or extra_check.get("sso")
+                            or extra_check.get("sso_rw")
+                            or ""
+                        )
                         # vendor 有时会返回"部分成功"的 Account（token 为空但没 raise），
                         # 但如果有 email + password 也算有效（trae/openblocklabs 等平台
                         # 注册成功后 token 提取可能失败，但账号本身可用）
-                        extra_check = dict(getattr(account, "extra", {}) or {})
                         _has_credential = bool(
                             token
+                            or extra_check.get("sso")
+                            or extra_check.get("sso_rw")
                             or extra_check.get("accessToken")
                             or extra_check.get("refreshToken")
                             or extra_check.get("session_token")
@@ -593,6 +617,74 @@ class TaskSupervisor:
                                 now_iso(),
                             ),
                         )
+
+                        # 每注册成功一个就立即推送。停止任务只阻止下一轮，已经成功
+                        # 并入库的账号会先完成本次推送，避免部分任务留下未发送库存。
+                        if platform_name == "grok":
+                            saved = fetch_one(
+                                "SELECT id, exporter_status_json FROM accounts "
+                                "WHERE email = ? AND sso = ? ORDER BY id DESC LIMIT 1",
+                                (email, token),
+                            )
+                            if saved:
+                                try:
+                                    from core.base_exporter import ExporterConfig
+                                    from exporters.grok2api import Grok2APIExporter
+
+                                    api_config = dict(task_config.get("api") or {})
+                                    push_config = ExporterConfig(
+                                        exporter_id="grok2api",
+                                        enabled=True,
+                                        endpoint=str(api_config.get("endpoint") or os.getenv(
+                                            "GROK_REGISTER_DEFAULT_API_ENDPOINT", ""
+                                        )),
+                                        extra={
+                                            "auth_token": str(api_config.get("token") or ""),
+                                            "admin_username": os.getenv("GROK2API_ADMIN_USERNAME", "admin"),
+                                            "admin_password": os.getenv("GROK2API_ADMIN_PASSWORD", ""),
+                                        },
+                                    )
+                                    push_result = Grok2APIExporter().push(
+                                        {
+                                            "email": email,
+                                            "sso": token,
+                                            "token": token,
+                                            "password": getattr(account, "password", ""),
+                                            "extra": extra,
+                                        },
+                                        push_config,
+                                    )
+                                    try:
+                                        exporter_status = json.loads(saved["exporter_status_json"] or "{}")
+                                    except Exception:
+                                        exporter_status = {}
+                                    exporter_status["grok2api"] = {
+                                        "ok": bool(push_result.success),
+                                        "message": push_result.message,
+                                        "last_pushed_at": now_iso(),
+                                    }
+                                    _execute(
+                                        "UPDATE accounts SET exporter_status_json = ? WHERE id = ?",
+                                        (json.dumps(exporter_status, ensure_ascii=False), int(saved["id"])),
+                                    )
+                                    marker = "已推送到 API" if push_result.success else "推送到 API 失败"
+                                    _append_log(f"[{marker}] {email}: {push_result.message}")
+                                except Exception as push_exc:
+                                    _append_log(f"[推送到 API 失败] {email}: {push_exc}")
+
+                        # CPA OAuth mint 在独立单 worker 队列执行，不阻塞后续注册。
+                        if platform_name == "grok":
+                            try:
+                                saved = fetch_one(
+                                    "SELECT id FROM accounts WHERE email = ? AND sso = ? ORDER BY id DESC LIMIT 1",
+                                    (email, token),
+                                )
+                                if saved:
+                                    from ._cpa_runtime import cpa_mint_runtime
+                                    if cpa_mint_runtime.is_auto_enabled():
+                                        cpa_mint_runtime.enqueue(int(saved["id"]))
+                            except Exception as cpa_exc:
+                                _append_log(f"[CPA] 自动补全入队失败: {cpa_exc}")
 
                         with console_path.open("a", encoding="utf-8") as log:
                             log.write(

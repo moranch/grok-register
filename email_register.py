@@ -53,6 +53,35 @@ TEMP_MAIL_PROVIDER = str(_conf.get("temp_mail_provider") or "").strip().lower()
 # ============================================================
 
 _temp_email_cache: Dict[str, str] = {}
+_hotmail_pool = None
+_hotmail_accounts: Dict[str, Dict[str, str]] = {}
+
+
+def _get_hotmail_pool():
+    global _hotmail_pool
+    if _hotmail_pool is None:
+        from hotmail_pool import HotmailPool
+
+        hosts_raw = str(
+            _conf.get("hotmail_imap_hosts")
+            or "outlook.office365.com,imap-mail.outlook.com"
+        )
+        hosts = [part.strip() for part in hosts_raw.replace("，", ",").split(",") if part.strip()]
+        _hotmail_pool = HotmailPool(
+            str(_conf.get("hotmail_accounts_file") or TEMP_MAIL_API_BASE),
+            state_path=str(_conf.get("hotmail_state_path") or ""),
+            max_aliases=int(_conf.get("hotmail_max_aliases_per_account", 5) or 5),
+            alias_mode=str(_conf.get("hotmail_alias_mode") or "random"),
+            alias_length=int(_conf.get("hotmail_alias_random_length", 8) or 8),
+            poll_interval=float(_conf.get("hotmail_poll_interval", 5) or 5),
+            recent_seconds=int(_conf.get("hotmail_recent_seconds", 900) or 900),
+            imap_last_n=int(_conf.get("hotmail_imap_last_n", 30) or 30),
+            imap_hosts=hosts,
+            require_recipient_match=bool(_conf.get("hotmail_require_recipient_match", True)),
+            proxy=PROXY,
+            log=print,
+        )
+    return _hotmail_pool
 
 
 def get_email_and_token() -> Tuple[Optional[str], Optional[str]]:
@@ -60,6 +89,13 @@ def get_email_and_token() -> Tuple[Optional[str], Optional[str]]:
     创建临时邮箱并返回 (email, mail_token)。
     供 DrissionPage_example.py 调用。
     """
+    if TEMP_MAIL_PROVIDER in {"hotmail", "outlookmail", "outlook", "microsoft"}:
+        pool = _get_hotmail_pool()
+        email, account = pool.acquire()
+        token = "hotmail:" + email.lower()
+        _hotmail_accounts[token] = account
+        return email, token
+
     email, _password, mail_token = create_temp_email()
     if email and mail_token:
         _temp_email_cache[email] = mail_token
@@ -75,7 +111,13 @@ def get_oai_code(dev_token: str, email: str, timeout: int = 30) -> Optional[str]
     Returns:
         验证码字符串（去除连字符，如 "MM0SF3"）或 None
     """
-    code = wait_for_verification_code(mail_token=dev_token, email=email, timeout=timeout)
+    if str(dev_token or "").startswith("hotmail:"):
+        account = _hotmail_accounts.get(dev_token)
+        if not account:
+            raise RuntimeError("Hotmail dev_token 无效")
+        code = _get_hotmail_pool().wait_for_code(email, account, timeout=max(timeout, 120))
+    else:
+        code = wait_for_verification_code(mail_token=dev_token, email=email, timeout=timeout)
     if code:
         code = code.replace("-", "")
     return code

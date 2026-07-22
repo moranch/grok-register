@@ -27,6 +27,9 @@ if str(APP_DIR) not in sys.path:
 from api._shared import WEBUI_DIR, init_db, seed_mailbox_from_defaults
 from api._supervisor import supervisor
 from api._lifecycle_runtime import start_lifecycle_thread
+from api._cpa_runtime import cpa_mint_runtime
+from api._inventory_runtime import auto_replenish_runtime
+from core.grok2api_clearance import grok2api_clearance_refresher
 
 
 @asynccontextmanager
@@ -56,6 +59,10 @@ async def lifespan(_: FastAPI):
     # 3. 生命周期后台线程
     start_lifecycle_thread()
 
+    # 3.1 CPA OAuth 补全队列（单 worker，避免阻塞注册与触发并发风控）
+    cpa_mint_runtime.start()
+    grok2api_clearance_refresher.start()
+
     # 4. 多平台插件加载（按 design 顺序：platform → mailbox → captcha → strategy → exporter）
     try:
         from core.registry import (
@@ -84,9 +91,15 @@ async def lifespan(_: FastAPI):
         # 插件加载失败不阻塞应用启动（保持与旧行为一致）
         print(f"[WARN] 多平台插件加载失败（不影响旧功能）: {exc}")
 
+    # 5. 可交付账号低库存自动补货
+    auto_replenish_runtime.start()
+
     try:
         yield
     finally:
+        auto_replenish_runtime.stop()
+        grok2api_clearance_refresher.stop()
+        cpa_mint_runtime.stop()
         supervisor.stop()
 
 
@@ -109,6 +122,8 @@ from api.stats import router as _stats_router
 from api.lifecycle import router as _lifecycle_router
 from api.settings import router as _settings_router
 from api.system import router as _system_router
+from api.inventory import internal_router as _inventory_internal_router
+from api.inventory import router as _inventory_router
 from api.frontend import root_router as _frontend_root_router
 from api.frontend import spa_router as _frontend_spa_router
 
@@ -126,6 +141,8 @@ app.include_router(_stats_router)
 app.include_router(_lifecycle_router)
 app.include_router(_settings_router)
 app.include_router(_system_router)
+app.include_router(_inventory_router)
+app.include_router(_inventory_internal_router)
 
 # 4) 插件系统子 router（短前缀 + 本处补 /api）
 try:

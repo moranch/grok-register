@@ -22,12 +22,14 @@ class GrokPlatform(BasePlatform):
         return password or ""
 
     def _map_grok_result(self, result: dict, *, password: str = "") -> RegistrationResult:
+        sso = str(result.get("sso") or "")
         return RegistrationResult(
             email=result["email"],
             password=password or result.get("password", ""),
+            token=sso,
             status=AccountStatus.REGISTERED,
             extra={
-                "sso": result.get("sso", ""),
+                "sso": sso,
                 "sso_rw": result.get("sso_rw", ""),
                 "given_name": result.get("given_name", ""),
                 "family_name": result.get("family_name", ""),

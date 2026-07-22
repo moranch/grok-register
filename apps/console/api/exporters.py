@@ -17,9 +17,30 @@ from pydantic import BaseModel
 
 from core.registry import EXPORTER_REGISTRY
 from core.base_exporter import BaseExporter, ExporterConfig, get_exporter, list_exporters
-from data import dao
+from api._shared import (
+    account_list,
+    execute_no_return,
+    fetch_all,
+    now_iso,
+    record_exporter_result,
+)
 
 router = APIRouter(prefix="/exporters", tags=["exporters"])
+
+
+def _get_settings() -> Dict[str, str]:
+    rows = fetch_all("SELECT key, value FROM settings")
+    return {str(row["key"]): str(row["value"]) for row in rows}
+
+
+def _upsert_setting(key: str, value: str) -> None:
+    execute_no_return(
+        """
+        INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """,
+        (key, value, now_iso()),
+    )
 
 
 # ─── 请求模型 ─────────────────────────────────────────────────────────────────
@@ -51,7 +72,7 @@ class ExporterPushRequest(BaseModel):
 async def list_all_exporters():
     """返回已加载 Exporter 列表（含配置状态）。"""
     exporters_meta = list_exporters()
-    settings = dao.get_all_settings()
+    settings = _get_settings()
 
     results = []
     for meta in exporters_meta:
@@ -88,7 +109,7 @@ async def update_exporter_config(exporter_id: str, body: ExporterConfigUpdate):
         "template": body.template,
         "extra": body.extra,
     }
-    dao.upsert_setting(f"exporter_{exporter_id}", json.dumps(config_data, ensure_ascii=False))
+    _upsert_setting(f"exporter_{exporter_id}", json.dumps(config_data, ensure_ascii=False))
 
     return {"ok": True, "exporter_id": exporter_id, "config": config_data}
 
@@ -101,7 +122,7 @@ async def test_exporter(exporter_id: str, body: ExporterTestRequest):
         raise HTTPException(status_code=404, detail=f"Exporter '{exporter_id}' 未注册")
 
     # 加载配置
-    settings = dao.get_all_settings()
+    settings = _get_settings()
     config_raw = settings.get(f"exporter_{exporter_id}", "{}")
     config_dict = {}
     try:
@@ -149,7 +170,7 @@ async def push_accounts(exporter_id: str, body: ExporterPushRequest):
         raise HTTPException(status_code=400, detail="account_ids 不能为空")
 
     # 加载配置
-    settings = dao.get_all_settings()
+    settings = _get_settings()
     config_raw = settings.get(f"exporter_{exporter_id}", "{}")
     config_dict = {}
     try:
@@ -168,8 +189,8 @@ async def push_accounts(exporter_id: str, body: ExporterPushRequest):
 
     # 逐个推送
     results = {"success": 0, "failed": 0, "errors": []}
-    accounts, _ = dao.list_accounts(limit=99999)
-    account_map = {a.id: a for a in accounts}
+    accounts = account_list(5000)
+    account_map = {int(account["id"]): account for account in accounts}
 
     for aid in body.account_ids:
         account = account_map.get(aid)
@@ -180,27 +201,40 @@ async def push_accounts(exporter_id: str, body: ExporterPushRequest):
 
         extra = {}
         try:
-            extra = json.loads(account.extra_json) if account.extra_json else {}
+            extra = json.loads(account.get("extra_json") or "{}")
         except (json.JSONDecodeError, TypeError):
             pass
 
         account_data = {
-            "platform": account.platform,
-            "email": account.email,
-            "password": account.password,
-            "sso": account.sso,
-            "user_id": account.user_id,
+            "platform": account.get("platform", ""),
+            "email": account.get("email", ""),
+            "password": account.get("password", ""),
+            "sso": account.get("sso", ""),
+            "user_id": account.get("user_id", ""),
             "extra": extra,
         }
 
         try:
             push_result = exporter.push(account_data, config)
+            record_exporter_result(
+                aid,
+                exporter_id,
+                success=bool(push_result.success),
+                message=push_result.message,
+                data=push_result.data,
+            )
             if push_result.success:
                 results["success"] += 1
             else:
                 results["failed"] += 1
                 results["errors"].append({"account_id": aid, "error": push_result.message})
         except Exception as e:
+            record_exporter_result(
+                aid,
+                exporter_id,
+                success=False,
+                message=f"{type(e).__name__}: {e}",
+            )
             results["failed"] += 1
             results["errors"].append({"account_id": aid, "error": str(e)})
 

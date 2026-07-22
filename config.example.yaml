@@ -1,0 +1,28 @@
+server:
+  listen: 0.0.0.0:8000
+  maxBodyBytes: 33554432
+  readTimeout: 15m
+  requestTimeout: 2h
+  swaggerEnabled: true
+auth:
+  accessTokenTTL: 15m
+  refreshTokenTTL: 720h
+  secureCookies: false
+secrets:
+  jwtSecret: replace-with-a-long-random-secret
+  credentialEncryptionKey: replace-with-a-32-byte-random-key
+bootstrapAdmin:
+  username: admin
+  password: change-this-admin-password
+frontend:
+  staticPath: ./frontend/dist
+database:
+  driver: sqlite
+  sqlite:
+    path: /app/data/backend.db
+runtimeStore:
+  driver: memory
+media:
+  driver: local
+  local:
+    path: /app/data/media

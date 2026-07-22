@@ -9,16 +9,28 @@
 """
 from __future__ import annotations
 
+import re
+from datetime import datetime
 from typing import Any
+from urllib.parse import quote
+
+import requests
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
+from pydantic import BaseModel, Field
 
 from ._shared import (
     AccountUpdate,
+    AccountDeliveryCreate,
+    DOWNLOAD_GATE_INTERNAL_TOKEN,
+    DOWNLOAD_GATE_INTERNAL_URL,
+    DOWNLOAD_GATE_PUBLIC_URL,
+    account_delivery_document,
     account_asset_summary,
     account_delete,
     account_list,
+    account_list_by_ids,
     account_update,
     check_auth,
     execute_no_return,
@@ -27,10 +39,68 @@ from ._shared import (
     now_iso,
 )
 
-router = APIRouter(prefix="/api/accounts", tags=["accounts"])
+from . import _delivery_runtime
 
 
-@router.get("")
+router = APIRouter(tags=["accounts"])
+
+
+class InternalDeliveryReserve(BaseModel):
+    card_key: str = Field(..., min_length=1, max_length=200)
+    platform: str = Field("grok", pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    required_model: str = Field("", max_length=100)
+
+
+class InternalDeliveryCommit(BaseModel):
+    card_key: str = Field(..., min_length=1, max_length=200)
+    lease_id: str = Field(..., min_length=1, max_length=100)
+    lease_token: str = Field(..., min_length=1, max_length=200)
+    bundle_id: str = Field("", max_length=200)
+
+
+def _raise_delivery_error(exc: Exception) -> None:
+    if isinstance(exc, _delivery_runtime.DeliveryUnauthorized):
+        raise HTTPException(status_code=401, detail=str(exc), headers={"WWW-Authenticate": "Bearer"})
+    if isinstance(exc, _delivery_runtime.DeliveryNotFound):
+        raise HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, _delivery_runtime.DeliveryConflict):
+        raise HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, _delivery_runtime.DeliveryUnavailable):
+        status = 503 if "not configured" in str(exc) else 409
+        raise HTTPException(status_code=status, detail=str(exc))
+    raise exc
+
+
+def _delivery_filename(account: dict[str, Any]) -> str:
+    email = str(account.get("email") or "account")
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", email).strip("._") or "account"
+    platform = re.sub(
+        r"[^a-z0-9_-]+",
+        "-",
+        str(account.get("platform") or "grok").strip().lower(),
+    ).strip("-") or "account"
+    return f"{platform}-account-{int(account['id'])}-{slug[:80]}.json"
+
+
+def _manual_delivery_response(
+    result: dict[str, Any],
+    title: str,
+    file_count: int,
+    platform: str = "grok",
+) -> dict[str, Any]:
+    key = str(result.get("key") or "")
+    return {
+        "ok": True,
+        "bundle_id": result.get("bundle_id"),
+        "key": key,
+        "claim_url": f"{DOWNLOAD_GATE_PUBLIC_URL}/?key={quote(key, safe='')}",
+        "file_count": int(result.get("file_count") or file_count),
+        "platform": str(result.get("platform") or platform),
+        "title": result.get("title") or title,
+    }
+
+
+@router.get("/api/accounts")
 def api_accounts(
     request: Request, limit: int = Query(500, ge=1, le=5000)
 ) -> dict[str, Any]:
@@ -38,17 +108,17 @@ def api_accounts(
     return {"items": account_list(limit)}
 
 
-@router.get("/summary")
+@router.get("/api/accounts/summary")
 def api_accounts_summary(request: Request) -> dict[str, Any]:
     """账户资产总览：总数、生命周期 / 套餐 / 有效性分布。"""
     check_auth(request)
     return account_asset_summary()
 
 
-@router.get("/export")
+@router.get("/api/accounts/export")
 def api_accounts_export(
     request: Request,
-    fmt: str = Query("json", pattern="^(json|csv|sso)$"),
+    fmt: str = Query("json", pattern="^(json|backup|csv|sso)$"),
 ) -> Response:
     check_auth(request)
     content, media_type, filename = export_accounts(fmt)
@@ -59,7 +129,218 @@ def api_accounts_export(
     )
 
 
-@router.patch("/{account_id}")
+@router.post("/api/accounts/delivery")
+def api_accounts_delivery(
+    request: Request,
+    payload: AccountDeliveryCreate,
+) -> dict[str, Any]:
+    check_auth(request)
+    requested_ids = list(dict.fromkeys(payload.account_ids))
+    accounts = account_list_by_ids(requested_ids)
+    found_ids = {int(account["id"]) for account in accounts}
+    missing_ids = [account_id for account_id in requested_ids if account_id not in found_ids]
+    if missing_ids:
+        raise HTTPException(
+            status_code=404,
+            detail={"message": "部分账户不存在", "missing_account_ids": missing_ids},
+        )
+    if not DOWNLOAD_GATE_INTERNAL_TOKEN:
+        raise HTTPException(status_code=503, detail="DownloadGate 内部 API Token 未配置")
+
+    platforms = {
+        str(account.get("platform") or "grok").strip().lower()
+        for account in accounts
+    }
+    if len(platforms) != 1:
+        raise HTTPException(status_code=409, detail="一次交付不能混合多个目标平台")
+    platform = next(iter(platforms))
+    title = (payload.title or "").strip() or (
+        f"{platform} 账号交付 {len(accounts)} 个 - {datetime.now():%Y-%m-%d %H:%M}"
+    )
+    try:
+        delivery_order = _delivery_runtime.prepare_selected_request(requested_ids, title)
+    except Exception as exc:
+        _raise_delivery_error(exc)
+        raise
+
+    delivery_order_id = int(delivery_order["order_id"])
+    delivery_card_key = str(delivery_order["card_key"])
+    files = []
+    documents: dict[int, dict[str, Any]] = {}
+    for account in accounts:
+        document = account_delivery_document(account)
+        documents[int(account["id"])] = document
+        files.append(
+            {
+                "filename": _delivery_filename(account),
+                "data": document,
+            }
+        )
+    recovered = _delivery_runtime.recover_selected(delivery_order_id, documents)
+    if recovered:
+        return _manual_delivery_response(recovered, title, len(files), platform)
+    if delivery_order.get("reused"):
+        detail = "此前打包请求结果尚未确认，账号仍被安全保留；请稍后重试以恢复原卡密"
+        _delivery_runtime.abort_selected(delivery_order_id, detail)
+        raise HTTPException(status_code=409, detail=detail)
+    try:
+        response = requests.post(
+            f"{DOWNLOAD_GATE_INTERNAL_URL}/api/internal/bundles",
+            headers={
+                "Authorization": f"Bearer {DOWNLOAD_GATE_INTERNAL_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "title": title,
+                "pack_mode": payload.pack_mode,
+                "key": delivery_card_key,
+                "files": files,
+            },
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        recovered = _delivery_runtime.recover_selected(delivery_order_id, documents)
+        if recovered:
+            return _manual_delivery_response(recovered, title, len(files), platform)
+        _delivery_runtime.abort_selected(delivery_order_id, str(exc))
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "DownloadGate 响应未确认，账号已安全保留且不会再次分配；"
+                f"请稍后重试恢复原卡密: {exc}"
+            ),
+        ) from exc
+
+    try:
+        result = response.json()
+    except ValueError:
+        result = {"error": response.text[:500] or "DownloadGate 返回了无效响应"}
+    if not response.ok:
+        detail = result.get("error") if isinstance(result, dict) else "DownloadGate 打包失败"
+        recovered = _delivery_runtime.recover_selected(delivery_order_id, documents)
+        if recovered:
+            return _manual_delivery_response(recovered, title, len(files), platform)
+        _delivery_runtime.abort_selected(delivery_order_id, str(detail or "DownloadGate 打包失败"))
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "DownloadGate 打包结果未确认，账号已安全保留且不会再次分配；"
+                f"请稍后重试恢复原卡密: {detail or '未知错误'}"
+            ),
+        )
+
+    key = str(result.get("key") or "")
+    if key != delivery_card_key:
+        recovered = _delivery_runtime.recover_selected(delivery_order_id, documents)
+        if recovered:
+            return _manual_delivery_response(recovered, title, len(files), platform)
+        detail = "DownloadGate 返回了不匹配的卡密，账号已安全保留等待恢复"
+        _delivery_runtime.abort_selected(delivery_order_id, detail)
+        raise HTTPException(status_code=502, detail=detail)
+    try:
+        _delivery_runtime.commit_selected(
+            delivery_order_id,
+            card_key=key,
+            bundle_id=str(result.get("bundle_id") or ""),
+            documents=documents,
+        )
+    except Exception as exc:
+        _raise_delivery_error(exc)
+        raise
+    return _manual_delivery_response(result, title, len(files), platform)
+
+
+@router.post("/api/internal/account-deliveries/reserve")
+def api_internal_account_delivery_reserve(
+    request: Request,
+    payload: InternalDeliveryReserve,
+) -> dict[str, Any]:
+    try:
+        _delivery_runtime.check_internal_bearer(request.headers.get("Authorization", ""))
+        return _delivery_runtime.reserve(
+            payload.card_key,
+            payload.required_model,
+            payload.platform,
+        )
+    except Exception as exc:
+        _raise_delivery_error(exc)
+        raise
+
+
+@router.post("/api/internal/account-deliveries/commit")
+def api_internal_account_delivery_commit(
+    request: Request,
+    payload: InternalDeliveryCommit,
+) -> dict[str, Any]:
+    try:
+        _delivery_runtime.check_internal_bearer(request.headers.get("Authorization", ""))
+        return _delivery_runtime.commit(
+            payload.card_key,
+            payload.lease_id,
+            payload.lease_token,
+            payload.bundle_id,
+        )
+    except Exception as exc:
+        _raise_delivery_error(exc)
+        raise
+
+
+@router.get("/api/internal/account-deliveries/by-card/{card_key}")
+def api_internal_account_delivery_by_card(
+    request: Request,
+    card_key: str,
+) -> dict[str, Any]:
+    try:
+        _delivery_runtime.check_internal_bearer(request.headers.get("Authorization", ""))
+        return _delivery_runtime.by_card(card_key)
+    except Exception as exc:
+        _raise_delivery_error(exc)
+        raise
+
+
+@router.post("/api/accounts/cpa/backfill")
+def api_accounts_cpa_backfill(
+    request: Request,
+    limit: int = Query(0, ge=0, le=5000),
+    force: bool = Query(False),
+) -> dict[str, Any]:
+    """将缺少 refresh_token 的 Grok 存量账号加入后台 OAuth 补全队列。"""
+    check_auth(request)
+    from ._cpa_runtime import cpa_mint_runtime
+
+    return {"ok": True, "job": cpa_mint_runtime.enqueue_backfill(limit=limit, force=force)}
+
+
+@router.get("/api/accounts/cpa/jobs/{job_id}")
+def api_accounts_cpa_job(request: Request, job_id: str) -> dict[str, Any]:
+    check_auth(request)
+    from ._cpa_runtime import cpa_mint_runtime
+
+    job = cpa_mint_runtime.job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="CPA backfill job not found")
+    return {"job": job}
+
+
+@router.post("/api/accounts/{account_id}/mint-cpa")
+def api_account_mint_cpa(
+    request: Request,
+    account_id: int,
+    force: bool = Query(False),
+) -> dict[str, Any]:
+    check_auth(request)
+    row = fetch_one("SELECT id, platform, sso FROM accounts WHERE id = ?", (account_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="account not found")
+    if row["platform"] != "grok" or not row["sso"]:
+        raise HTTPException(status_code=400, detail="仅支持有 SSO 的 Grok 账号")
+    from ._cpa_runtime import cpa_mint_runtime
+
+    queued = cpa_mint_runtime.enqueue(account_id, force=force)
+    return {"ok": queued, "queued": queued, "account_id": account_id}
+
+
+@router.patch("/api/accounts/{account_id}")
 def api_account_update(
     request: Request, account_id: int, payload: AccountUpdate
 ) -> dict[str, Any]:
@@ -74,18 +355,22 @@ def api_account_update(
         sso=payload.sso,
         email=payload.email,
         password=payload.password,
+        session_token=payload.session_token,
+        access_token=payload.access_token,
+        refresh_token=payload.refresh_token,
+        id_token=payload.id_token,
     )
     return {"account": row}
 
 
-@router.delete("/{account_id}")
+@router.delete("/api/accounts/{account_id}")
 def api_account_delete(request: Request, account_id: int) -> dict[str, Any]:
     check_auth(request)
     account_delete(account_id)
     return {"ok": True}
 
 
-@router.post("/{account_id}/query-state")
+@router.post("/api/accounts/{account_id}/query-state")
 def api_account_query_state(request: Request, account_id: int) -> dict[str, Any]:
     """调用平台的 query_state action 查询账号状态/套餐/额度，结果写回 DB。"""
     check_auth(request)

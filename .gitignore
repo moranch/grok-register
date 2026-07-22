@@ -14,3 +14,7 @@ node_modules/
 CLAUDE.md
 .env
 debug/
+.codex-backups/
+apps/download-gate/download_gate_data/
+config.yaml
+_q.py
