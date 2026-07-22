@@ -1,4 +1,5 @@
 import importlib.util
+import base64
 import json
 import tempfile
 import threading
@@ -144,6 +145,15 @@ class DynamicCardTests(unittest.TestCase):
 
         self.assertIn('id="livePoolAvailable"', page)
         self.assertIn("/api/pool-summary", page)
+        self.assertIn("cockpit_download_url", page)
+        self.assertIn("sub_download_url", page)
+        self.assertIn('download="auth.json"', page)
+        self.assertIn("下载 CPA JSON", page)
+        self.assertIn("下载 Sub2API JSON", page)
+        self.assertIn("下载 Cockpit auth.json", page)
+        self.assertIn("CPA、Sub2API 与 Cockpit 是三种独立格式", page)
+        self.assertIn('id="claimSubBtn"', page)
+        self.assertIn('id="claimCockpitBtn"', page)
         self.assertIn("兑换时再次现场验活", page)
 
     def test_generated_card_keys_use_readable_groups(self):
@@ -216,12 +226,19 @@ class DynamicCardTests(unittest.TestCase):
         self.assertFalse((gate.ZIP_DIR / f"{first_id}.zip").exists())
         payload = json.loads(json_path.read_text(encoding="utf-8"))
         self.assertEqual(first_bundle["download_format"], "json")
-        self.assertEqual(first_bundle["json_name"], "xai-user@example.com.json")
+        self.assertEqual(first_bundle["json_name"], "CPA-xai-user@example.com.json")
         self.assertEqual(gate.bundle_download_path(first_id, first_bundle), f"/download/{first_id}.json")
-        self.assertEqual(gate.bundle_download_name(first_id, first_bundle), "xai-user_example.com.json")
+        self.assertEqual(gate.bundle_download_name(first_id, first_bundle), "CPA-xai-user_example.com.json")
         self.assertEqual(payload["type"], "xai")
         self.assertEqual(payload["sub"], "acct-1")
-        self.assertEqual(payload["sso"], "sso-secret")
+        self.assertEqual(set(payload), {
+            "type", "access_token", "refresh_token", "token_type", "expires_in",
+            "expired", "last_refresh", "email", "sub", "base_url", "redirect_uri",
+            "token_endpoint", "auth_kind", "id_token",
+        })
+        self.assertNotIn("sso", payload)
+        self.assertNotIn("disabled", payload)
+        self.assertNotIn("headers", payload)
         self.assertNotIn("account_id", payload)
         self.assertNotIn("credentials", payload)
 
@@ -259,13 +276,80 @@ class DynamicCardTests(unittest.TestCase):
         self.assertEqual(gate.migrate_existing_bundle_json(manifest), 1)
 
         with gate.zipfile.ZipFile(zip_path) as archive:
-            self.assertEqual(archive.namelist(), ["xai-legacy@example.com.json"])
+            self.assertEqual(archive.namelist(), ["CPA-xai-legacy@example.com.json"])
             payload = json.loads(archive.read(archive.namelist()[0]))
         self.assertEqual(set(payload), {
-            "type", "auth_kind", "email", "sub", "access_token", "refresh_token",
-            "id_token", "token_type", "disabled", "headers", "sso",
+            "type", "access_token", "refresh_token", "token_type", "expires_in",
+            "expired", "last_refresh", "email", "sub", "base_url", "redirect_uri",
+            "token_endpoint", "auth_kind", "id_token",
         })
         self.assertEqual(manifest["bundles"][bundle_id]["format"], "cpa-flat-v1")
+
+    def test_cpa_pickup_matches_aaron_identity_precedence(self):
+        def jwt(payload):
+            encode = lambda value: base64.urlsafe_b64encode(
+                json.dumps(value, separators=(",", ":")).encode()
+            ).rstrip(b"=").decode()
+            return f"{encode({'alg': 'none'})}.{encode(payload)}.x"
+
+        access = jwt({"sub": "access-sub", "iat": 1784690000, "exp": 1784700000})
+        id_token = jwt({
+            "sub": "id-sub",
+            "email": "identity@example.com",
+            "iat": 1784690000,
+            "exp": 1784710000,
+        })
+        payload = gate.cpa_import_payload({
+            "type": "xai",
+            "access_token": access,
+            "refresh_token": "refresh",
+            "id_token": id_token,
+            "expires_in": 20000,
+            "disabled": False,
+            "headers": {"X-Test": "remove-me"},
+            "sso": "remove-me",
+        })
+
+        self.assertEqual(payload["sub"], "id-sub")
+        self.assertEqual(payload["email"], "identity@example.com")
+        self.assertEqual(payload["expired"], gate._utc_text(1784710000))
+        self.assertNotIn("disabled", payload)
+        self.assertNotIn("headers", payload)
+        self.assertNotIn("sso", payload)
+
+    def test_existing_direct_cpa_json_is_rewritten_to_aaron_shape(self):
+        manifest = gate.load_manifest()
+        bundle_id = "legacy-direct-cpa"
+        path = gate.JSON_DIR / f"{bundle_id}.json"
+        path.write_text(json.dumps({
+            "type": "xai",
+            "email": "legacy@example.com",
+            "sub": "legacy-sub",
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "id_token": "id",
+            "token_type": "Bearer",
+            "disabled": False,
+            "headers": {"X-Test": "remove-me"},
+            "sso": "remove-me",
+        }), encoding="utf-8")
+        manifest["bundles"][bundle_id] = {
+            "id": bundle_id,
+            "platform": "grok",
+            "dynamic": True,
+            "json_name": "xai-legacy@example.com.json",
+            "download_format": "json",
+            "files": ["xai-legacy@example.com.json"],
+            "format": "cpa-flat-v1",
+        }
+
+        self.assertEqual(gate.migrate_existing_bundle_json(manifest), 1)
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertNotIn("disabled", payload)
+        self.assertNotIn("headers", payload)
+        self.assertNotIn("sso", payload)
+        self.assertEqual(manifest["bundles"][bundle_id]["format"], "cpa-aaron-v1")
 
     def test_existing_dynamic_zip_is_converted_to_direct_json(self):
         manifest = gate.load_manifest()
@@ -338,9 +422,17 @@ class DynamicCardTests(unittest.TestCase):
         manifest = gate.load_manifest()
         key = gate.issue_cards(manifest, 1, "batch-a")[0]
         gate.save_manifest(manifest)
+        source_document = {
+            "type": "xai",
+            "account_id": "acct-1",
+            "email": "batch@example.com",
+            "sub": "acct-1",
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+        }
         committed = {
             "account_id": "acct-1",
-            "document": {"account_id": "acct-1", "email": "batch@example.com"},
+            "document": source_document,
         }
         with patch.object(
             gate,
@@ -351,14 +443,122 @@ class DynamicCardTests(unittest.TestCase):
             ],
         ):
             bundle_id, bundle = gate.provision_card_bundle(manifest, key)
+        source_path = gate.JSON_DIR / f"{bundle_id}.json"
+        source_before = source_path.read_bytes()
         batch = {"items": [{"key": key, "bundle_id": bundle_id}]}
-        data = gate.build_batch_zip_bytes(manifest, batch)
+        with patch.object(gate, "console_json_post") as post:
+            data = gate.build_batch_zip_bytes(manifest, batch)
+            post.assert_not_called()
+        self.assertEqual(source_path.read_bytes(), source_before)
         with gate.zipfile.ZipFile(gate.io.BytesIO(data)) as archive:
             names = archive.namelist()
-            self.assertEqual(len(names), 1)
-            self.assertTrue(names[0].endswith(gate.bundle_download_name(bundle_id, bundle)))
-            payload = json.loads(archive.read(names[0]))
-        self.assertEqual(payload["email"], "batch@example.com")
+            self.assertEqual(len(names), 3)
+            cpa_name = next(name for name in names if "/cpa/" in name)
+            sub_name = next(name for name in names if "/sub2api/" in name)
+            cockpit_name = next(name for name in names if name.endswith("/cockpit/auth.json"))
+            self.assertTrue(cpa_name.endswith(gate.bundle_download_name(bundle_id, bundle)))
+            self.assertTrue(sub_name.endswith("/sub2api/SUB2API-grok-batch_example.com.json"))
+            cpa = json.loads(archive.read(cpa_name))
+            sub = json.loads(archive.read(sub_name))
+            cockpit = json.loads(archive.read(cockpit_name))
+        self.assertEqual(cpa["email"], "batch@example.com")
+        self.assertEqual(sub["type"], gate.SUB2API_DATA_TYPE)
+        self.assertEqual(sub["accounts"][0]["credentials"]["access_token"], cpa["access_token"])
+        self.assertEqual(sub["accounts"][0]["credentials"]["sub"], cpa["sub"])
+        entry = cockpit[gate.GROK_AUTH_REGISTRY_KEY]
+        self.assertEqual(entry["key"], cpa["access_token"])
+        self.assertEqual(entry["refresh_token"], cpa["refresh_token"])
+        self.assertEqual(entry["user_id"], cpa["sub"])
+        self.assertEqual(entry["principal_id"], cpa["sub"])
+
+    def test_cockpit_auth_payload_is_single_official_registry_account(self):
+        source = {
+            "type": "xai",
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "email": "cockpit@example.com",
+            "sub": "subject-1",
+            "expired": "2026-07-23T00:00:00Z",
+            "last_refresh": "2026-07-22T18:00:00Z",
+        }
+        original = json.loads(json.dumps(source))
+
+        payload = gate.cockpit_auth_payload(source)
+
+        self.assertEqual(source, original)
+        self.assertEqual(set(payload), {gate.GROK_AUTH_REGISTRY_KEY})
+        self.assertNotIn("type", payload)
+        self.assertNotIn("access_token", payload)
+        self.assertNotIn("sub", payload)
+        entry = payload[gate.GROK_AUTH_REGISTRY_KEY]
+        self.assertEqual(entry["key"], "access-token")
+        self.assertEqual(entry["auth_mode"], "oidc")
+        self.assertEqual(entry["email"], "cockpit@example.com")
+        self.assertEqual(entry["refresh_token"], "refresh-token")
+        self.assertEqual(entry["user_id"], "subject-1")
+        self.assertEqual(entry["principal_id"], "subject-1")
+        self.assertEqual(entry["principal_type"], "User")
+        self.assertEqual(entry["expires_at"], "2026-07-23T00:00:00Z")
+        self.assertEqual(entry["oidc_issuer"], gate.GROK_OIDC_ISSUER)
+        self.assertEqual(entry["oidc_client_id"], gate.GROK_OIDC_CLIENT_ID)
+
+    def test_sub2api_payload_is_single_grok_data_account(self):
+        source = {
+            "type": "xai",
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "token_type": "Bearer",
+            "expired": "2026-07-23T00:00:00Z",
+            "email": "sub@example.com",
+            "sub": "subject-1",
+            "base_url": "https://cli-chat-proxy.grok.com/v1",
+            "id_token": "id-token",
+        }
+        original = json.loads(json.dumps(source))
+
+        payload = gate.sub2api_payload(source)
+
+        self.assertEqual(source, original)
+        self.assertEqual(set(payload), {"type", "version", "exported_at", "proxies", "accounts"})
+        self.assertEqual(payload["type"], gate.SUB2API_DATA_TYPE)
+        self.assertEqual(payload["version"], gate.SUB2API_DATA_VERSION)
+        self.assertEqual(payload["proxies"], [])
+        self.assertEqual(len(payload["accounts"]), 1)
+        account = payload["accounts"][0]
+        self.assertEqual(account["name"], "sub@example.com")
+        self.assertEqual(account["platform"], "grok")
+        self.assertEqual(account["type"], "oauth")
+        self.assertEqual(account["concurrency"], 1)
+        self.assertEqual(account["priority"], 0)
+        self.assertTrue(account["auto_pause_on_expired"])
+        credentials = account["credentials"]
+        self.assertEqual(credentials["access_token"], "access-token")
+        self.assertEqual(credentials["refresh_token"], "refresh-token")
+        self.assertEqual(credentials["expires_at"], "2026-07-23T00:00:00Z")
+        self.assertEqual(credentials["email"], "sub@example.com")
+        self.assertEqual(credentials["sub"], "subject-1")
+        self.assertEqual(credentials["client_id"], gate.GROK_OIDC_CLIENT_ID)
+        self.assertEqual(credentials["scope"], gate.GROK_OIDC_SCOPE)
+        self.assertEqual(gate.sub2api_filename(source), "SUB2API-grok-sub_example.com.json")
+
+    def test_batch_keeps_non_grok_json_layout_unchanged(self):
+        manifest = gate.load_manifest()
+        bundle_id = "kiro-json"
+        source_path = gate.JSON_DIR / f"{bundle_id}.json"
+        source_path.write_text(json.dumps({"email": "kiro@example.com"}), encoding="utf-8")
+        manifest["bundles"][bundle_id] = {
+            "id": bundle_id,
+            "platform": "kiro",
+            "json_name": "kiro-account.json",
+            "download_format": "json",
+            "files": ["kiro-account.json"],
+        }
+        batch = {"items": [{"key": "KIRO-KEY", "bundle_id": bundle_id}]}
+
+        data = gate.build_batch_zip_bytes(manifest, batch)
+
+        with gate.zipfile.ZipFile(gate.io.BytesIO(data)) as archive:
+            self.assertEqual(archive.namelist(), ["01-KIRO-KEY/kiro-account.json"])
 
     def test_consumed_reserve_without_document_recovers_by_card(self):
         manifest = gate.load_manifest()

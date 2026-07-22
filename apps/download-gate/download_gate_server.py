@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import cgi
+import base64
 import csv
 import hashlib
 import hmac
@@ -15,6 +16,7 @@ import threading
 import time
 import zipfile
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -43,7 +45,7 @@ ADMIN_PATH = normalize_admin_path(os.environ.get("DOWNLOAD_GATE_ADMIN_PATH", "/d
 INTERNAL_API_TOKEN = os.environ.get("DOWNLOAD_GATE_INTERNAL_TOKEN", "").strip()
 CONSOLE_URL = os.environ.get("DOWNLOAD_GATE_CONSOLE_URL", "").strip().rstrip("/")
 CONSOLE_TIMEOUT_SECONDS = max(int(os.environ.get("DOWNLOAD_GATE_CONSOLE_TIMEOUT", "120") or 120), 5)
-APP_VERSION = "2026.07.22.3"
+APP_VERSION = "2026.07.23.10"
 CLIENT_COOKIE_NAME = "dg_client"
 CLIENT_COOKIE_MAX_AGE = 365 * 24 * 60 * 60
 CLAIM_TTL_SECONDS = 24 * 60 * 60
@@ -70,6 +72,12 @@ CARD_PLATFORMS = (
     "anything",
 )
 DEFAULT_REQUIRED_MODELS = {"grok": "grok-4.5"}
+GROK_OIDC_ISSUER = "https://auth.x.ai"
+GROK_OIDC_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
+GROK_OIDC_SCOPE = "openid profile email offline_access grok-cli:access api:access"
+GROK_AUTH_REGISTRY_KEY = f"{GROK_OIDC_ISSUER}::{GROK_OIDC_CLIENT_ID}"
+SUB2API_DATA_TYPE = "sub2api-data"
+SUB2API_DATA_VERSION = 1
 
 
 def normalize_card_platform(value: str | None) -> str:
@@ -493,28 +501,30 @@ def clear_orphan_zips(manifest: dict) -> int:
     return deleted
 
 
-CPA_IMPORT_FIELDS = (
-    "type",
-    "auth_kind",
-    "email",
-    "sub",
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "token_type",
-    "expires_in",
-    "expired",
-    "last_refresh",
-    "redirect_uri",
-    "token_endpoint",
-    "base_url",
-    "disabled",
-    "headers",
-)
+CPA_DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
+CPA_DEFAULT_REDIRECT_URI = "http://127.0.0.1:56121/callback"
+CPA_DEFAULT_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
+
+
+def _jwt_payload(value: object) -> dict:
+    try:
+        segment = str(value or "").split(".")[1]
+        segment += "=" * (-len(segment) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(segment).decode("utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _utc_text(value: object) -> str:
+    try:
+        return datetime.fromtimestamp(int(value), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError, OSError):
+        return ""
 
 
 def cpa_import_payload(document: dict) -> dict:
-    """Return the flat xAI auth object accepted by CPA-compatible importers."""
+    """Return the exact flat CPA shape emitted by AaronL725/grok-register."""
     nested = document.get("cpa_auth") if isinstance(document.get("cpa_auth"), dict) else {}
     if nested and (nested.get("access_token") or nested.get("refresh_token")):
         source = nested
@@ -525,23 +535,153 @@ def cpa_import_payload(document: dict) -> dict:
     else:
         return document
     credentials = document.get("credentials") if isinstance(document.get("credentials"), dict) else {}
-    payload = {}
-    for key in CPA_IMPORT_FIELDS:
-        value = source.get(key)
-        if value is None or value == "":
-            value = document.get(key)
-        if (value is None or value == "") and key in credentials:
-            value = credentials.get(key)
-        if value is not None:
-            payload[key] = value
-    payload.setdefault("type", "xai")
-    payload.setdefault("auth_kind", "oauth")
-    payload.setdefault("token_type", "Bearer")
-    payload.setdefault("disabled", False)
-    sso = str(source.get("sso") or document.get("sso") or credentials.get("sso") or "").strip()
-    if sso:
-        payload["sso"] = sso
+    access_token = str(
+        source.get("access_token")
+        or document.get("access_token")
+        or credentials.get("access_token")
+        or ""
+    ).strip()
+    refresh_token = str(
+        source.get("refresh_token")
+        or document.get("refresh_token")
+        or credentials.get("refresh_token")
+        or ""
+    ).strip()
+    if not access_token or not refresh_token:
+        return document
+    id_token = str(
+        source.get("id_token")
+        or document.get("id_token")
+        or credentials.get("id_token")
+        or ""
+    ).strip()
+    # Aaron's parse_identity() prefers id_token, then access_token.
+    identity = _jwt_payload(id_token) if id_token else {}
+    if not identity:
+        identity = _jwt_payload(access_token)
+    email = str(
+        source.get("email")
+        or document.get("email")
+        or identity.get("email")
+        or ""
+    ).strip()
+    subject = str(identity.get("sub") or identity.get("principal_id") or source.get("sub") or "").strip()
+    expires_in = source.get("expires_in")
+    if expires_in is None:
+        expires_in = document.get("expires_in")
+    if expires_in is None and identity.get("exp") and identity.get("iat"):
+        expires_in = max(int(identity["exp"]) - int(identity["iat"]), 0)
+    try:
+        expires_in = int(expires_in or 21600)
+    except (TypeError, ValueError):
+        expires_in = 21600
+    expired = _utc_text(identity.get("exp"))
+    if not expired:
+        expired = str(source.get("expired") or document.get("expired") or "")
+    last_refresh = str(source.get("last_refresh") or document.get("last_refresh") or "")
+    if not last_refresh:
+        last_refresh = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Keep field names and insertion order aligned with upstream schema.py.
+    payload = {
+        "type": "xai",
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": str(source.get("token_type") or document.get("token_type") or "Bearer"),
+        "expires_in": expires_in,
+        "expired": expired,
+        "last_refresh": last_refresh,
+        "email": email,
+        "sub": subject,
+        "base_url": str(source.get("base_url") or document.get("base_url") or CPA_DEFAULT_BASE_URL).rstrip("/"),
+        "redirect_uri": str(source.get("redirect_uri") or document.get("redirect_uri") or CPA_DEFAULT_REDIRECT_URI),
+        "token_endpoint": str(source.get("token_endpoint") or document.get("token_endpoint") or CPA_DEFAULT_TOKEN_ENDPOINT),
+        "auth_kind": "oauth",
+    }
+    if id_token:
+        payload["id_token"] = id_token
     return payload
+
+
+def cockpit_auth_payload(document: dict) -> dict:
+    """Derive a single-account official Grok auth.json registry for Cockpit."""
+    cpa = cpa_import_payload(document)
+    source = cpa if cpa is not document else document
+    access_token = str(source.get("access_token") or "").strip()
+    refresh_token = str(source.get("refresh_token") or "").strip()
+    if not access_token:
+        raise ValueError("CPA JSON 缺少 access_token，无法生成 Cockpit auth.json")
+    subject = str(source.get("sub") or "").strip()
+    entry: dict[str, object] = {
+        "key": access_token,
+        "auth_mode": "oidc",
+        "email": str(source.get("email") or "").strip(),
+        "principal_type": "User",
+        "oidc_issuer": GROK_OIDC_ISSUER,
+        "oidc_client_id": GROK_OIDC_CLIENT_ID,
+    }
+    if refresh_token:
+        entry["refresh_token"] = refresh_token
+    if subject:
+        entry["user_id"] = subject
+        entry["principal_id"] = subject
+    if source.get("expired") not in (None, ""):
+        entry["expires_at"] = source["expired"]
+    if source.get("last_refresh") not in (None, ""):
+        entry["create_time"] = source["last_refresh"]
+    return {GROK_AUTH_REGISTRY_KEY: entry}
+
+
+def sub2api_payload(document: dict) -> dict:
+    """Derive a one-account Sub2API DataPayload for Grok OAuth import."""
+    cpa = cpa_import_payload(document)
+    source = cpa if cpa is not document else document
+    access_token = str(source.get("access_token") or "").strip()
+    refresh_token = str(source.get("refresh_token") or "").strip()
+    if not access_token:
+        raise ValueError("CPA JSON 缺少 access_token，无法生成 Sub2API 导入文件")
+    email = str(source.get("email") or "").strip()
+    subject = str(source.get("sub") or "").strip()
+    credentials: dict[str, object] = {
+        "access_token": access_token,
+    }
+    if refresh_token:
+        credentials["refresh_token"] = refresh_token
+    credentials["token_type"] = str(source.get("token_type") or "Bearer")
+    if source.get("expired") not in (None, ""):
+        credentials["expires_at"] = source["expired"]
+    if source.get("id_token") not in (None, ""):
+        credentials["id_token"] = source["id_token"]
+    credentials["client_id"] = GROK_OIDC_CLIENT_ID
+    credentials["scope"] = GROK_OIDC_SCOPE
+    if email:
+        credentials["email"] = email
+    if subject:
+        credentials["sub"] = subject
+    credentials["base_url"] = str(source.get("base_url") or CPA_DEFAULT_BASE_URL).rstrip("/")
+    return {
+        "type": SUB2API_DATA_TYPE,
+        "version": SUB2API_DATA_VERSION,
+        "exported_at": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "proxies": [],
+        "accounts": [
+            {
+                "name": email or subject or "Grok OAuth Account",
+                "platform": "grok",
+                "type": "oauth",
+                "credentials": credentials,
+                "concurrency": 1,
+                "priority": 0,
+                "auto_pause_on_expired": True,
+            }
+        ],
+    }
+
+
+def sub2api_filename(document: dict) -> str:
+    cpa = cpa_import_payload(document)
+    source = cpa if cpa is not document else document
+    identity = str(source.get("email") or source.get("sub") or "account").strip()
+    return safe_filename(f"SUB2API-grok-{identity}.json", "SUB2API-grok-account.json")
 
 
 def cpa_import_filename(payload: dict, fallback: str = "account.json") -> str:
@@ -551,7 +691,7 @@ def cpa_import_filename(payload: dict, fallback: str = "account.json") -> str:
     stem = email if email.lower().startswith("xai") else f"xai-{email}"
     safe_stem = "".join(char if char.isalnum() or char in "._-@" else "_" for char in stem)
     safe_stem = safe_stem.strip("._-")[:115]
-    return f"{safe_stem or 'xai-account'}.json"
+    return f"CPA-{safe_stem or 'xai-account'}.json"
 
 
 def normalize_delivery_json_file(filename: str, raw: bytes) -> tuple[str, bytes, dict | None]:
@@ -867,6 +1007,38 @@ def migrate_existing_bundle_json(manifest: dict) -> int:
     migrated = 0
     for bundle_id, bundle in manifest.setdefault("bundles", {}).items():
         if not isinstance(bundle, dict):
+            continue
+        direct_json_path = JSON_DIR / f"{bundle_id}.json"
+        if direct_json_path.exists():
+            try:
+                original_raw = direct_json_path.read_bytes()
+                original_name = str(
+                    bundle.get("json_name")
+                    or next(iter(bundle.get("files") or []), "account.json")
+                )
+                name, raw, payload = normalize_delivery_json_file(original_name, original_raw)
+            except (OSError, ValueError):
+                payload = None
+            if isinstance(payload, dict) and payload is not None and (
+                raw != original_raw
+                or name != original_name
+                or bundle.get("format") != "cpa-aaron-v1"
+            ):
+                temp_json_path = JSON_DIR / f".{bundle_id}.{secrets.token_hex(6)}.tmp"
+                try:
+                    temp_json_path.write_bytes(raw)
+                    os.replace(temp_json_path, direct_json_path)
+                finally:
+                    if temp_json_path.exists():
+                        temp_json_path.unlink()
+                bundle["files"] = [name]
+                bundle["file_count"] = 1
+                bundle["size"] = direct_json_path.stat().st_size
+                bundle["json_name"] = name
+                bundle["download_format"] = "json"
+                bundle["format"] = "cpa-aaron-v1"
+                bundle["identities"] = [delivery_identity_from_json(payload, filename=name)]
+                migrated += 1
             continue
         zip_path = ZIP_DIR / f"{bundle_id}.zip"
         if not zip_path.exists():
@@ -1774,7 +1946,7 @@ def user_page(message: str = "", *, initial_key: str = "") -> bytes:
     initial_value = html.escape(initial_key)
     announcement = load_announcement()
     pool_closed = bool(announcement.get("pool_closed"))
-    default_key_hint = "当前号池为空，未激活卡密暂不可取件；已取件用户可在有效期内继续下载。" if pool_closed else "支持单卡 JSON；多个卡密每行一个可合并下载。"
+    default_key_hint = "当前号池为空，未激活卡密暂不可取件；已取件用户可在有效期内继续下载。" if pool_closed else "单卡可分别下载 CPA、Sub2API 或 Cockpit；多卡会按三种格式分目录合并下载。"
     pool_closed_js = "true" if pool_closed else "false"
     pool_closed_message_js = json.dumps(pool_closed_message(), ensure_ascii=False)
     pool_closed_notice_html = (
@@ -2123,22 +2295,50 @@ def user_page(message: str = "", *, initial_key: str = "") -> bytes:
     body.pickup-page .batch-hint strong {
       color: inherit;
     }
-    body.pickup-page #claimBtn {
+    body.pickup-page .claim-actions {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 18px;
+    }
+    body.pickup-page .claim-actions.is-batch {
+      grid-template-columns: 1fr;
+    }
+    body.pickup-page #claimBtn,
+    body.pickup-page #claimSubBtn,
+    body.pickup-page #claimCockpitBtn {
       width: 100%;
       min-height: 48px;
-      margin-top: 18px;
+      margin-top: 0;
       border-radius: 7px;
-      background: var(--accent);
-      color: #fff;
       font-size: .9rem;
       font-weight: 800;
+      white-space: normal;
+    }
+    body.pickup-page #claimBtn {
+      background: var(--accent);
+      color: #fff;
       box-shadow: 0 5px 14px rgba(37, 99, 235, .18);
     }
     body.pickup-page #claimBtn:hover {
       background: #1d4ed8;
     }
-    body.pickup-page #claimBtn:disabled {
+    body.pickup-page #claimSubBtn,
+    body.pickup-page #claimCockpitBtn {
+      border: 1px solid var(--accent);
+      background: #fff;
+      color: var(--accent);
+      box-shadow: none;
+    }
+    body.pickup-page #claimSubBtn:hover,
+    body.pickup-page #claimCockpitBtn:hover {
+      background: #eff6ff;
+    }
+    body.pickup-page #claimBtn:disabled,
+    body.pickup-page #claimSubBtn:disabled,
+    body.pickup-page #claimCockpitBtn:disabled {
       background: #93a9d8;
+      color: #fff;
       box-shadow: none;
     }
     body.pickup-page #hint:empty {
@@ -2461,6 +2661,9 @@ def user_page(message: str = "", *, initial_key: str = "") -> bytes:
         height: 116px;
         min-height: 108px;
       }
+      body.pickup-page .claim-actions {
+        grid-template-columns: 1fr;
+      }
       body.pickup-page .guide-list {
         grid-template-columns: 1fr;
       }
@@ -2493,13 +2696,13 @@ def user_page(message: str = "", *, initial_key: str = "") -> bytes:
   </style>"""
     body = f"""
 <div class="pickup-intro">
-  <p class="pickup-lead">粘贴卡密或取件链接即可领取账号文件。单卡直接下载 JSON，多卡会合并为 ZIP；首次领取后 24 小时内有效，并绑定当前浏览器。</p>
+  <p class="pickup-lead">粘贴卡密或取件链接即可领取账号文件。CPA、Sub2API 与 Cockpit 是三种独立格式，但都来自同一个已验活账号。</p>
   <span class="pickup-version">v{APP_VERSION}</span>
 </div>
 <section class="pickup-facts" aria-label="取件规则">
-  <div class="pickup-fact"><span>单个卡密</span><strong>直接下载 JSON 文件</strong></div>
-  <div class="pickup-fact"><span>多个卡密</span><strong>合并为一个临时 ZIP</strong></div>
-  <div class="pickup-fact"><span>下载有效期</span><strong>首次领取后 24 小时</strong></div>
+  <div class="pickup-fact"><span>CPA</span><strong>CPA-xai-邮箱.json</strong></div>
+  <div class="pickup-fact"><span>Sub2API</span><strong>SUB2API-grok-邮箱.json</strong></div>
+  <div class="pickup-fact"><span>Cockpit</span><strong>auth.json</strong></div>
 </section>
 <section id="livePool" class="live-pool" aria-label="实时号池状态">
   <div class="live-pool-main">
@@ -2522,7 +2725,7 @@ def user_page(message: str = "", *, initial_key: str = "") -> bytes:
         <strong id="pickupFormTitle">输入卡密领取文件</strong>
         <span>支持卡密、完整取件链接，以及带 key 参数的链接。</span>
       </div>
-      <small class="lookup-format">JSON / ZIP</small>
+      <small class="lookup-format">CPA / Sub2API / Cockpit / ZIP</small>
     </div>
     <div class="key-field">
       <div class="field-label-row">
@@ -2535,9 +2738,13 @@ def user_page(message: str = "", *, initial_key: str = "") -> bytes:
     </div>
     <div id="keyCountHint" class="batch-hint">{html.escape(default_key_hint)}</div>
     {pool_closed_notice_html}
-    <button id="claimBtn" type="button" onclick="claim()">核验并下载</button>
+    <div id="claimActions" class="claim-actions">
+      <button id="claimBtn" type="button" onclick="claim('cpa')">下载 CPA JSON</button>
+      <button id="claimSubBtn" type="button" onclick="claim('sub2api')">下载 Sub2API JSON</button>
+      <button id="claimCockpitBtn" type="button" onclick="claim('cockpit')">下载 Cockpit auth.json</button>
+    </div>
     <div id="hint" aria-live="polite">{note}</div>
-    <div class="lookup-footnote">核验成功后浏览器会自动开始下载；若没有弹出下载，可在结果区手动下载或复制链接。</div>
+    <div class="lookup-footnote">选择所需格式后会自动下载；领取成功后结果区仍可分别下载另一个格式。</div>
   </section>
   <aside class="pickup-side" aria-label="领取说明">
     <h2 class="pickup-side-title">领取说明</h2>
@@ -2545,7 +2752,7 @@ def user_page(message: str = "", *, initial_key: str = "") -> bytes:
     <div class="guide-list">
       <div class="guide-item">
         <span class="guide-index">01</span>
-        <div class="guide-copy"><strong>单卡直接交付</strong><span>一个卡密对应一个 JSON 文件，核验后直接下载，不再额外打包。</span></div>
+        <div class="guide-copy"><strong>三种格式分开下载</strong><span>CPA、Sub2API 和 Cockpit 是三个独立文件，但对应同一个账号且不重复消耗库存。</span></div>
       </div>
       <div class="guide-item">
         <span class="guide-index">02</span>
@@ -2566,6 +2773,9 @@ def user_page(message: str = "", *, initial_key: str = "") -> bytes:
 <script>
 const q = document.querySelector('#q');
 const claimBtn = document.querySelector('#claimBtn');
+const claimSubBtn = document.querySelector('#claimSubBtn');
+const claimCockpitBtn = document.querySelector('#claimCockpitBtn');
+const claimActions = document.querySelector('#claimActions');
 const res = document.querySelector('#res');
 const hint = document.querySelector('#hint');
 const keyCountHint = document.querySelector('#keyCountHint');
@@ -2576,7 +2786,9 @@ const livePoolCandidate = document.querySelector('#livePoolCandidate');
 const livePoolBar = document.querySelector('#livePoolBar');
 const livePoolStatus = document.querySelector('#livePoolStatus');
 const livePoolRule = document.querySelector('#livePoolRule');
-const defaultClaimText = claimBtn ? claimBtn.textContent : '核验并下载';
+const defaultClaimText = claimBtn ? claimBtn.textContent : '下载 CPA JSON';
+const defaultSubClaimText = claimSubBtn ? claimSubBtn.textContent : '下载 Sub2API JSON';
+const defaultCockpitClaimText = claimCockpitBtn ? claimCockpitBtn.textContent : '下载 Cockpit auth.json';
 const poolClosed = {pool_closed_js};
 const poolClosedMessage = {pool_closed_message_js};
 async function refreshLivePool(){{
@@ -2657,6 +2869,11 @@ function extractKeys(s){{
 function setClaimButtonText(text){{
   if(claimBtn && !claimBtn.disabled) claimBtn.textContent = text;
 }}
+function setClaimButtonMode(isBatch){{
+  if(claimActions) claimActions.classList.toggle('is-batch', isBatch);
+  if(claimSubBtn) claimSubBtn.hidden = isBatch;
+  if(claimCockpitBtn) claimCockpitBtn.hidden = isBatch;
+}}
 function closePoolClosedModal(){{
   if(poolClosedModal) poolClosedModal.hidden = true;
   document.body.classList.remove('modal-open');
@@ -2679,37 +2896,42 @@ if(poolClosedModal){{
 function updateKeyHint(){{
   const keys = extractKeys(q.value);
   if(!keyCountHint) return keys;
+  setClaimButtonMode(keys.length > 1);
   keyCountHint.classList.toggle('is-batch', keys.length > 1 || poolClosed);
   if(keys.length > 1){{
     keyCountHint.innerHTML = poolClosed
       ? `已识别 <strong>${{keys.length}}</strong> 个卡密。当前号池为空：未激活卡密暂不可取件；已取件卡密可合并下载。`
-      : `已识别 <strong>${{keys.length}}</strong> 个卡密，点击后会合并成 1 个 ZIP 下载。`;
-    setClaimButtonText('批量合并下载');
+      : `已识别 <strong>${{keys.length}}</strong> 个卡密，每个账号的 CPA、Sub2API 与 Cockpit 文件会分目录合并成 1 个 ZIP。`;
+    setClaimButtonText('批量下载三格式 ZIP');
   }}else if(keys.length === 1){{
     keyCountHint.innerHTML = poolClosed
       ? '已识别 <strong>1</strong> 个卡密。当前号池为空：未激活卡密暂不可取件；已取件卡密可下载。'
-      : '已识别 <strong>1</strong> 个卡密，将直接下载对应 JSON 文件。';
+      : '已识别 <strong>1</strong> 个卡密，请分别选择 CPA、Sub2API 或 Cockpit。';
     setClaimButtonText(defaultClaimText);
   }}else{{
-    keyCountHint.textContent = poolClosed ? poolClosedMessage : '支持单卡 JSON；多个卡密每行一个可合并下载。';
+    keyCountHint.textContent = poolClosed ? poolClosedMessage : '单卡可分别下载 CPA、Sub2API 或 Cockpit；多卡会按三种格式分目录合并下载。';
     setClaimButtonText(defaultClaimText);
   }}
   return keys;
 }}
 function trigger(url, name){{setTimeout(()=>{{window.location.assign(url);}},250);}}
-async function claim(){{
-  if(claimBtn && claimBtn.disabled) return;
+async function claim(downloadKind='cpa'){{
+  if((claimBtn && claimBtn.disabled) || (claimSubBtn && claimSubBtn.disabled) || (claimCockpitBtn && claimCockpitBtn.disabled)) return;
   const keys = updateKeyHint();
   const value = keys[0] || '';
   q.value = keys.join('\\n');
   if(!value){{hint.innerHTML='<div class="note warn">请输入卡密 KEY。</div>';return;}}
-  performClaim(keys);
+  performClaim(keys, downloadKind);
 }}
-async function performClaim(keys){{
-  if(claimBtn && claimBtn.disabled) return;
+async function performClaim(keys, downloadKind='cpa'){{
+  if((claimBtn && claimBtn.disabled) || (claimSubBtn && claimSubBtn.disabled) || (claimCockpitBtn && claimCockpitBtn.disabled)) return;
   const value = keys[0] || '';
   const oldText = claimBtn ? claimBtn.textContent : '';
+  const oldSubText = claimSubBtn ? claimSubBtn.textContent : '';
+  const oldCockpitText = claimCockpitBtn ? claimCockpitBtn.textContent : '';
   if(claimBtn){{claimBtn.disabled = true; claimBtn.textContent = '正在核验'; claimBtn.setAttribute('aria-busy', 'true');}}
+  if(claimSubBtn){{claimSubBtn.disabled = true; claimSubBtn.textContent = '正在核验'; claimSubBtn.setAttribute('aria-busy', 'true');}}
+  if(claimCockpitBtn){{claimCockpitBtn.disabled = true; claimCockpitBtn.textContent = '正在核验'; claimCockpitBtn.setAttribute('aria-busy', 'true');}}
   hint.innerHTML='<div class="note warn">正在核验卡密...</div>';res.innerHTML='';
   try{{
     const batch = keys.length > 1;
@@ -2727,17 +2949,17 @@ async function performClaim(keys){{
         ? '<div class="note warn">部分卡密领取成功并已开始下载；失败项：'+partialErrors.map(esc).join('；')+'</div>'
         : '<div class="note ok">批量卡密有效，已合并打包并开始下载。</div>';
       res.innerHTML = `<article class="card result">
-        <div class="hd"><div class="result-heading"><small>领取成功</small><strong>已合并 ${{esc(r.key_count)}} 个卡密</strong></div><span class="tag">ZIP 文件</span></div>
+        <div class="hd"><div class="result-heading"><small>领取成功</small><strong>已合并 ${{esc(r.key_count)}} 个卡密</strong></div><span class="tag">CPA + Sub2API + Cockpit ZIP</span></div>
         <div class="rows">
           <div class="row"><span class="k">文件名</span><span class="v">${{esc(r.zip_name)}}</span></div>
-          <div class="row"><span class="k">交付类型</span><span class="v">批量合并 ZIP</span></div>
+          <div class="row"><span class="k">交付类型</span><span class="v">CPA、Sub2API 与 Cockpit 分目录批量 ZIP</span></div>
           <div class="row"><span class="k">文件数</span><span class="v">${{r.file_count}}</span></div>
           <div class="row"><span class="k">大小</span><span class="v">${{esc(r.size_text)}}</span></div>
           <div class="row row-wide"><span class="k">卡密</span><span class="v">${{keyHtml}}</span></div>
           <div class="row row-wide"><span class="k">链接有效</span><span class="v">临时链接约 10 分钟；原卡密仍按首次领取后 24 小时有效</span></div>
         </div>
         <div class="downloads">
-          <div class="note warn">合并 ZIP 内会按卡密分文件夹存放，避免同名 JSON 覆盖。</div>
+          <div class="note warn">每个卡密目录内分别存放 cpa/、sub2api/ 和 cockpit/ 三种文件。</div>
           <div class="download-actions">
             <a class="btn" href="${{esc(r.download_url)}}" download>下载合并 ZIP</a>
             <button class="secondary" type="button" data-copy="${{esc(r.download_url)}}" onclick="copyText(this.dataset.copy,this)">复制下载链接</button>
@@ -2748,13 +2970,28 @@ async function performClaim(keys){{
       return;
     }}
     const downloadName = r.file_name || r.zip_name || 'account.json';
-    const downloadLabel = r.download_format === 'json' ? '下载 JSON' : '下载 ZIP';
-    hint.innerHTML='<div class="note ok">卡密有效，已取件并开始下载。当前浏览器已绑定该卡密。</div>';
+    const downloadLabel = r.cockpit_download_url ? '下载 CPA JSON' : (r.download_format === 'json' ? '下载 JSON' : '下载 ZIP');
+    const subDownload = r.sub_download_url
+      ? `<a class="btn secondary" href="${{esc(r.sub_download_url)}}" download="${{esc(r.sub_file_name || 'SUB2API-grok-account.json')}}">下载 Sub2API JSON</a>`
+      : '';
+    const cockpitDownload = r.cockpit_download_url
+      ? `<a class="btn secondary" href="${{esc(r.cockpit_download_url)}}" download="auth.json">下载 Cockpit auth.json</a>`
+      : '';
+    const selectedDownloads = {{
+      cpa: {{url:r.download_url, name:downloadName, label:'CPA JSON'}},
+      sub2api: {{url:r.sub_download_url, name:r.sub_file_name || 'SUB2API-grok-account.json', label:'Sub2API JSON'}},
+      cockpit: {{url:r.cockpit_download_url, name:r.cockpit_file_name || 'auth.json', label:'Cockpit auth.json'}}
+    }};
+    const selected = selectedDownloads[downloadKind] && selectedDownloads[downloadKind].url
+      ? selectedDownloads[downloadKind]
+      : selectedDownloads.cpa;
+    hint.innerHTML='<div class="note ok">卡密有效，已开始下载 '+esc(selected.label)+'。当前浏览器已绑定该卡密。</div>';
     res.innerHTML = `<article class="card result">
-      <div class="hd"><div class="result-heading"><small>领取成功</small><strong>卡密 ${{esc(r.key)}}</strong></div><span class="tag">${{r.download_format === 'json' ? 'JSON 文件' : 'ZIP 文件'}}</span></div>
+      <div class="hd"><div class="result-heading"><small>领取成功</small><strong>卡密 ${{esc(r.key)}}</strong></div><span class="tag">${{r.sub_download_url ? 'CPA / Sub2API / Cockpit' : (r.download_format === 'json' ? 'JSON 文件' : 'ZIP 文件')}}</span></div>
       <div class="rows">
-        <div class="row"><span class="k">文件名</span><span class="v">${{esc(downloadName)}}</span></div>
-        <div class="row"><span class="k">交付类型</span><span class="v">${{r.download_format === 'json' ? '单卡 JSON' : '压缩包 ZIP'}}</span></div>
+        <div class="row"><span class="k">CPA 文件名</span><span class="v">${{esc(downloadName)}}</span></div>
+        <div class="row"><span class="k">Sub2API 文件名</span><span class="v">${{esc(r.sub_file_name || '-')}}</span></div>
+        <div class="row"><span class="k">Cockpit 文件名</span><span class="v">${{esc(r.cockpit_file_name || 'auth.json')}}</span></div>
         <div class="row"><span class="k">文件数</span><span class="v">${{r.file_count}}</span></div>
         <div class="row"><span class="k">大小</span><span class="v">${{esc(r.size_text)}}</span></div>
         <div class="row"><span class="k">取件时间</span><span class="v">${{esc(r.bound_at || '刚刚')}}</span></div>
@@ -2764,15 +3001,19 @@ async function performClaim(keys){{
         <div class="note warn">浏览器没有自动下载时，可手动下载或复制链接。</div>
         <div class="download-actions">
           <a class="btn" href="${{esc(r.download_url)}}" download>${{downloadLabel}}</a>
+          ${{subDownload}}
+          ${{cockpitDownload}}
           <button class="secondary" type="button" data-copy="${{esc(r.download_url)}}" onclick="copyText(this.dataset.copy,this)">复制下载链接</button>
         </div>
       </div>
     </article>`;
-    trigger(r.download_url, downloadName);
+    trigger(selected.url, selected.name);
   }}catch(e){{
     hint.innerHTML='<div class="note err">请求失败：'+esc(e.message)+'</div>';
   }}finally{{
     if(claimBtn){{claimBtn.disabled = false; claimBtn.textContent = oldText; claimBtn.removeAttribute('aria-busy');}}
+    if(claimSubBtn){{claimSubBtn.disabled = false; claimSubBtn.textContent = oldSubText || defaultSubClaimText; claimSubBtn.removeAttribute('aria-busy');}}
+    if(claimCockpitBtn){{claimCockpitBtn.disabled = false; claimCockpitBtn.textContent = oldCockpitText || defaultCockpitClaimText; claimCockpitBtn.removeAttribute('aria-busy');}}
     updateKeyHint();
   }}
 }}
@@ -4224,8 +4465,28 @@ def build_batch_zip_bytes(manifest: dict, batch: dict) -> bytes:
                 raise FileNotFoundError(f"missing delivery file for bundle {bundle_id}")
             if source_path.suffix.lower() == ".json":
                 member_name = safe_zip_member_path(bundle_download_name(bundle_id, bundle))
-                arcname = unique_zip_member_name(f"{folder}/{member_name}", used_names)
-                target.writestr(arcname, source_path.read_bytes())
+                raw = source_path.read_bytes()
+                if normalize_card_platform(bundle.get("platform")) == "grok":
+                    arcname = unique_zip_member_name(f"{folder}/cpa/{member_name}", used_names)
+                    target.writestr(arcname, raw)
+                    document = json.loads(raw.decode("utf-8-sig"))
+                    sub_raw = json.dumps(
+                        sub2api_payload(document), ensure_ascii=False, indent=2
+                    ).encode("utf-8")
+                    sub_name = unique_zip_member_name(
+                        f"{folder}/sub2api/{sub2api_filename(document)}", used_names
+                    )
+                    target.writestr(sub_name, sub_raw)
+                    cockpit_raw = json.dumps(
+                        cockpit_auth_payload(document), ensure_ascii=False, indent=2
+                    ).encode("utf-8")
+                    cockpit_name = unique_zip_member_name(
+                        f"{folder}/cockpit/auth.json", used_names
+                    )
+                    target.writestr(cockpit_name, cockpit_raw)
+                else:
+                    arcname = unique_zip_member_name(f"{folder}/{member_name}", used_names)
+                    target.writestr(arcname, raw)
             else:
                 with zipfile.ZipFile(source_path, "r") as source:
                     for member in source.infolist():
@@ -5039,6 +5300,24 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
             download_path += f"?key={quote(key, safe='')}"
         download_name = bundle_download_name(bundle_id, bundle)
         download_format = "json" if download_name.lower().endswith(".json") else "zip"
+        sub_download_url = ""
+        sub_file_name = ""
+        cockpit_download_url = ""
+        if download_format == "json" and normalize_card_platform(bundle.get("platform")) == "grok":
+            sub_path = bundle_download_path(bundle_id, bundle)
+            sub_path += f"?format=sub2api&key={quote(key, safe='')}"
+            sub_download_url = absolute_url(self, sub_path)
+            sub_file_name = "SUB2API-grok-account.json"
+            try:
+                source_path = bundle_payload_path(bundle_id, bundle)
+                if source_path:
+                    sub_document = json.loads(source_path.read_text(encoding="utf-8-sig"))
+                    sub_file_name = sub2api_filename(sub_document)
+            except (OSError, ValueError):
+                pass
+            cockpit_path = bundle_download_path(bundle_id, bundle)
+            cockpit_path += f"?format=cockpit&key={quote(key, safe='')}"
+            cockpit_download_url = absolute_url(self, cockpit_path)
         expires_text = bundle_expires_text(bundle)
         self.send_json(
             {
@@ -5052,6 +5331,10 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
                 "file_name": download_name,
                 "download_format": download_format,
                 "download_url": absolute_url(self, download_path),
+                "sub_download_url": sub_download_url,
+                "sub_file_name": sub_file_name,
+                "cockpit_download_url": cockpit_download_url,
+                "cockpit_file_name": "auth.json" if cockpit_download_url else "",
                 "bound_at": bundle.get("bound_at") or "",
                 "expires_at": expires_text,
             },
@@ -5100,7 +5383,14 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
             return
 
         batch = create_batch_download(self, items, client_id)
-        total_files = sum(int(item["bundle"].get("file_count") or len(item["bundle"].get("files") or []) or 0) for item in items)
+        total_files = sum(
+            3
+            if bundle_payload_path(item["bundle_id"], item["bundle"])
+            and bundle_payload_path(item["bundle_id"], item["bundle"]).suffix.lower() == ".json"
+            and normalize_card_platform(item["bundle"].get("platform")) == "grok"
+            else int(item["bundle"].get("file_count") or len(item["bundle"].get("files") or []) or 0)
+            for item in items
+        )
         total_size = sum(int(item["bundle"].get("size") or 0) for item in items)
         download_path = f"/download-batch/{quote(str(batch.get('token') or ''), safe='')}.zip"
         self.send_json(
@@ -5239,6 +5529,33 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
                 return
         data = payload_path.read_bytes()
         filename = bundle_download_name(bundle_id, bundle)
+        variant = str((query.get("format") or [""])[0]).strip().lower()
+        if variant == "cockpit":
+            if payload_path.suffix.lower() != ".json" or normalize_card_platform(bundle.get("platform")) != "grok":
+                self.send_html(user_page("该交付文件不支持 Cockpit 格式。"), HTTPStatus.BAD_REQUEST, client_headers)
+                return
+            try:
+                document = json.loads(data.decode("utf-8-sig"))
+                data = json.dumps(
+                    cockpit_auth_payload(document), ensure_ascii=False, indent=2
+                ).encode("utf-8")
+            except (UnicodeDecodeError, ValueError) as exc:
+                self.send_html(user_page(f"生成 Cockpit auth.json 失败：{exc}"), HTTPStatus.INTERNAL_SERVER_ERROR, client_headers)
+                return
+            filename = "auth.json"
+        elif variant in {"sub", "sub2api"}:
+            if payload_path.suffix.lower() != ".json" or normalize_card_platform(bundle.get("platform")) != "grok":
+                self.send_html(user_page("该交付文件不支持 Sub2API 格式。"), HTTPStatus.BAD_REQUEST, client_headers)
+                return
+            try:
+                document = json.loads(data.decode("utf-8-sig"))
+                data = json.dumps(
+                    sub2api_payload(document), ensure_ascii=False, indent=2
+                ).encode("utf-8")
+            except (UnicodeDecodeError, ValueError) as exc:
+                self.send_html(user_page(f"生成 Sub2API 导入文件失败：{exc}"), HTTPStatus.INTERNAL_SERVER_ERROR, client_headers)
+                return
+            filename = sub2api_filename(document)
         self.send_response(200)
         self.send_header(
             "Content-Type",
