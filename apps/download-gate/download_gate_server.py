@@ -45,7 +45,7 @@ ADMIN_PATH = normalize_admin_path(os.environ.get("DOWNLOAD_GATE_ADMIN_PATH", "/d
 INTERNAL_API_TOKEN = os.environ.get("DOWNLOAD_GATE_INTERNAL_TOKEN", "").strip()
 CONSOLE_URL = os.environ.get("DOWNLOAD_GATE_CONSOLE_URL", "").strip().rstrip("/")
 CONSOLE_TIMEOUT_SECONDS = max(int(os.environ.get("DOWNLOAD_GATE_CONSOLE_TIMEOUT", "120") or 120), 5)
-APP_VERSION = "2026.07.23.10"
+APP_VERSION = "2026.07.23.11"
 CLIENT_COOKIE_NAME = "dg_client"
 CLIENT_COOKIE_MAX_AGE = 365 * 24 * 60 * 60
 CLAIM_TTL_SECONDS = 24 * 60 * 60
@@ -5580,7 +5580,7 @@ def main() -> None:
         save_manifest(manifest)
         print(f"Migrated {migrated} bundle(s) to flat CPA JSON")
     host = os.environ.get("DOWNLOAD_GATE_HOST", "127.0.0.1").strip() or "127.0.0.1"
-    port = int(os.environ.get("DOWNLOAD_GATE_PORT", "8787"))
+    port = int(os.environ.get("DOWNLOAD_GATE_PORT", "18787"))
     server = ThreadingHTTPServer((host, port), DownloadGateHandler)
     print(f"DownloadGate v{APP_VERSION} running: http://{host}:{port}")
     print(f"Admin page: http://{host}:{port}{ADMIN_PATH}")

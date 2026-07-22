@@ -66,7 +66,7 @@ LINE_RE_PUSH = re.compile(r"SSO token 已推送到 API")
 
 CONSOLE_PASSWORD = os.getenv("GROK_REGISTER_CONSOLE_PASSWORD", "")
 DOWNLOAD_GATE_INTERNAL_URL = os.getenv(
-    "DOWNLOAD_GATE_INTERNAL_URL", "http://download-gate:8787"
+    "DOWNLOAD_GATE_INTERNAL_URL", "http://download-gate:18787"
 ).rstrip("/")
 DOWNLOAD_GATE_INTERNAL_TOKEN = os.getenv("DOWNLOAD_GATE_INTERNAL_TOKEN", "").strip()
 DOWNLOAD_GATE_PUBLIC_URL = os.getenv(
