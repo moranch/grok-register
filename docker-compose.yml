@@ -23,6 +23,8 @@ services:
 
   grok2api:
     image: ghcr.io/chenyme/grok2api:latest
+    entrypoint: ["/bin/sh", "/opt/grok2api-volume-entrypoint.sh"]
+    command: ["/app/grok2api", "--config", "/app/config.yaml", "--listen", "0.0.0.0:8000"]
     environment:
       TZ: Asia/Shanghai
       DATA_DIR: /app/data
@@ -39,7 +41,13 @@ services:
     ports:
       - "${GROK2API_HOST_PORT:-8000}:8000"
     volumes:
-      - ./config.yaml:/run/grok2api/config.yaml:ro
+      - type: bind
+        source: ./config.yaml
+        target: /run/grok2api/config.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - ./apps/grok2api-runtime/volume-entrypoint.sh:/opt/grok2api-volume-entrypoint.sh:ro
       - ./runtime/grok2api/data:/app/data
       - ./runtime/grok2api/logs:/app/logs
     restart: unless-stopped
