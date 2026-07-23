@@ -13,15 +13,19 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Body
+from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
 
 from core.registry import PLATFORM_REGISTRY
 from core.config_store import ConfigStore, platform_to_dict
 
-from ._shared import execute_no_return, fetch_one, now_iso
+from ._shared import check_auth, execute_no_return, fetch_one, now_iso
 
-router = APIRouter(prefix="/platforms", tags=["platforms"])
+router = APIRouter(
+    prefix="/platforms",
+    tags=["platforms"],
+    dependencies=[Depends(check_auth)],
+)
 
 # 全局配置存储实例（由 main_app lifespan 初始化后可用）
 _config_store = ConfigStore()

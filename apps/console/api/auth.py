@@ -11,12 +11,13 @@
 """
 from __future__ import annotations
 
+import secrets
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-from ._shared import CONSOLE_PASSWORD
+from ._shared import CONSOLE_PASSWORD, check_auth
 
 # 两个 router 分别挂载不同前缀，app.py 里 include 时处理
 router = APIRouter(tags=["auth"])
@@ -39,23 +40,15 @@ def api_login(payload: dict) -> dict[str, Any]:
     if not CONSOLE_PASSWORD:
         return {"success": True}
     password = str(payload.get("password", "")).strip()
-    if password == CONSOLE_PASSWORD:
+    if secrets.compare_digest(password, CONSOLE_PASSWORD):
         return {"success": True}
-    import logging
-    logging.getLogger("uvicorn").warning(
-        "[api_login] password mismatch: input_len=%d, expected_len=%d, "
-        "input_first_char=%r, expected_first_char=%r",
-        len(password),
-        len(CONSOLE_PASSWORD),
-        password[:1] if password else "",
-        CONSOLE_PASSWORD[:1] if CONSOLE_PASSWORD else "",
-    )
     raise HTTPException(status_code=401, detail="Invalid password")
 
 
 @auth_router.get("/debug")
 def api_auth_debug(request: Request) -> dict[str, Any]:
     """临时调试接口：返回后端实际使用的密码长度和首尾字符。不暴露明文。"""
+    check_auth(request)
     pw = CONSOLE_PASSWORD or ""
     return {
         "password_configured": bool(pw),

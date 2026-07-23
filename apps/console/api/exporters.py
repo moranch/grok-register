@@ -12,20 +12,25 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from core.registry import EXPORTER_REGISTRY
 from core.base_exporter import BaseExporter, ExporterConfig, get_exporter, list_exporters
 from api._shared import (
     account_list,
+    check_auth,
     execute_no_return,
     fetch_all,
     now_iso,
     record_exporter_result,
 )
 
-router = APIRouter(prefix="/exporters", tags=["exporters"])
+router = APIRouter(
+    prefix="/exporters",
+    tags=["exporters"],
+    dependencies=[Depends(check_auth)],
+)
 
 
 def _get_settings() -> Dict[str, str]:

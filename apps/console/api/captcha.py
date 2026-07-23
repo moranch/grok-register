@@ -10,12 +10,17 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from core.registry import CAPTCHA_REGISTRY, STRATEGY_REGISTRY
+from ._shared import check_auth
 
-router = APIRouter(prefix="/captcha", tags=["captcha"])
+router = APIRouter(
+    prefix="/captcha",
+    tags=["captcha"],
+    dependencies=[Depends(check_auth)],
+)
 
 
 # ─── 请求模型 ─────────────────────────────────────────────────────────────────
