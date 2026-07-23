@@ -797,7 +797,10 @@ def reserve(
                         "state": "ready",
                         "platform": platform,
                     }
-                error = str(probe.get("error") or probe.get("mint_error") or "required model unavailable")[:500]
+                # access_token 为空时会先尝试从 SSO 自动补全 OAuth。补全失败的
+                # mint_error 才是真正根因（例如 CPA 目的地未配置或 SSO 失效），
+                # 不应再被笼统的 "access_token is empty" 掩盖。
+                error = str(probe.get("mint_error") or probe.get("error") or "required model unavailable")[:500]
                 updated = conn.execute(
                     "UPDATE account_delivery_leases SET state='failed', probe_json=?, last_error=?, updated_at=? "
                     "WHERE id=? AND state='probing'",

@@ -967,6 +967,44 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_delivery_orders_platform_state "
             "ON delivery_orders(platform, state)"
         )
+
+        # DownloadGate 的动态交付依赖 Grok SSO 先换取 CPA OAuth 凭据。
+        # 新部署默认启用本地 CPA 产物目录，这样注册成功后后台队列会立即
+        # 生成 access/refresh token，而不是等到用户取件时才发现 token 为空。
+        # INSERT OR IGNORE 保留用户已经在 UI 中保存的启用/禁用和远程端点配置。
+        cpa_auto_mint = os.getenv("GROK_REGISTER_CPA_AUTO_MINT", "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        default_cpa_config = {
+            "enabled": cpa_auto_mint,
+            "endpoint": "",
+            "api_append": True,
+            "template": "",
+            "extra": {
+                "auth_dir": str(CPA_AUTH_DIR),
+                "base_url": "https://cli-chat-proxy.grok.com/v1",
+                "timeout": 90,
+                "verify_tls": True,
+                "probe": True,
+                "probe_required": False,
+                "auto_mint": cpa_auto_mint,
+                "prevalidate_enabled": cpa_auto_mint,
+                "prevalidate_ttl_minutes": 60,
+                "prevalidate_batch_size": 10,
+                "prevalidate_scan_seconds": 30,
+            },
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO settings(key, value, updated_at) VALUES (?, ?, ?)",
+            (
+                "exporter_cpa",
+                json.dumps(default_cpa_config, ensure_ascii=False),
+                now_iso(),
+            ),
+        )
         conn.commit()
 
 

@@ -95,6 +95,30 @@ class CpaRuntimeTests(unittest.TestCase):
 
         enqueue.assert_called_once_with(account_id, force=False)
 
+    def test_init_db_seeds_enabled_local_cpa_exporter(self):
+        row = _shared.fetch_one("SELECT value FROM settings WHERE key='exporter_cpa'")
+        self.assertIsNotNone(row)
+        config = json.loads(row["value"])
+        self.assertTrue(config["enabled"])
+        self.assertTrue(config["extra"]["auto_mint"])
+        self.assertEqual(config["extra"]["auth_dir"], str(_shared.CPA_AUTH_DIR))
+
+    def test_init_db_preserves_saved_cpa_exporter_config(self):
+        saved = {
+            "enabled": False,
+            "endpoint": "http://custom-cpa:8317",
+            "extra": {"auto_mint": False, "management_key": "secret"},
+        }
+        _shared.execute_no_return(
+            "UPDATE settings SET value=? WHERE key='exporter_cpa'",
+            (json.dumps(saved),),
+        )
+
+        _shared.init_db()
+
+        row = _shared.fetch_one("SELECT value FROM settings WHERE key='exporter_cpa'")
+        self.assertEqual(json.loads(row["value"]), saved)
+
 
 if __name__ == "__main__":
     unittest.main()
