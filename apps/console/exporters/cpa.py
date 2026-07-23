@@ -46,7 +46,7 @@ class CpaExporter(BaseExporter):
         "timeout": {"type": "integer", "title": "超时秒数", "default": 90},
         "verify_tls": {"type": "boolean", "title": "验证 TLS", "default": True},
         "probe": {"type": "boolean", "title": "导出后探测模型", "default": True},
-        "probe_required": {"type": "boolean", "title": "探测失败视为导出失败", "default": False},
+        "probe_required": {"type": "boolean", "title": "探测失败视为导出失败", "default": True},
         "auto_mint": {"type": "boolean", "title": "注册成功后自动补全 OAuth", "default": True},
         "prevalidate_enabled": {
             "type": "boolean",
@@ -101,6 +101,21 @@ class CpaExporter(BaseExporter):
                 str(account_data.get("email") or ""),
                 base_url=str(extra.get("base_url") or "https://cli-chat-proxy.grok.com/v1"),
             )
+            probe = None
+            if bool(extra.get("probe", True)):
+                probe = probe_cpa_models(
+                    record["access_token"],
+                    base_url=record["base_url"],
+                    proxy=str(extra.get("proxy") or ""),
+                    timeout=min(timeout, 30),
+                    verify_tls=verify_tls,
+                    headers=record.get("headers") if isinstance(record.get("headers"), dict) else None,
+                )
+                if bool(extra.get("probe_required", True)) and not (
+                    probe.get("ok") and probe.get("has_grok_45")
+                ):
+                    return PushResult(False, self.name, "CPA 文件未生成：grok-4.5 探测失败")
+
             destinations: list[str] = []
             filename = ""
             auth_dir = str(extra.get("auth_dir") or "").strip()
@@ -118,18 +133,6 @@ class CpaExporter(BaseExporter):
                     verify_tls=verify_tls,
                 )
                 destinations.append("remote")
-            probe = None
-            if bool(extra.get("probe", True)):
-                probe = probe_cpa_models(
-                    record["access_token"],
-                    base_url=record["base_url"],
-                    proxy=str(extra.get("proxy") or ""),
-                    timeout=min(timeout, 30),
-                    verify_tls=verify_tls,
-                    headers=record.get("headers") if isinstance(record.get("headers"), dict) else None,
-                )
-                if bool(extra.get("probe_required", False)) and not probe.get("has_grok_45"):
-                    return PushResult(False, self.name, "CPA 文件已生成，但 grok-4.5 探测失败")
             return PushResult(
                 True,
                 self.name,

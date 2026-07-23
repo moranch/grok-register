@@ -989,7 +989,7 @@ def init_db() -> None:
                 "timeout": 90,
                 "verify_tls": True,
                 "probe": True,
-                "probe_required": False,
+                "probe_required": True,
                 "auto_mint": cpa_auto_mint,
                 "prevalidate_enabled": cpa_auto_mint,
                 "prevalidate_ttl_minutes": 60,

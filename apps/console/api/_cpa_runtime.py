@@ -345,6 +345,23 @@ class CpaMintRuntime:
                 str(row["email"] or ""),
                 base_url=str(config_extra.get("base_url") or "https://cli-chat-proxy.grok.com/v1"),
             )
+            probe = None
+            if bool(config_extra.get("probe", True)):
+                probe = probe_cpa_models(
+                    record["access_token"],
+                    base_url=record["base_url"],
+                    proxy=proxy,
+                    timeout=min(timeout, 30),
+                    verify_tls=verify_tls,
+                    headers=record.get("headers") if isinstance(record.get("headers"), dict) else None,
+                )
+                if bool(config_extra.get("probe_required", True)) and not (
+                    probe.get("ok") and probe.get("has_grok_45")
+                ):
+                    raise RuntimeError("grok-4.5 探测失败")
+
+            # 只有自动验活通过后才落地/上传交付凭据。失败账号不生成 CPA，
+            # DownloadGate 也不会从未验活库存派生 Sub2API/Cockpit 文件。
             filename = ""
             destinations: list[str] = []
             if auth_dir:
@@ -359,19 +376,6 @@ class CpaMintRuntime:
                     verify_tls=verify_tls,
                 )
                 destinations.append("remote")
-
-            probe = None
-            if bool(config_extra.get("probe", True)):
-                probe = probe_cpa_models(
-                    record["access_token"],
-                    base_url=record["base_url"],
-                    proxy=proxy,
-                    timeout=min(timeout, 30),
-                    verify_tls=verify_tls,
-                    headers=record.get("headers") if isinstance(record.get("headers"), dict) else None,
-                )
-                if bool(config_extra.get("probe_required", False)) and not probe.get("has_grok_45"):
-                    raise RuntimeError("grok-4.5 探测失败")
 
             for key in (
                 "access_token", "refresh_token", "id_token", "token_type", "expires_in",

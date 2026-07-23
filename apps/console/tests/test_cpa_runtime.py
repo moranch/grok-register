@@ -101,7 +101,37 @@ class CpaRuntimeTests(unittest.TestCase):
         config = json.loads(row["value"])
         self.assertTrue(config["enabled"])
         self.assertTrue(config["extra"]["auto_mint"])
+        self.assertTrue(config["extra"]["probe_required"])
         self.assertEqual(config["extra"]["auth_dir"], str(_shared.CPA_AUTH_DIR))
+
+    def test_failed_prevalidation_does_not_generate_cpa_file(self):
+        account_id = self.add_account()
+        _shared.execute_no_return(
+            "UPDATE accounts SET extra_json='{}' WHERE id=?",
+            (account_id,),
+        )
+        failed_probe = {
+            "ok": False,
+            "has_grok_45": False,
+            "error": "required model unavailable",
+        }
+        record = {
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "base_url": "https://cli-chat-proxy.grok.com/v1",
+        }
+        with (
+            patch.object(self.runtime, "config", return_value=self.config),
+            patch("api._cpa_runtime.exchange_sso_for_token", return_value={"access_token": "access"}),
+            patch("api._cpa_runtime.token_to_cpa_record", return_value=record),
+            patch("api._cpa_runtime.probe_cpa_models", return_value=failed_probe),
+            patch("api._cpa_runtime.write_cpa_record") as write_cpa,
+        ):
+            ok, error = self.runtime._mint_account(account_id, force=True)
+
+        self.assertFalse(ok)
+        self.assertIn("探测失败", error)
+        write_cpa.assert_not_called()
 
     def test_init_db_preserves_saved_cpa_exporter_config(self):
         saved = {
