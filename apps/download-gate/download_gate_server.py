@@ -58,6 +58,12 @@ CARD_KEY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 CARD_KEY_GROUP_SIZE = 4
 CARD_KEY_DEFAULT_LENGTH = 12
 CARD_KEY_LENGTHS = (12, 16, 20)
+CARD_STATUS_LABELS = {
+    "issued": "待领取",
+    "provisioning": "验活打包中",
+    "claimed": "领取成功",
+    "void": "已作废",
+}
 CARD_PLATFORMS = (
     "grok",
     "chatgpt",
@@ -1842,6 +1848,10 @@ def page_shell(
     .tag::before{{content:"";width:5px;height:5px;border-radius:50%;background:currentColor}}
     .tag.replaced{{color:var(--warn);background:var(--warn-bg)}}
     .tag.expired{{color:var(--bad);background:var(--bad-bg)}}
+    .tag.card-status.claimed{{color:var(--good);background:var(--good-bg)}}
+    .tag.card-status.provisioning{{color:var(--warn);background:var(--warn-bg)}}
+    .tag.card-status.issued{{color:#2563a8;background:rgba(37,99,168,.10)}}
+    .tag.card-status.void{{color:var(--bad);background:var(--bad-bg)}}
     .rows{{padding:8px 18px 4px}}
     .row{{display:flex;gap:14px;padding:8px 0;border-bottom:1px solid #f3f0eb;font-size:.86rem}}
     .row:last-child{{border-bottom:0}}
@@ -3445,10 +3455,19 @@ def admin_page(
   <label>卡密列表<textarea id="issuedCardKeys" rows="10" readonly onclick="this.select()">{issued_text}</textarea></label>
   <button type="button" onclick="copyText(document.querySelector('#issuedCardKeys').value,this)">复制全部卡密</button>
 </section>"""
+    def card_status_badge(card: dict) -> str:
+        status = str(card.get("status") or "issued").strip().lower()
+        if status not in CARD_STATUS_LABELS:
+            status = "issued"
+        return (
+            f'<span class="tag card-status {status}">'
+            f'{html.escape(CARD_STATUS_LABELS[status])}</span>'
+        )
+
     card_rows = "".join(
         f"<tr><td><span class=\"item-key\">{html.escape(str(card.get('key') or ''))}</span></td>"
         f"<td>{html.escape(str(card.get('platform') or 'grok'))}</td>"
-        f"<td>{html.escape(str(card.get('status') or 'issued'))}</td>"
+        f"<td>{card_status_badge(card)}</td>"
         f"<td>{html.escape(str(card.get('batch') or '-'))}</td>"
         f"<td>{html.escape(str(card.get('created_at') or '-'))}</td>"
         f"<td>{html.escape(str(card.get('claimed_at') or card.get('last_error') or '-'))}</td></tr>"

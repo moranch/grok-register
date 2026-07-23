@@ -213,6 +213,12 @@ class DynamicCardTests(unittest.TestCase):
         self.assertIn('id="claimCockpitBtn"', page)
         self.assertIn("兑换时再次现场验活", page)
 
+    def test_card_status_labels_are_localized(self):
+        self.assertEqual(gate.CARD_STATUS_LABELS["issued"], "待领取")
+        self.assertEqual(gate.CARD_STATUS_LABELS["provisioning"], "验活打包中")
+        self.assertEqual(gate.CARD_STATUS_LABELS["claimed"], "领取成功")
+        self.assertEqual(gate.CARD_STATUS_LABELS["void"], "已作废")
+
     def test_generated_card_keys_use_readable_groups(self):
         manifest = gate.load_manifest()
         keys = gate.issue_cards(manifest, 25, "format-check")
