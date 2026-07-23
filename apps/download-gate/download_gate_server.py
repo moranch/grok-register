@@ -16,7 +16,7 @@ import threading
 import time
 import zipfile
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -194,6 +194,50 @@ def migrate_manifest(data: dict) -> tuple[dict, bool]:
         if not isinstance(data.get(name), dict):
             data[name] = {}
             changed = True
+
+    # 旧 Compose 没有给 DownloadGate 设置 TZ，历史卡密时间因此以 UTC
+    # 无时区字符串保存。首次升级到 Asia/Shanghai 时统一平移并写入标记，
+    # 避免后台继续显示少 8 小时，也避免后续启动重复转换。
+    metadata = data.get("_metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        data["_metadata"] = metadata
+        changed = True
+    if (
+        os.environ.get("TZ", "").strip() == "Asia/Shanghai"
+        and metadata.get("timestamp_timezone") != "Asia/Shanghai"
+    ):
+        timestamp_fields = {
+            "created_at",
+            "bound_at",
+            "claimed_at",
+            "provisioning_at",
+            "provisioned_at",
+            "last_failed_at",
+            "stock_assigned_at",
+            "voided_at",
+        }
+        china_tz = timezone(timedelta(hours=8))
+        for collection_name in ("bundles", "cards"):
+            for item in data[collection_name].values():
+                if not isinstance(item, dict):
+                    continue
+                for field in timestamp_fields:
+                    raw = str(item.get(field) or "").strip()
+                    if not raw:
+                        continue
+                    try:
+                        parsed = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+                    except ValueError:
+                        continue
+                    item[field] = (
+                        parsed.replace(tzinfo=timezone.utc)
+                        .astimezone(china_tz)
+                        .strftime("%Y-%m-%d %H:%M:%S")
+                    )
+        metadata["timestamp_timezone"] = "Asia/Shanghai"
+        metadata["timestamp_migration"] = "legacy-utc-to-cst-v1"
+        changed = True
     bundles = data["bundles"]
     keys = data["keys"]
     cards = data["cards"]

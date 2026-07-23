@@ -1,6 +1,7 @@
 import importlib.util
 import base64
 import json
+import os
 import tempfile
 import threading
 import time
@@ -56,6 +57,34 @@ class DynamicCardTests(unittest.TestCase):
         migrated = gate.load_manifest()
         self.assertEqual(migrated["cards"]["OLD-CARD"]["status"], "claimed")
         self.assertEqual(migrated["cards"]["OLD-CARD"]["bundle_id"], "old-bundle")
+
+    def test_legacy_utc_card_times_are_migrated_once_for_shanghai(self):
+        manifest = {
+            "bundles": {
+                "old-bundle": {
+                    "id": "old-bundle",
+                    "key": "OLD-CARD",
+                    "created_at": "2026-07-23 14:53:43",
+                    "bound_at": "2026-07-23 15:09:32",
+                    "bound_client": "fingerprint",
+                }
+            },
+            "keys": {"OLD-CARD": "old-bundle"},
+            "cards": {},
+        }
+        gate.save_manifest(manifest)
+
+        with patch.dict(os.environ, {"TZ": "Asia/Shanghai"}):
+            migrated = gate.load_manifest()
+            migrated_again = gate.load_manifest()
+
+        bundle = migrated_again["bundles"]["old-bundle"]
+        self.assertEqual(bundle["created_at"], "2026-07-23 22:53:43")
+        self.assertEqual(bundle["bound_at"], "2026-07-23 23:09:32")
+        self.assertEqual(
+            migrated_again["_metadata"]["timestamp_timezone"],
+            "Asia/Shanghai",
+        )
 
     def test_issue_cards_creates_empty_ledger_entries(self):
         manifest = gate.load_manifest()
