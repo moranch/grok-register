@@ -203,10 +203,10 @@ def migrate_manifest(data: dict) -> tuple[dict, bool]:
         metadata = {}
         data["_metadata"] = metadata
         changed = True
-    if (
-        os.environ.get("TZ", "").strip() == "Asia/Shanghai"
-        and metadata.get("timestamp_timezone") != "Asia/Shanghai"
-    ):
+    if os.environ.get("TZ", "").strip() == "Asia/Shanghai":
+        migration_version = str(metadata.get("timestamp_migration") or "")
+        migrate_timestamp_values = metadata.get("timestamp_timezone") != "Asia/Shanghai"
+        migrate_batch_labels = migration_version != "legacy-utc-to-cst-v2"
         timestamp_fields = {
             "created_at",
             "bound_at",
@@ -223,25 +223,41 @@ def migrate_manifest(data: dict) -> tuple[dict, bool]:
             for item in data[collection_name].values():
                 if not isinstance(item, dict):
                     continue
-                for field in timestamp_fields:
-                    raw = str(item.get(field) or "").strip()
-                    if not raw:
-                        continue
+                if migrate_timestamp_values:
+                    for field in timestamp_fields:
+                        raw = str(item.get(field) or "").strip()
+                        if not raw:
+                            continue
+                        try:
+                            parsed = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+                        except ValueError:
+                            continue
+                        if not backup_created:
+                            backup_manifest("timezone-migration-utc-to-cst")
+                            backup_created = True
+                        item[field] = (
+                            parsed.replace(tzinfo=timezone.utc)
+                            .astimezone(china_tz)
+                            .strftime("%Y-%m-%d %H:%M:%S")
+                        )
+                batch = str(item.get("batch") or "").strip()
+                if migrate_batch_labels and batch.startswith("batch-"):
                     try:
-                        parsed = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+                        batch_time = datetime.strptime(batch, "batch-%Y%m%d-%H%M%S")
                     except ValueError:
                         continue
                     if not backup_created:
                         backup_manifest("timezone-migration-utc-to-cst")
                         backup_created = True
-                    item[field] = (
-                        parsed.replace(tzinfo=timezone.utc)
+                    item["batch"] = (
+                        batch_time.replace(tzinfo=timezone.utc)
                         .astimezone(china_tz)
-                        .strftime("%Y-%m-%d %H:%M:%S")
+                        .strftime("batch-%Y%m%d-%H%M%S")
                     )
-        metadata["timestamp_timezone"] = "Asia/Shanghai"
-        metadata["timestamp_migration"] = "legacy-utc-to-cst-v1"
-        changed = True
+        if migrate_timestamp_values or migrate_batch_labels:
+            metadata["timestamp_timezone"] = "Asia/Shanghai"
+            metadata["timestamp_migration"] = "legacy-utc-to-cst-v2"
+            changed = True
     bundles = data["bundles"]
     keys = data["keys"]
     cards = data["cards"]

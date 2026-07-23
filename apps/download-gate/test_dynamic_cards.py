@@ -67,6 +67,7 @@ class DynamicCardTests(unittest.TestCase):
                     "created_at": "2026-07-23 14:53:43",
                     "bound_at": "2026-07-23 15:09:32",
                     "bound_client": "fingerprint",
+                    "batch": "batch-20260723-145343",
                 }
             },
             "keys": {"OLD-CARD": "old-bundle"},
@@ -81,10 +82,37 @@ class DynamicCardTests(unittest.TestCase):
         bundle = migrated_again["bundles"]["old-bundle"]
         self.assertEqual(bundle["created_at"], "2026-07-23 22:53:43")
         self.assertEqual(bundle["bound_at"], "2026-07-23 23:09:32")
+        self.assertEqual(bundle["batch"], "batch-20260723-225343")
         self.assertEqual(
             migrated_again["_metadata"]["timestamp_timezone"],
             "Asia/Shanghai",
         )
+
+    def test_v1_timezone_migration_only_updates_legacy_batch_label(self):
+        manifest = {
+            "_metadata": {
+                "timestamp_timezone": "Asia/Shanghai",
+                "timestamp_migration": "legacy-utc-to-cst-v1",
+            },
+            "bundles": {},
+            "keys": {},
+            "cards": {
+                "OLD-CARD": {
+                    "key": "OLD-CARD",
+                    "status": "issued",
+                    "created_at": "2026-07-23 22:53:43",
+                    "batch": "batch-20260723-145343",
+                }
+            },
+        }
+        gate.save_manifest(manifest)
+
+        with patch.dict(os.environ, {"TZ": "Asia/Shanghai"}):
+            migrated = gate.load_manifest()
+
+        card = migrated["cards"]["OLD-CARD"]
+        self.assertEqual(card["created_at"], "2026-07-23 22:53:43")
+        self.assertEqual(card["batch"], "batch-20260723-225343")
 
     def test_issue_cards_creates_empty_ledger_entries(self):
         manifest = gate.load_manifest()
