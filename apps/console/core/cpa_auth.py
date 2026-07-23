@@ -20,6 +20,7 @@ SCOPES = (
     "api:access conversations:read conversations:write"
 )
 CPA_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
+CPA_USERINFO_URL = f"{OIDC_ISSUER}/oauth2/userinfo"
 CPA_REDIRECT_URI = "http://127.0.0.1:56121/callback"
 CPA_HEADERS = {
     "x-grok-client-version": "0.2.93",
@@ -312,36 +313,25 @@ def write_cpa_record(auth_dir: str, record: dict[str, Any]) -> Path:
     return target
 
 
-def probe_cpa_models(
+def probe_cpa_account(
     access_token: str,
     *,
-    base_url: str = CPA_BASE_URL,
     proxy: str = "",
     timeout: int = 30,
     verify_tls: bool = True,
-    headers: dict[str, str] | None = None,
-    model: str = "grok-4.5",
 ) -> dict[str, Any]:
-    """Run a minimal real response to verify account usability, not just model listing."""
+    """Verify the OAuth identity only; never call a model endpoint."""
     session = curl_requests.Session()
     session.proxies = _proxies(proxy) or {}
     session.verify = verify_tls
     try:
         response = _request_with_retry(
             session,
-            "POST",
-            base_url.rstrip("/") + "/responses",
+            "GET",
+            CPA_USERINFO_URL,
             headers={
-                **CPA_HEADERS,
-                **(headers or {}),
                 "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "input": "ping",
-                "max_output_tokens": 2,
-                "stream": False,
+                "Accept": "application/json",
             },
             impersonate="chrome",
             timeout=timeout,
@@ -366,20 +356,9 @@ def probe_cpa_models(
             "token revoked",
             "token expired",
         )
-        alive_but_limited_markers = (
-            "spending-limit",
-            "run out of credits",
-            "need a grok subscription",
-            "permission-denied",
-            "access to the chat endpoint is denied",
-            "rate limit",
-        )
         banned = status in (400, 401, 403) and any(marker in lowered for marker in banned_markers)
         token_invalid = status == 401 or (
             status in (400, 403) and any(marker in lowered for marker in token_markers)
-        )
-        alive_but_limited = status in (400, 402, 403, 429) and any(
-            marker in lowered for marker in alive_but_limited_markers
         )
         if 200 <= status < 300:
             failure_kind = ""
@@ -402,43 +381,39 @@ def probe_cpa_models(
         else:
             failure_kind = "rejected"
             account_state = "unknown"
-        ok = 200 <= status < 300
-        account_alive = ok or (alive_but_limited and not banned and not token_invalid)
+        account_alive = 200 <= status < 300
         return {
-            "ok": ok,
+            "ok": account_alive,
             "account_alive": account_alive,
-            "model_usable": ok and model == "grok-4.5",
             "delivery_eligible": account_alive,
-            "alive_but_limited": alive_but_limited,
             "status": status,
-            "model_ids": [model] if ok else [],
-            "has_grok_45": ok and model == "grok-4.5",
-            "probe_kind": "account_response",
-            "probe_version": 2,
+            "probe_kind": "account_identity",
+            "probe_version": 3,
             "account_state": account_state,
             "banned": banned,
             "failure_kind": failure_kind,
             "refresh_recommended": token_invalid,
-            "error": "" if ok else (summary or f"HTTP {status}"),
+            "error": "" if account_alive else (summary or f"HTTP {status}"),
         }
     except Exception as exc:
         return {
             "ok": False,
             "account_alive": False,
-            "model_usable": False,
             "delivery_eligible": False,
-            "alive_but_limited": False,
             "status": 0,
-            "model_ids": [],
-            "has_grok_45": False,
-            "probe_kind": "account_response",
-            "probe_version": 2,
+            "probe_kind": "account_identity",
+            "probe_version": 3,
             "account_state": "unknown",
             "banned": False,
             "failure_kind": "transient",
             "refresh_recommended": False,
             "error": str(exc),
         }
+
+
+# Backward-compatible import for third-party extensions. The implementation now
+# performs OAuth identity liveness only and does not contact any model endpoint.
+probe_cpa_models = probe_cpa_account
 
 
 def upload_cpa_record(

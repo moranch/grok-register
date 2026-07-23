@@ -1,4 +1,4 @@
-import gc
+﻿import gc
 import json
 import tempfile
 import threading
@@ -120,7 +120,7 @@ class DeliveryRuntimeTests(unittest.TestCase):
 
         with patch.object(
             _delivery_runtime,
-            "probe_cpa_models",
+            "probe_cpa_account",
             side_effect=AssertionError("live probe should not run"),
         ):
             reservation = _delivery_runtime.reserve("CACHED-CARD")
@@ -144,7 +144,7 @@ class DeliveryRuntimeTests(unittest.TestCase):
 
         with patch.object(
             _delivery_runtime,
-            "probe_cpa_models",
+            "probe_cpa_account",
             side_effect=AssertionError("stale account should not be selected"),
         ):
             reservation = _delivery_runtime.reserve("PRIORITY-CARD")
@@ -163,13 +163,13 @@ class DeliveryRuntimeTests(unittest.TestCase):
         )
         live_result = {
             "ok": True,
+            "account_alive": True,
             "status": 200,
-            "model_ids": ["grok-4.5"],
-            "has_grok_45": True,
+            "probe_kind": "account_identity",
         }
         with patch.object(
             _delivery_runtime,
-            "probe_cpa_models",
+            "probe_cpa_account",
             return_value=live_result,
         ) as live_probe:
             reservation = _delivery_runtime.reserve("EXPIRED-CACHE-CARD")
@@ -182,25 +182,21 @@ class DeliveryRuntimeTests(unittest.TestCase):
         self.assertEqual(int(lease["account_id"]), account_id)
         self.assertEqual(lease["state"], "ready")
 
-    def test_alive_account_can_be_delivered_when_model_call_is_limited(self):
-        account_id = self.add_account("limited@example.com", "limited-sub")
-        limited_probe = {
-            "ok": False,
+    def test_alive_account_can_be_delivered_without_model_validation(self):
+        account_id = self.add_account("alive@example.com", "alive-sub")
+        identity_probe = {
+            "ok": True,
             "account_alive": True,
             "delivery_eligible": True,
-            "model_usable": False,
-            "status": 403,
-            "model_ids": [],
-            "has_grok_45": False,
-            "probe_kind": "account_response",
-            "error": "personal-team-blocked:spending-limit",
+            "status": 200,
+            "probe_kind": "account_identity",
         }
         with patch.object(
             _delivery_runtime,
-            "probe_cpa_models",
-            return_value=limited_probe,
+            "probe_cpa_account",
+            return_value=identity_probe,
         ):
-            reservation = _delivery_runtime.reserve("LIMITED-CARD")
+            reservation = _delivery_runtime.reserve("ALIVE-CARD")
 
         lease = _shared.fetch_one(
             "SELECT account_id, state, probe_json FROM account_delivery_leases WHERE id=?",
@@ -214,11 +210,10 @@ class DeliveryRuntimeTests(unittest.TestCase):
         account_id = self.add_account("banned@example.com", "banned-sub")
         banned_probe = {
             "ok": False,
+            "account_alive": False,
             "status": 403,
-            "model_ids": [],
-            "has_grok_45": False,
-            "probe_kind": "account_response",
-            "probe_version": 2,
+            "probe_kind": "account_identity",
+            "probe_version": 3,
             "account_state": "banned",
             "banned": True,
             "failure_kind": "banned",
@@ -226,7 +221,7 @@ class DeliveryRuntimeTests(unittest.TestCase):
             "error": "account suspended",
         }
         with (
-            patch.object(_delivery_runtime, "probe_cpa_models", return_value=banned_probe),
+            patch.object(_delivery_runtime, "probe_cpa_account", return_value=banned_probe),
             patch("api._cpa_runtime.cpa_mint_runtime._mint_account") as mint,
         ):
             with self.assertRaises(_delivery_runtime.DeliveryUnavailable):

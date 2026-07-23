@@ -816,7 +816,7 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 card_key TEXT NOT NULL UNIQUE,
                 platform TEXT NOT NULL DEFAULT 'grok',
-                required_model TEXT NOT NULL DEFAULT 'grok-4.5',
+                required_model TEXT NOT NULL DEFAULT '',
                 state TEXT NOT NULL DEFAULT 'pending',
                 source TEXT NOT NULL DEFAULT 'dynamic',
                 title TEXT NOT NULL DEFAULT '',

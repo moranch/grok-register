@@ -45,7 +45,7 @@ ADMIN_PATH = normalize_admin_path(os.environ.get("DOWNLOAD_GATE_ADMIN_PATH", "/d
 INTERNAL_API_TOKEN = os.environ.get("DOWNLOAD_GATE_INTERNAL_TOKEN", "").strip()
 CONSOLE_URL = os.environ.get("DOWNLOAD_GATE_CONSOLE_URL", "").strip().rstrip("/")
 CONSOLE_TIMEOUT_SECONDS = max(int(os.environ.get("DOWNLOAD_GATE_CONSOLE_TIMEOUT", "120") or 120), 5)
-APP_VERSION = "2026.07.23.11"
+APP_VERSION = "2026.07.24.01"
 CLIENT_COOKIE_NAME = "dg_client"
 CLIENT_COOKIE_MAX_AGE = 365 * 24 * 60 * 60
 CLAIM_TTL_SECONDS = 24 * 60 * 60
@@ -78,7 +78,6 @@ CARD_PLATFORMS = (
     "blink",
     "anything",
 )
-DEFAULT_REQUIRED_MODELS = {"grok": "grok-4.5"}
 GROK_OIDC_ISSUER = "https://auth.x.ai"
 GROK_OIDC_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 GROK_OIDC_SCOPE = "openid profile email offline_access grok-cli:access api:access"
@@ -95,8 +94,9 @@ def normalize_card_platform(value: str | None) -> str:
 
 
 def normalize_card_required_model(platform: str, value: str | None) -> str:
-    model = str(value or "").strip()
-    return model[:100] or DEFAULT_REQUIRED_MODELS.get(platform, "")
+    if platform == "grok":
+        return ""
+    return str(value or "").strip()[:100]
 
 
 def card_status_view(card: dict) -> tuple[str, str]:
@@ -1011,7 +1011,6 @@ def public_pool_summary() -> dict:
             "unverifiedCount": unverified_stock if known else 0,
             "percent": percent if known else 0,
             "verificationTtlMinutes": ttl_minutes,
-            "verificationModel": str(status.get("required_model") or "grok-4.5"),
             "checkedAt": now_text(),
         },
         "settings": {
@@ -3501,7 +3500,6 @@ def admin_page(
     <label>数量<input name="count" type="number" min="1" max="{MAX_ISSUE_CARDS}" value="10" required></label>
     <label>批次<input name="batch" maxlength="80" placeholder="例如：7月第二批"></label>
     <label>目标平台<select name="platform" required>{platform_options}</select></label>
-    <label>验证模型<input name="required_model" maxlength="100" placeholder="Grok 留空默认 grok-4.5；其他平台留空"></label>
   </div>
   <button class="full" type="submit">生成预发行卡密</button>
 </form>

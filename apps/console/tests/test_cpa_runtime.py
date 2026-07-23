@@ -64,15 +64,14 @@ class CpaRuntimeTests(unittest.TestCase):
         account_id = self.add_account()
         probe = {
             "ok": True,
+            "account_alive": True,
             "status": 200,
-            "model_ids": ["grok-4.5"],
-            "has_grok_45": True,
-            "probe_kind": "account_response",
-            "probe_version": 2,
+            "probe_kind": "account_identity",
+            "probe_version": 3,
         }
         with (
             patch.object(self.runtime, "config", return_value=self.config),
-            patch("api._cpa_runtime.probe_cpa_models", return_value=probe) as live_probe,
+            patch("api._cpa_runtime.probe_cpa_account", return_value=probe) as live_probe,
             patch("api._cpa_runtime.exchange_sso_for_token") as mint,
         ):
             ok, error = self.runtime._mint_account(account_id, force=False)
@@ -83,7 +82,8 @@ class CpaRuntimeTests(unittest.TestCase):
         mint.assert_not_called()
         row = _shared.fetch_one("SELECT extra_json FROM accounts WHERE id=?", (account_id,))
         cpa = json.loads(row["extra_json"])["cpa"]
-        self.assertTrue(cpa["probe"]["has_grok_45"])
+        self.assertTrue(cpa["probe"]["account_alive"])
+        self.assertEqual(cpa["probe"]["probe_kind"], "account_identity")
         self.assertTrue(cpa["probe_checked_at"])
 
     def test_scheduler_enqueues_stale_undelivered_account(self):
@@ -127,8 +127,8 @@ class CpaRuntimeTests(unittest.TestCase):
         )
         failed_probe = {
             "ok": False,
-            "has_grok_45": False,
-            "error": "required model unavailable",
+            "account_alive": False,
+            "error": "OAuth identity unavailable",
         }
         record = {
             "access_token": "access",
@@ -139,7 +139,7 @@ class CpaRuntimeTests(unittest.TestCase):
             patch.object(self.runtime, "config", return_value=self.config),
             patch("api._cpa_runtime.exchange_sso_for_token", return_value={"access_token": "access"}),
             patch("api._cpa_runtime.token_to_cpa_record", return_value=record),
-            patch("api._cpa_runtime.probe_cpa_models", return_value=failed_probe),
+            patch("api._cpa_runtime.probe_cpa_account", return_value=failed_probe),
             patch("api._cpa_runtime.write_cpa_record") as write_cpa,
         ):
             ok, error = self.runtime._mint_account(account_id, force=True)

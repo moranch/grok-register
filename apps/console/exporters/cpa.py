@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 from core.base_exporter import BaseExporter, ExporterConfig, PushResult
 from core.cpa_auth import (
     exchange_sso_for_token,
-    probe_cpa_models,
+    probe_cpa_account,
     token_to_cpa_record,
     upload_cpa_record,
     write_cpa_record,
@@ -45,8 +45,8 @@ class CpaExporter(BaseExporter):
         },
         "timeout": {"type": "integer", "title": "超时秒数", "default": 90},
         "verify_tls": {"type": "boolean", "title": "验证 TLS", "default": True},
-        "probe": {"type": "boolean", "title": "导出后探测模型", "default": True},
-        "probe_required": {"type": "boolean", "title": "探测失败视为导出失败", "default": True},
+        "probe": {"type": "boolean", "title": "导出后验证账号存活", "default": True},
+        "probe_required": {"type": "boolean", "title": "账号验证失败视为导出失败", "default": True},
         "auto_mint": {"type": "boolean", "title": "注册成功后自动补全 OAuth", "default": True},
         "prevalidate_enabled": {
             "type": "boolean",
@@ -103,13 +103,11 @@ class CpaExporter(BaseExporter):
             )
             probe = None
             if bool(extra.get("probe", True)):
-                probe = probe_cpa_models(
+                probe = probe_cpa_account(
                     record["access_token"],
-                    base_url=record["base_url"],
                     proxy=str(extra.get("proxy") or ""),
                     timeout=min(timeout, 30),
                     verify_tls=verify_tls,
-                    headers=record.get("headers") if isinstance(record.get("headers"), dict) else None,
                 )
                 if bool(extra.get("probe_required", True)) and not bool(
                     probe.get("account_alive", probe.get("ok"))

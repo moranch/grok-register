@@ -185,7 +185,6 @@ class DynamicCardTests(unittest.TestCase):
             "verified_stock": 17,
             "unverified_stock": 168,
             "prevalidate_ttl_minutes": 60,
-            "required_model": "grok-4.5",
         }
 
         with patch.object(gate, "load_auto_replenish_status", return_value=(status, "")):
@@ -195,7 +194,7 @@ class DynamicCardTests(unittest.TestCase):
         self.assertEqual(summary["pool"]["availableCount"], 17)
         self.assertEqual(summary["pool"]["candidateCount"], 185)
         self.assertEqual(summary["pool"]["unverifiedCount"], 168)
-        self.assertEqual(summary["pool"]["verificationModel"], "grok-4.5")
+        self.assertNotIn("verificationModel", summary["pool"])
 
     def test_pickup_page_contains_live_pool_component(self):
         page = gate.user_page().decode("utf-8")
@@ -211,6 +210,7 @@ class DynamicCardTests(unittest.TestCase):
         self.assertIn("CPA、Sub2API 与 Cockpit 是三种独立格式", page)
         self.assertIn('id="claimSubBtn"', page)
         self.assertIn('id="claimCockpitBtn"', page)
+        self.assertNotIn('name="required_model"', page)
         self.assertIn("账号存活验证通过", page)
 
     def test_card_status_labels_are_localized(self):

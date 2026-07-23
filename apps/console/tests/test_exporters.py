@@ -10,7 +10,13 @@ if str(CONSOLE_DIR) not in sys.path:
     sys.path.insert(0, str(CONSOLE_DIR))
 
 from core.base_exporter import ExporterConfig
-from core.cpa_auth import CPA_HEADERS, CPA_REDIRECT_URI, probe_cpa_models, token_to_cpa_record
+from core.cpa_auth import (
+    CPA_HEADERS,
+    CPA_REDIRECT_URI,
+    CPA_USERINFO_URL,
+    probe_cpa_account,
+    token_to_cpa_record,
+)
 from exporters.cpa import CpaExporter
 from exporters.grok2api import Grok2APIExporter
 
@@ -108,13 +114,19 @@ class ExporterTests(unittest.TestCase):
         session = Mock()
         session.request.return_value = response
         with patch("core.cpa_auth.curl_requests.Session", return_value=session):
-            return probe_cpa_models("access", timeout=10)
+            result = probe_cpa_account("access", timeout=10)
+        self.last_probe_request = session.request.call_args
+        return result
 
-    def test_cpa_probe_confirms_real_account_response(self):
-        result = self._probe_response(200, '{"object":"response"}')
+    def test_cpa_probe_confirms_oauth_identity_without_calling_a_model(self):
+        result = self._probe_response(200, '{"sub":"account-1"}')
         self.assertTrue(result["ok"])
         self.assertEqual(result["account_state"], "active")
-        self.assertEqual(result["probe_kind"], "account_response")
+        self.assertEqual(result["probe_kind"], "account_identity")
+        args, kwargs = self.last_probe_request
+        self.assertEqual(args[:2], ("GET", CPA_USERINFO_URL))
+        self.assertNotIn("json", kwargs)
+        self.assertNotIn("model", str(kwargs).lower())
 
     def test_cpa_probe_marks_explicit_suspension_as_banned(self):
         result = self._probe_response(403, '{"error":"account suspended"}')
@@ -137,7 +149,7 @@ class ExporterTests(unittest.TestCase):
         self.assertEqual(forbidden["failure_kind"], "forbidden")
         self.assertFalse(forbidden["banned"])
 
-    def test_cpa_probe_treats_limited_but_authenticated_account_as_alive(self):
+    def test_cpa_identity_probe_does_not_infer_liveness_from_model_errors(self):
         limited = self._probe_response(
             403,
             '{"code":"personal-team-blocked:spending-limit","error":"run out of credits"}',
@@ -149,9 +161,8 @@ class ExporterTests(unittest.TestCase):
 
         for result in (limited, denied):
             self.assertFalse(result["ok"])
-            self.assertTrue(result["account_alive"])
-            self.assertTrue(result["delivery_eligible"])
-            self.assertFalse(result["model_usable"])
+            self.assertFalse(result["account_alive"])
+            self.assertFalse(result["delivery_eligible"])
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from core.cpa_auth import CPA_BASE_URL, probe_cpa_models
+from core.cpa_auth import probe_cpa_account
 
 from . import _shared
 
@@ -28,7 +28,6 @@ HISTORY_IMPORT_KEY = "account_delivery_history_import_v1"
 HISTORY_IMPORT_BUNDLE_PREFIX = "account_delivery_history_bundle_v2:"
 ACTIVE_LEASE_STATES = ("probing", "ready", "packing")
 DEFAULT_DELIVERY_PLATFORM = "grok"
-DEFAULT_REQUIRED_MODELS = {"grok": "grok-4.5"}
 
 
 def normalize_delivery_platform(value: str | None) -> str:
@@ -39,9 +38,7 @@ def normalize_delivery_platform(value: str | None) -> str:
 
 
 def normalize_required_model(platform: str, value: str | None) -> str:
-    model = str(value or "").strip()
-    if not model:
-        model = DEFAULT_REQUIRED_MODELS.get(platform, "")
+    model = "" if platform == "grok" else str(value or "").strip()
     if len(model) > 100:
         raise DeliveryConflict("required_model is too long")
     return model
@@ -339,7 +336,7 @@ def import_download_gate_history() -> dict[str, int]:
 def _probe_account(account_id: int, required_model: str) -> dict[str, Any]:
     cached_accounts = _shared.account_list_by_ids([account_id])
     if not cached_accounts:
-        return {"ok": False, "error": "account not found", "model_ids": []}
+        return {"ok": False, "error": "account not found"}
     cached_account = cached_accounts[0]
     account_platform = normalize_delivery_platform(
         str(cached_account.get("platform") or DEFAULT_DELIVERY_PLATFORM)
@@ -384,8 +381,6 @@ def _probe_account(account_id: int, required_model: str) -> dict[str, Any]:
             "probe_kind": "platform_inventory",
             "credential_present": credential_present,
             "required_model": required_model,
-            "required_model_available": True,
-            "model_ids": [],
             "error": "" if ok else "platform account credential is unavailable",
         }
 
@@ -418,14 +413,11 @@ def _probe_account(account_id: int, required_model: str) -> dict[str, Any]:
         if (
             checked_at is not None
             and checked_at >= datetime.now() - timedelta(minutes=cache_ttl_minutes)
-            and cached_probe.get("probe_kind") == "account_response"
+            and cached_probe.get("probe_kind") in {"account_identity", "account_response"}
             and cached_alive
         ):
             result = dict(cached_probe)
-            result["required_model"] = required_model
-            result["required_model_available"] = not required_model or required_model in {
-                str(item) for item in cached_probe.get("model_ids") or []
-            }
+            result["required_model"] = ""
             result["account_alive"] = True
             result["delivery_eligible"] = True
             result["cache_hit"] = True
@@ -438,7 +430,7 @@ def _probe_account(account_id: int, required_model: str) -> dict[str, Any]:
     def run_probe() -> dict[str, Any]:
         accounts = _shared.account_list_by_ids([account_id])
         if not accounts:
-            return {"ok": False, "error": "account not found", "model_ids": []}
+            return {"ok": False, "error": "account not found"}
         account = accounts[0]
         tokens = account.get("tokens") or {}
         try:
@@ -452,25 +444,18 @@ def _probe_account(account_id: int, required_model: str) -> dict[str, Any]:
                 "account_alive": False,
                 "delivery_eligible": False,
                 "error": "access_token is empty",
-                "model_ids": [],
                 "failure_kind": "token_expired",
                 "refresh_recommended": True,
                 "banned": False,
-                "probe_kind": "account_response",
+                "probe_kind": "account_identity",
             }
-        result = probe_cpa_models(
+        result = probe_cpa_account(
             access_token,
-            base_url=str(extra.get("base_url") or cpa_extra.get("base_url") or CPA_BASE_URL),
             proxy=str(cpa_extra.get("proxy") or account.get("proxy_url") or ""),
             timeout=probe_timeout,
             verify_tls=bool(cpa_extra.get("verify_tls", True)),
-            headers=extra.get("headers") if isinstance(extra.get("headers"), dict) else None,
-            model=required_model or "grok-4.5",
         )
-        model_ids = [str(item) for item in result.get("model_ids") or []]
-        result["required_model"] = required_model
-        result["required_model_available"] = not required_model or required_model in model_ids
-        result["model_usable"] = bool(result.get("ok")) and bool(result["required_model_available"])
+        result["required_model"] = ""
         result["delivery_eligible"] = bool(result.get("account_alive", result.get("ok")))
         return result
 
@@ -539,7 +524,7 @@ def delivery_stock_snapshot(
 
     Candidate inventory only applies the persisted account/lifecycle/lease filters.
     Grok verified inventory requires a recent probe proving the account credential is
-    alive. Model-call availability is reported separately and does not block packing.
+    alive. No model endpoint is called and model availability is not evaluated.
     """
     platform = normalize_delivery_platform(platform)
     required_model = normalize_required_model(platform, required_model)
@@ -548,10 +533,8 @@ def delivery_stock_snapshot(
     ttl_minutes = _delivery_prevalidation_ttl_minutes() if platform == "grok" else 0
     cutoff = datetime.now() - timedelta(minutes=ttl_minutes) if ttl_minutes else None
 
-    model_usable_stock = 0
     if platform != "grok":
         verified_stock = candidate_stock
-        model_usable_stock = candidate_stock
     else:
         verified_stock = 0
         for row in rows:
@@ -568,17 +551,13 @@ def delivery_stock_snapshot(
                 )
             except (TypeError, ValueError):
                 continue
-            model_ids = {str(item) for item in probe.get("model_ids") or []}
-            required_model_available = not required_model or required_model in model_ids
             recent_account_probe = (
                 cutoff is not None
                 and checked_at >= cutoff
-                and probe.get("probe_kind") == "account_response"
+                and probe.get("probe_kind") in {"account_identity", "account_response"}
             )
             if recent_account_probe and bool(probe.get("account_alive", probe.get("ok"))):
                 verified_stock += 1
-            if recent_account_probe and probe.get("ok") is True and required_model_available:
-                model_usable_stock += 1
 
     return {
         "platform": platform,
@@ -586,7 +565,6 @@ def delivery_stock_snapshot(
         "candidate_stock": candidate_stock,
         "verified_stock": verified_stock,
         "unverified_stock": max(0, candidate_stock - verified_stock),
-        "model_usable_stock": model_usable_stock,
         "prevalidate_ttl_minutes": ttl_minutes,
         "replenishment_metric": "candidate_stock",
     }
@@ -720,7 +698,7 @@ def reserve(
                                  ) = 1
                                  AND COALESCE(
                                      json_extract(a.extra_json, '$.cpa.probe.probe_kind'), ''
-                                 ) = 'account_response'
+                                 ) IN ('account_identity', 'account_response')
                                  AND COALESCE(
                                      json_extract(a.extra_json, '$.cpa.probe_checked_at'),
                                      json_extract(a.extra_json, '$.cpa.updated_at'),
@@ -776,7 +754,6 @@ def reserve(
         except Exception as exc:
             probe = {
                 "ok": False,
-                "model_ids": [],
                 "required_model": required_model,
                 "error": str(exc)[:500],
             }

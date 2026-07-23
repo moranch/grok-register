@@ -12,7 +12,7 @@ from typing import Any
 
 from core.cpa_auth import (
     exchange_sso_for_token,
-    probe_cpa_models,
+    probe_cpa_account,
     token_to_cpa_record,
     upload_cpa_record,
     write_cpa_record,
@@ -197,7 +197,8 @@ class CpaMintRuntime:
                   WHERE l.account_id=a.id AND l.state IN ('probing','ready','packing')
               )
               AND (
-                  COALESCE(json_extract(a.extra_json, '$.cpa.probe.probe_kind'), '') <> 'account_response'
+                  COALESCE(json_extract(a.extra_json, '$.cpa.probe.probe_kind'), '')
+                      NOT IN ('account_identity', 'account_response')
                   OR (
                       COALESCE(
                           json_extract(a.extra_json, '$.cpa.probe.account_alive'),
@@ -250,17 +251,11 @@ class CpaMintRuntime:
         except (TypeError, ValueError):
             timeout = 30
         try:
-            probe = probe_cpa_models(
+            probe = probe_cpa_account(
                 access_token,
-                base_url=str(
-                    extra.get("base_url")
-                    or config_extra.get("base_url")
-                    or "https://cli-chat-proxy.grok.com/v1"
-                ),
                 proxy=str(config_extra.get("proxy") or row["proxy_url"] or ""),
                 timeout=timeout,
                 verify_tls=bool(config_extra.get("verify_tls", True)),
-                headers=extra.get("headers") if isinstance(extra.get("headers"), dict) else None,
             )
         except Exception as exc:
             return False, {}, str(exc)
@@ -367,13 +362,11 @@ class CpaMintRuntime:
             )
             probe = None
             if bool(config_extra.get("probe", True)):
-                probe = probe_cpa_models(
+                probe = probe_cpa_account(
                     record["access_token"],
-                    base_url=record["base_url"],
                     proxy=proxy,
                     timeout=min(timeout, 30),
                     verify_tls=verify_tls,
-                    headers=record.get("headers") if isinstance(record.get("headers"), dict) else None,
                 )
                 if bool(config_extra.get("probe_required", True)) and not bool(
                     probe.get("account_alive", probe.get("ok"))
