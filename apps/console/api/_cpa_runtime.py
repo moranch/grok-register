@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import threading
 import time
@@ -48,7 +49,18 @@ class CpaMintRuntime:
             return {}
         try:
             data = json.loads(row["value"] or "{}")
-            return data if isinstance(data, dict) else {}
+            if not isinstance(data, dict):
+                return {}
+            extra = dict(data.get("extra") or {})
+            default_proxy = str(
+                os.getenv("GROK_REGISTER_CPA_PROXY")
+                or os.getenv("GROK_REGISTER_DEFAULT_PROXY")
+                or ""
+            ).strip()
+            if default_proxy and not str(extra.get("proxy") or "").strip():
+                extra["proxy"] = default_proxy
+            data["extra"] = extra
+            return data
         except Exception:
             return {}
 

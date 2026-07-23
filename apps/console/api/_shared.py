@@ -985,6 +985,11 @@ def init_db() -> None:
             "template": "",
             "extra": {
                 "auth_dir": str(CPA_AUTH_DIR),
+                "proxy": str(
+                    os.getenv("GROK_REGISTER_CPA_PROXY")
+                    or os.getenv("GROK_REGISTER_DEFAULT_PROXY")
+                    or ""
+                ).strip(),
                 "base_url": "https://cli-chat-proxy.grok.com/v1",
                 "timeout": 90,
                 "verify_tls": True,

@@ -1,5 +1,6 @@
 import gc
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -103,6 +104,20 @@ class CpaRuntimeTests(unittest.TestCase):
         self.assertTrue(config["extra"]["auto_mint"])
         self.assertTrue(config["extra"]["probe_required"])
         self.assertEqual(config["extra"]["auth_dir"], str(_shared.CPA_AUTH_DIR))
+
+    def test_runtime_uses_environment_proxy_when_saved_proxy_is_empty(self):
+        row = _shared.fetch_one("SELECT value FROM settings WHERE key='exporter_cpa'")
+        config = json.loads(row["value"])
+        config["extra"]["proxy"] = ""
+        _shared.execute_no_return(
+            "UPDATE settings SET value=? WHERE key='exporter_cpa'",
+            (json.dumps(config),),
+        )
+
+        with patch.dict(os.environ, {"GROK_REGISTER_CPA_PROXY": "socks5://warp:1080"}):
+            effective = self.runtime.config()
+
+        self.assertEqual(effective["extra"]["proxy"], "socks5://warp:1080")
 
     def test_failed_prevalidation_does_not_generate_cpa_file(self):
         account_id = self.add_account()
