@@ -94,7 +94,6 @@ services:
       - "${GROK_STACK_NOVNC_PORT:-6080}:6080"
     volumes:
       - .:/workspace
-      - ./runtime/webui:/opt/webui:ro
     restart: unless-stopped
     depends_on:
       - grok2api
