@@ -116,6 +116,7 @@ services:
     working_dir: /app
     command: ["python", "/app/download_gate_server.py"]
     environment:
+      TZ: Asia/Shanghai
       DOWNLOAD_GATE_HOST: 0.0.0.0
       DOWNLOAD_GATE_PORT: 18787
       DOWNLOAD_GATE_ADMIN_PATH: ${DOWNLOAD_GATE_ADMIN_PATH:-/dg-admin}
