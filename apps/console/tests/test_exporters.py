@@ -137,6 +137,22 @@ class ExporterTests(unittest.TestCase):
         self.assertEqual(forbidden["failure_kind"], "forbidden")
         self.assertFalse(forbidden["banned"])
 
+    def test_cpa_probe_treats_limited_but_authenticated_account_as_alive(self):
+        limited = self._probe_response(
+            403,
+            '{"code":"personal-team-blocked:spending-limit","error":"run out of credits"}',
+        )
+        denied = self._probe_response(
+            403,
+            '{"code":"permission-denied","error":"Access to the chat endpoint is denied"}',
+        )
+
+        for result in (limited, denied):
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["account_alive"])
+            self.assertTrue(result["delivery_eligible"])
+            self.assertFalse(result["model_usable"])
+
 
 if __name__ == "__main__":
     unittest.main()

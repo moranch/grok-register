@@ -125,12 +125,19 @@ class AutoReplenishRuntimeTests(unittest.TestCase):
         recent = _shared.now_iso()
         stale = (datetime.now() - timedelta(minutes=61)).strftime("%Y-%m-%d %H:%M:%S")
 
-        def cpa_probe(*, checked_at: str, ok: bool = True, models: list[str] | None = None):
+        def cpa_probe(
+            *,
+            checked_at: str,
+            ok: bool = True,
+            alive: bool | None = None,
+            models: list[str] | None = None,
+        ):
             return {
                 "cpa": {
                     "probe_checked_at": checked_at,
                     "probe": {
                         "ok": ok,
+                        "account_alive": ok if alive is None else alive,
                         "probe_kind": "account_response",
                         "model_ids": models if models is not None else ["grok-4.5"],
                     },
@@ -141,12 +148,14 @@ class AutoReplenishRuntimeTests(unittest.TestCase):
         self.add_account(2, extra=cpa_probe(checked_at=stale))
         self.add_account(3, extra=cpa_probe(checked_at=recent, ok=False))
         self.add_account(4, extra=cpa_probe(checked_at=recent, models=["grok-3"]))
+        self.add_account(5, extra=cpa_probe(checked_at=recent, ok=False, alive=True, models=[]))
 
         snapshot = _delivery_runtime.delivery_stock_snapshot()
 
-        self.assertEqual(snapshot["candidate_stock"], 4)
-        self.assertEqual(snapshot["verified_stock"], 1)
-        self.assertEqual(snapshot["unverified_stock"], 3)
+        self.assertEqual(snapshot["candidate_stock"], 5)
+        self.assertEqual(snapshot["verified_stock"], 3)
+        self.assertEqual(snapshot["model_usable_stock"], 1)
+        self.assertEqual(snapshot["unverified_stock"], 2)
         self.assertEqual(snapshot["replenishment_metric"], "candidate_stock")
 
     def test_stock_99_queues_one_task_for_100_and_deduplicates(self):

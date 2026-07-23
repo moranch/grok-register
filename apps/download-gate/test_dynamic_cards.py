@@ -172,9 +172,9 @@ class DynamicCardTests(unittest.TestCase):
         with patch.object(gate, "load_auto_replenish_status", return_value=(status, "")):
             panel = gate.admin_auto_replenish_panel()
 
-        self.assertIn("近期验活可交付（60 分钟）", panel)
+        self.assertIn("近期账号存活可交付（60 分钟）", panel)
         self.assertIn(">17</strong>", panel)
-        self.assertIn("未通过近期验活", panel)
+        self.assertIn("未通过账号存活验证", panel)
         self.assertIn(">168</strong>", panel)
         self.assertIn("候选库存（补货口径）", panel)
         self.assertIn(">185</strong>", panel)
@@ -211,7 +211,7 @@ class DynamicCardTests(unittest.TestCase):
         self.assertIn("CPA、Sub2API 与 Cockpit 是三种独立格式", page)
         self.assertIn('id="claimSubBtn"', page)
         self.assertIn('id="claimCockpitBtn"', page)
-        self.assertIn("兑换时再次现场验活", page)
+        self.assertIn("账号存活验证通过", page)
 
     def test_card_status_labels_are_localized(self):
         self.assertEqual(gate.card_status_view({"status": "issued"}), ("issued", "待验活"))

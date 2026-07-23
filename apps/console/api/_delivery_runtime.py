@@ -414,19 +414,21 @@ def _probe_account(account_id: int, required_model: str) -> dict[str, Any]:
             checked_at = datetime.fromisoformat(checked_text.replace("Z", "+00:00")).replace(tzinfo=None)
         except (TypeError, ValueError):
             checked_at = None
-        model_ids = [str(item) for item in cached_probe.get("model_ids") or []]
+        cached_alive = bool(cached_probe.get("account_alive", cached_probe.get("ok")))
         if (
             checked_at is not None
             and checked_at >= datetime.now() - timedelta(minutes=cache_ttl_minutes)
             and cached_probe.get("probe_kind") == "account_response"
-            and bool(cached_probe.get("ok"))
-            and (not required_model or required_model in model_ids)
+            and cached_alive
         ):
             result = dict(cached_probe)
             result["required_model"] = required_model
-            result["required_model_available"] = True
+            result["required_model_available"] = not required_model or required_model in {
+                str(item) for item in cached_probe.get("model_ids") or []
+            }
+            result["account_alive"] = True
+            result["delivery_eligible"] = True
             result["cache_hit"] = True
-            result["ok"] = True
             return result
     try:
         probe_timeout = min(max(10, int(cpa_extra.get("timeout", 30))), 60)
@@ -447,6 +449,8 @@ def _probe_account(account_id: int, required_model: str) -> dict[str, Any]:
         if not access_token:
             return {
                 "ok": False,
+                "account_alive": False,
+                "delivery_eligible": False,
                 "error": "access_token is empty",
                 "model_ids": [],
                 "failure_kind": "token_expired",
@@ -466,11 +470,12 @@ def _probe_account(account_id: int, required_model: str) -> dict[str, Any]:
         model_ids = [str(item) for item in result.get("model_ids") or []]
         result["required_model"] = required_model
         result["required_model_available"] = not required_model or required_model in model_ids
-        result["ok"] = bool(result.get("ok")) and bool(result["required_model_available"])
+        result["model_usable"] = bool(result.get("ok")) and bool(result["required_model_available"])
+        result["delivery_eligible"] = bool(result.get("account_alive", result.get("ok")))
         return result
 
     first = run_probe()
-    if first.get("ok"):
+    if first.get("account_alive", first.get("ok")):
         return first
     if not first.get("refresh_recommended"):
         return first
@@ -533,8 +538,8 @@ def delivery_stock_snapshot(
     """Return candidate and recently verified delivery inventory separately.
 
     Candidate inventory only applies the persisted account/lifecycle/lease filters.
-    Grok verified inventory additionally requires a recent successful account-level
-    CPA probe that exposes the delivery model.
+    Grok verified inventory requires a recent probe proving the account credential is
+    alive. Model-call availability is reported separately and does not block packing.
     """
     platform = normalize_delivery_platform(platform)
     required_model = normalize_required_model(platform, required_model)
@@ -543,8 +548,10 @@ def delivery_stock_snapshot(
     ttl_minutes = _delivery_prevalidation_ttl_minutes() if platform == "grok" else 0
     cutoff = datetime.now() - timedelta(minutes=ttl_minutes) if ttl_minutes else None
 
+    model_usable_stock = 0
     if platform != "grok":
         verified_stock = candidate_stock
+        model_usable_stock = candidate_stock
     else:
         verified_stock = 0
         for row in rows:
@@ -563,14 +570,15 @@ def delivery_stock_snapshot(
                 continue
             model_ids = {str(item) for item in probe.get("model_ids") or []}
             required_model_available = not required_model or required_model in model_ids
-            if (
+            recent_account_probe = (
                 cutoff is not None
                 and checked_at >= cutoff
                 and probe.get("probe_kind") == "account_response"
-                and probe.get("ok") is True
-                and required_model_available
-            ):
+            )
+            if recent_account_probe and bool(probe.get("account_alive", probe.get("ok"))):
                 verified_stock += 1
+            if recent_account_probe and probe.get("ok") is True and required_model_available:
+                model_usable_stock += 1
 
     return {
         "platform": platform,
@@ -578,6 +586,7 @@ def delivery_stock_snapshot(
         "candidate_stock": candidate_stock,
         "verified_stock": verified_stock,
         "unverified_stock": max(0, candidate_stock - verified_stock),
+        "model_usable_stock": model_usable_stock,
         "prevalidate_ttl_minutes": ttl_minutes,
         "replenishment_metric": "candidate_stock",
     }
@@ -704,8 +713,11 @@ def reserve(
                             AND (tried.state <> 'failed' OR tried.updated_at > ?)
                       )
                     ORDER BY CASE WHEN ?='grok' AND
-                                 COALESCE(json_extract(a.extra_json, '$.cpa.probe.ok'), 0) = 1
-                                 AND COALESCE(json_extract(a.extra_json, '$.cpa.probe.has_grok_45'), 0) = 1
+                                 COALESCE(
+                                     json_extract(a.extra_json, '$.cpa.probe.account_alive'),
+                                     json_extract(a.extra_json, '$.cpa.probe.ok'),
+                                     0
+                                 ) = 1
                                  AND COALESCE(
                                      json_extract(a.extra_json, '$.cpa.probe.probe_kind'), ''
                                  ) = 'account_response'
@@ -772,7 +784,7 @@ def reserve(
             conn = _begin_immediate()
             try:
                 now = _shared.now_iso()
-                if probe.get("ok"):
+                if probe.get("account_alive", probe.get("ok")):
                     updated = conn.execute(
                         "UPDATE account_delivery_leases SET state='ready', probe_json=?, last_error='', "
                         "updated_at=?, expires_at=NULL WHERE id=? AND state='probing'",

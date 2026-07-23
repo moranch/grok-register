@@ -2894,7 +2894,7 @@ async function refreshLivePool(){{
       ? (available > 0 ? '号池在线，可提交卡密兑换' : '暂无近期验活库存，兑换时将现场尝试验活')
       : '号池状态暂时读取失败';
     livePoolRule.textContent = known
-      ? `近 ${{ttl || 60}} 分钟 CPA 验活成功且支持 grok-4.5；兑换时再次现场验活。`
+      ? `近 ${{ttl || 60}} 分钟账号存活验证通过；额度或模型权限不足不阻止凭据打包。`
       : '兑换时仍会现场验活，失败账号自动剔除并继续换号。';
   }}catch(_error){{
     livePoolAvailable.textContent = '--';
@@ -3402,7 +3402,7 @@ def admin_auto_replenish_panel() -> str:
   <div class="replenish-toggle-row">
     <div class="replenish-toggle-copy">
       <strong>{'已开启' if enabled else '已关闭'}</strong>
-      <span>候选库存低于阈值时自动创建注册任务；近期验活库存要求 CPA 账号探测成功且包含 grok-4.5。关闭开关不会中断已经运行的补货任务。</span>
+      <span>候选库存低于阈值时自动创建注册任务；近期可交付库存按账号凭据存活计算，额度和模型权限仅作为附加状态。关闭开关不会中断已经运行的补货任务。</span>
     </div>
     <input type="hidden" name="enabled" value="0">
     <label class="switch-control" title="开启或关闭自动补货">
@@ -3411,8 +3411,8 @@ def admin_auto_replenish_panel() -> str:
     </label>
   </div>
   <div class="inventory-metrics" aria-label="自动补货状态">
-    <div class="inventory-metric"><span>近期验活可交付（{prevalidate_ttl_minutes} 分钟）</span><strong class="{verified_class}">{verified_stock}</strong></div>
-    <div class="inventory-metric"><span>未通过近期验活</span><strong class="{unverified_class}">{unverified_stock}</strong></div>
+    <div class="inventory-metric"><span>近期账号存活可交付（{prevalidate_ttl_minutes} 分钟）</span><strong class="{verified_class}">{verified_stock}</strong></div>
+    <div class="inventory-metric"><span>未通过账号存活验证</span><strong class="{unverified_class}">{unverified_stock}</strong></div>
     <div class="inventory-metric"><span>候选库存（补货口径）</span><strong class="{candidate_class}">{candidate_stock}</strong></div>
     <div class="inventory-metric"><span>候选库存触发阈值</span><strong>&lt; {threshold}</strong></div>
     <div class="inventory-metric"><span>每次补货</span><strong>{replenish_count}</strong></div>

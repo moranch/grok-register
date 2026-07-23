@@ -111,10 +111,10 @@ class CpaExporter(BaseExporter):
                     verify_tls=verify_tls,
                     headers=record.get("headers") if isinstance(record.get("headers"), dict) else None,
                 )
-                if bool(extra.get("probe_required", True)) and not (
-                    probe.get("ok") and probe.get("has_grok_45")
+                if bool(extra.get("probe_required", True)) and not bool(
+                    probe.get("account_alive", probe.get("ok"))
                 ):
-                    return PushResult(False, self.name, "CPA 文件未生成：grok-4.5 探测失败")
+                    return PushResult(False, self.name, "CPA 文件未生成：账号存活探测失败")
 
             destinations: list[str] = []
             filename = ""

@@ -182,6 +182,34 @@ class DeliveryRuntimeTests(unittest.TestCase):
         self.assertEqual(int(lease["account_id"]), account_id)
         self.assertEqual(lease["state"], "ready")
 
+    def test_alive_account_can_be_delivered_when_model_call_is_limited(self):
+        account_id = self.add_account("limited@example.com", "limited-sub")
+        limited_probe = {
+            "ok": False,
+            "account_alive": True,
+            "delivery_eligible": True,
+            "model_usable": False,
+            "status": 403,
+            "model_ids": [],
+            "has_grok_45": False,
+            "probe_kind": "account_response",
+            "error": "personal-team-blocked:spending-limit",
+        }
+        with patch.object(
+            _delivery_runtime,
+            "probe_cpa_models",
+            return_value=limited_probe,
+        ):
+            reservation = _delivery_runtime.reserve("LIMITED-CARD")
+
+        lease = _shared.fetch_one(
+            "SELECT account_id, state, probe_json FROM account_delivery_leases WHERE id=?",
+            (reservation["lease_id"],),
+        )
+        self.assertEqual(int(lease["account_id"]), account_id)
+        self.assertEqual(lease["state"], "ready")
+        self.assertTrue(json.loads(lease["probe_json"])["account_alive"])
+
     def test_explicitly_banned_account_is_removed_without_mint(self):
         account_id = self.add_account("banned@example.com", "banned-sub")
         banned_probe = {

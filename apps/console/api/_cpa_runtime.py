@@ -199,7 +199,11 @@ class CpaMintRuntime:
               AND (
                   COALESCE(json_extract(a.extra_json, '$.cpa.probe.probe_kind'), '') <> 'account_response'
                   OR (
-                      COALESCE(json_extract(a.extra_json, '$.cpa.probe.ok'), 0) = 1
+                      COALESCE(
+                          json_extract(a.extra_json, '$.cpa.probe.account_alive'),
+                          json_extract(a.extra_json, '$.cpa.probe.ok'),
+                          0
+                      ) = 1
                       AND COALESCE(
                           json_extract(a.extra_json, '$.cpa.probe_checked_at'),
                           json_extract(a.extra_json, '$.cpa.updated_at'),
@@ -207,7 +211,11 @@ class CpaMintRuntime:
                       ) < ?
                   )
                   OR (
-                      COALESCE(json_extract(a.extra_json, '$.cpa.probe.ok'), 0) <> 1
+                      COALESCE(
+                          json_extract(a.extra_json, '$.cpa.probe.account_alive'),
+                          json_extract(a.extra_json, '$.cpa.probe.ok'),
+                          0
+                      ) <> 1
                       AND COALESCE(
                           json_extract(a.extra_json, '$.cpa.probe_checked_at'),
                           json_extract(a.extra_json, '$.cpa.updated_at'),
@@ -256,8 +264,8 @@ class CpaMintRuntime:
             )
         except Exception as exc:
             return False, {}, str(exc)
-        ok = bool(probe.get("ok")) and bool(probe.get("has_grok_45"))
-        return ok, probe, "" if ok else str(probe.get("error") or "grok-4.5 is unavailable")
+        alive = bool(probe.get("account_alive", probe.get("ok")))
+        return alive, probe, "" if alive else str(probe.get("error") or "account is unavailable")
 
     def _store_probe_success(
         self,
@@ -367,10 +375,10 @@ class CpaMintRuntime:
                     verify_tls=verify_tls,
                     headers=record.get("headers") if isinstance(record.get("headers"), dict) else None,
                 )
-                if bool(config_extra.get("probe_required", True)) and not (
-                    probe.get("ok") and probe.get("has_grok_45")
+                if bool(config_extra.get("probe_required", True)) and not bool(
+                    probe.get("account_alive", probe.get("ok"))
                 ):
-                    raise RuntimeError("grok-4.5 探测失败")
+                    raise RuntimeError("账号存活探测失败")
 
             # 只有自动验活通过后才落地/上传交付凭据。失败账号不生成 CPA，
             # DownloadGate 也不会从未验活库存派生 Sub2API/Cockpit 文件。
@@ -395,8 +403,9 @@ class CpaMintRuntime:
             ):
                 if key in record:
                     extra[key] = record[key]
+            probe_alive = probe is None or bool(probe.get("account_alive", probe.get("ok")))
             extra["cpa"] = {
-                "status": "ready" if probe is None or probe.get("ok") else "failed",
+                "status": "ready" if probe_alive else "failed",
                 "filename": filename,
                 "destinations": destinations,
                 "mint_method": "protocol",
@@ -415,10 +424,10 @@ class CpaMintRuntime:
                     json.dumps(extra, ensure_ascii=False),
                     json.dumps(status, ensure_ascii=False),
                     bool(probe and probe.get("banned")),
-                    bool(probe and probe.get("ok") and probe.get("has_grok_45")),
+                    probe_alive,
                     bool(probe and probe.get("banned")),
                     now_iso(),
-                    "" if probe and probe.get("ok") else str((probe or {}).get("error") or "")[:500],
+                    "" if probe_alive else str((probe or {}).get("error") or "")[:500],
                     account_id,
                 ),
             )
