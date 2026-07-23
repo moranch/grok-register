@@ -218,6 +218,7 @@ def migrate_manifest(data: dict) -> tuple[dict, bool]:
             "voided_at",
         }
         china_tz = timezone(timedelta(hours=8))
+        backup_created = False
         for collection_name in ("bundles", "cards"):
             for item in data[collection_name].values():
                 if not isinstance(item, dict):
@@ -230,6 +231,9 @@ def migrate_manifest(data: dict) -> tuple[dict, bool]:
                         parsed = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
                     except ValueError:
                         continue
+                    if not backup_created:
+                        backup_manifest("timezone-migration-utc-to-cst")
+                        backup_created = True
                     item[field] = (
                         parsed.replace(tzinfo=timezone.utc)
                         .astimezone(china_tz)
