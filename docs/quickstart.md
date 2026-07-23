@@ -50,7 +50,7 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xvfb chromium-browser
 如果你不想先在宿主机手工装一堆依赖，可以直接用 Docker：
 
 ```bash
-git clone https://github.com/509992828/grok-register.git
+git clone https://github.com/moranch/grok-register.git
 cd grok-register
 cp .env.example .env
 docker compose up -d --build
