@@ -214,9 +214,19 @@ class DynamicCardTests(unittest.TestCase):
         self.assertIn("兑换时再次现场验活", page)
 
     def test_card_status_labels_are_localized(self):
-        self.assertEqual(gate.CARD_STATUS_LABELS["issued"], "待领取")
-        self.assertEqual(gate.CARD_STATUS_LABELS["provisioning"], "验活打包中")
-        self.assertEqual(gate.CARD_STATUS_LABELS["claimed"], "领取成功")
+        self.assertEqual(gate.card_status_view({"status": "issued"}), ("issued", "待验活"))
+        self.assertEqual(
+            gate.card_status_view({"status": "provisioning"}),
+            ("provisioning", "正在验活"),
+        )
+        self.assertEqual(
+            gate.card_status_view({"status": "claimed"}),
+            ("claimed", "验活成功 · 已领取"),
+        )
+        self.assertEqual(
+            gate.card_status_view({"status": "issued", "last_error": "timed out"}),
+            ("failed", "验活失败"),
+        )
         self.assertEqual(gate.CARD_STATUS_LABELS["void"], "已作废")
 
     def test_generated_card_keys_use_readable_groups(self):

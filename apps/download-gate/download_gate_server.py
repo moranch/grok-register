@@ -59,9 +59,10 @@ CARD_KEY_GROUP_SIZE = 4
 CARD_KEY_DEFAULT_LENGTH = 12
 CARD_KEY_LENGTHS = (12, 16, 20)
 CARD_STATUS_LABELS = {
-    "issued": "待领取",
-    "provisioning": "验活打包中",
-    "claimed": "领取成功",
+    "issued": "待验活",
+    "provisioning": "正在验活",
+    "claimed": "验活成功 · 已领取",
+    "failed": "验活失败",
     "void": "已作废",
 }
 CARD_PLATFORMS = (
@@ -96,6 +97,15 @@ def normalize_card_platform(value: str | None) -> str:
 def normalize_card_required_model(platform: str, value: str | None) -> str:
     model = str(value or "").strip()
     return model[:100] or DEFAULT_REQUIRED_MODELS.get(platform, "")
+
+
+def card_status_view(card: dict) -> tuple[str, str]:
+    status = str(card.get("status") or "issued").strip().lower()
+    if status == "issued" and str(card.get("last_error") or "").strip():
+        status = "failed"
+    if status not in CARD_STATUS_LABELS:
+        status = "issued"
+    return status, CARD_STATUS_LABELS[status]
 
 SESSIONS: dict[str, float] = {}
 BATCH_DOWNLOADS: dict[str, dict] = {}
@@ -1851,6 +1861,7 @@ def page_shell(
     .tag.card-status.claimed{{color:var(--good);background:var(--good-bg)}}
     .tag.card-status.provisioning{{color:var(--warn);background:var(--warn-bg)}}
     .tag.card-status.issued{{color:#2563a8;background:rgba(37,99,168,.10)}}
+    .tag.card-status.failed{{color:var(--bad);background:var(--bad-bg)}}
     .tag.card-status.void{{color:var(--bad);background:var(--bad-bg)}}
     .rows{{padding:8px 18px 4px}}
     .row{{display:flex;gap:14px;padding:8px 0;border-bottom:1px solid #f3f0eb;font-size:.86rem}}
@@ -3435,8 +3446,8 @@ def admin_page(
         reverse=True,
     )
     card_counts = {
-        status: sum(1 for card in cards if card.get("status") == status)
-        for status in ("issued", "provisioning", "claimed", "void")
+        status: sum(1 for card in cards if card_status_view(card)[0] == status)
+        for status in ("issued", "provisioning", "claimed", "failed", "void")
     }
     issued_batch = str(issued_batch or "").strip()[:80]
     issued_platform = str(issued_platform or "").strip().lower()
@@ -3456,12 +3467,10 @@ def admin_page(
   <button type="button" onclick="copyText(document.querySelector('#issuedCardKeys').value,this)">复制全部卡密</button>
 </section>"""
     def card_status_badge(card: dict) -> str:
-        status = str(card.get("status") or "issued").strip().lower()
-        if status not in CARD_STATUS_LABELS:
-            status = "issued"
+        status, label = card_status_view(card)
         return (
             f'<span class="tag card-status {status}">'
-            f'{html.escape(CARD_STATUS_LABELS[status])}</span>'
+            f'{html.escape(label)}</span>'
         )
 
     card_rows = "".join(
@@ -3480,9 +3489,10 @@ def admin_page(
     cards_panel = f"""
 <p class="lead">预发行卡密不预占账号。用户首次取件时，系统才会向 Console 申请一个现场验活账号并原子打包；同一卡密只对应一个账号和一个 ZIP。</p>
 <section class="admin-summary" aria-label="卡密统计">
-  <div class="stat"><span class="k">已发行</span><span class="v">{card_counts['issued']}</span></div>
-  <div class="stat"><span class="k">处理中</span><span class="v">{card_counts['provisioning']}</span></div>
-  <div class="stat"><span class="k">已领取</span><span class="v">{card_counts['claimed']}</span></div>
+  <div class="stat"><span class="k">待验活</span><span class="v">{card_counts['issued']}</span></div>
+  <div class="stat"><span class="k">正在验活</span><span class="v">{card_counts['provisioning']}</span></div>
+  <div class="stat"><span class="k">验活成功</span><span class="v">{card_counts['claimed']}</span></div>
+  <div class="stat"><span class="k">验活失败</span><span class="v">{card_counts['failed']}</span></div>
   <div class="stat"><span class="k">已作废</span><span class="v">{card_counts['void']}</span></div>
 </section>
 <form class="panel upload-panel" method="post" action="{ADMIN_PATH}/cards/issue">
