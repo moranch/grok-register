@@ -13,6 +13,7 @@ from typing import Any
 from core.cpa_auth import (
     exchange_sso_for_token,
     probe_cpa_account,
+    refresh_cpa_token,
     token_to_cpa_record,
     upload_cpa_record,
     write_cpa_record,
@@ -351,14 +352,42 @@ class CpaMintRuntime:
             timeout = max(30, int(config_extra.get("timeout", 90)))
             verify_tls = bool(config_extra.get("verify_tls", True))
             proxy = str(config_extra.get("proxy") or row["proxy_url"] or "")
-            token = exchange_sso_for_token(
-                str(row["sso"] or extra.get("sso") or ""),
-                sso_rw=str(extra.get("sso_rw") or ""),
-                proxy=proxy,
-                timeout=timeout,
-                verify_tls=verify_tls,
-                cancel=self._stop.is_set,
-            )
+            token: dict[str, Any] | None = None
+            mint_method = "device_flow"
+            refresh_error = ""
+
+            # access_token 过期时优先走标准 refresh grant。只有 refresh_token
+            # 本身失效或网络请求失败时，才回退到耗时更长的完整 SSO device flow。
+            saved_refresh_token = str(extra.get("refresh_token") or "").strip()
+            if saved_refresh_token:
+                try:
+                    token = refresh_cpa_token(
+                        saved_refresh_token,
+                        proxy=proxy,
+                        timeout=min(timeout, 30),
+                        verify_tls=verify_tls,
+                    )
+                    mint_method = "refresh_token"
+                except Exception as exc:
+                    refresh_error = str(exc)[:500]
+
+            if token is None:
+                try:
+                    token = exchange_sso_for_token(
+                        str(row["sso"] or extra.get("sso") or ""),
+                        sso_rw=str(extra.get("sso_rw") or ""),
+                        proxy=proxy,
+                        timeout=timeout,
+                        verify_tls=verify_tls,
+                        cancel=self._stop.is_set,
+                    )
+                except Exception as exc:
+                    if refresh_error:
+                        raise RuntimeError(
+                            f"refresh_token 续期失败: {refresh_error}; "
+                            f"SSO 重新授权失败: {exc}"
+                        ) from exc
+                    raise
             record = token_to_cpa_record(
                 token,
                 str(row["email"] or ""),
@@ -405,7 +434,7 @@ class CpaMintRuntime:
                 "status": "ready" if probe_alive else "failed",
                 "filename": filename,
                 "destinations": destinations,
-                "mint_method": "protocol",
+                "mint_method": mint_method,
                 "probe": probe,
                 "updated_at": now_iso(),
             }

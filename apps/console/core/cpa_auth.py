@@ -248,6 +248,74 @@ def exchange_sso_for_token(
     raise TimeoutError("OAuth token 获取超时")
 
 
+def refresh_cpa_token(
+    refresh_token: str,
+    *,
+    proxy: str = "",
+    timeout: int = 20,
+    verify_tls: bool = True,
+) -> dict[str, Any]:
+    """Renew an x.ai OAuth credential without invoking the device flow."""
+    refresh_token = str(refresh_token or "").strip()
+    if not refresh_token:
+        raise ValueError("refresh_token 为空")
+
+    def request_refresh(proxy_url: str):
+        session = curl_requests.Session()
+        session.proxies = _proxies(proxy_url) or {}
+        session.verify = verify_tls
+        return _request_with_retry(
+            session,
+            "POST",
+            f"{OIDC_ISSUER}/oauth2/token",
+            attempts=1,
+            data={
+                "grant_type": "refresh_token",
+                "client_id": CLIENT_ID,
+                "refresh_token": refresh_token,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            impersonate="chrome",
+            timeout=timeout,
+        )
+
+    global _identity_proxy_bypass_until
+    with _identity_proxy_bypass_lock:
+        bypass_proxy = bool(proxy) and time.monotonic() < _identity_proxy_bypass_until
+    transport = "direct_bypass" if bypass_proxy else ("proxy" if proxy else "direct")
+    try:
+        response = request_refresh("" if bypass_proxy else proxy)
+    except Exception as proxy_error:
+        if not proxy or bypass_proxy:
+            raise
+        with _identity_proxy_bypass_lock:
+            _identity_proxy_bypass_until = time.monotonic() + IDENTITY_PROXY_BYPASS_SECONDS
+        try:
+            response = request_refresh("")
+            transport = "direct_fallback"
+        except Exception as direct_error:
+            raise RuntimeError(
+                f"proxy OAuth refresh failed: {proxy_error}; "
+                f"direct OAuth refresh failed: {direct_error}"
+            ) from direct_error
+
+    payload = _json_payload(response)
+    if int(response.status_code) >= 400:
+        detail = str(
+            payload.get("error_description")
+            or payload.get("error")
+            or getattr(response, "text", "")
+            or f"HTTP {response.status_code}"
+        ).strip()
+        raise RuntimeError(f"OAuth refresh failed: {detail[:500]}")
+    if not str(payload.get("access_token") or "").strip():
+        raise RuntimeError("OAuth refresh 响应缺少 access_token")
+    if not str(payload.get("refresh_token") or "").strip():
+        payload["refresh_token"] = refresh_token
+    payload["transport"] = transport
+    return payload
+
+
 def token_to_cpa_record(
     token: dict[str, Any],
     email: str = "",

@@ -15,6 +15,7 @@ from core.cpa_auth import (
     CPA_REDIRECT_URI,
     CPA_USERINFO_URL,
     probe_cpa_account,
+    refresh_cpa_token,
     token_to_cpa_record,
 )
 from exporters.cpa import CpaExporter
@@ -108,6 +109,73 @@ class ExporterTests(unittest.TestCase):
         self.assertEqual(record["refresh_token"], "refresh")
         self.assertEqual(record["headers"], CPA_HEADERS)
         self.assertIn("x-authenticateresponse", record["headers"])
+
+    def test_cpa_refresh_uses_standard_refresh_grant(self):
+        response = Mock(status_code=200, text='{"access_token":"new-access"}')
+        response.json.return_value = {
+            "access_token": "new-access",
+            "refresh_token": "rotated-refresh",
+            "expires_in": 21600,
+        }
+        session = Mock()
+        session.request.return_value = response
+
+        with patch("core.cpa_auth.curl_requests.Session", return_value=session):
+            token = refresh_cpa_token("old-refresh", timeout=10)
+
+        self.assertEqual(token["access_token"], "new-access")
+        self.assertEqual(token["refresh_token"], "rotated-refresh")
+        self.assertEqual(token["transport"], "direct")
+        args, kwargs = session.request.call_args
+        self.assertEqual(args[:2], ("POST", "https://auth.x.ai/oauth2/token"))
+        self.assertEqual(
+            kwargs["data"],
+            {
+                "grant_type": "refresh_token",
+                "client_id": "b1a00492-073a-47ea-816f-4c329264a828",
+                "refresh_token": "old-refresh",
+            },
+        )
+
+    def test_cpa_refresh_preserves_non_rotated_refresh_token(self):
+        response = Mock(status_code=200, text='{"access_token":"new-access"}')
+        response.json.return_value = {"access_token": "new-access", "expires_in": 21600}
+        session = Mock()
+        session.request.return_value = response
+
+        with patch("core.cpa_auth.curl_requests.Session", return_value=session):
+            token = refresh_cpa_token("existing-refresh")
+
+        self.assertEqual(token["refresh_token"], "existing-refresh")
+
+    def test_cpa_refresh_falls_back_to_direct_when_proxy_times_out(self):
+        proxy_session = Mock()
+        proxy_session.request.side_effect = TimeoutError("proxy timed out")
+        direct_response = Mock(status_code=200, text='{"access_token":"new-access"}')
+        direct_response.json.return_value = {
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+        }
+        direct_session = Mock()
+        direct_session.request.return_value = direct_response
+
+        with (
+            patch("core.cpa_auth._identity_proxy_bypass_until", 0.0),
+            patch(
+                "core.cpa_auth.curl_requests.Session",
+                side_effect=[proxy_session, direct_session],
+            ),
+        ):
+            token = refresh_cpa_token(
+                "existing-refresh", proxy="socks5://warp:1080", timeout=5
+            )
+
+        self.assertEqual(token["transport"], "direct_fallback")
+        self.assertEqual(
+            proxy_session.proxies,
+            {"http": "socks5://warp:1080", "https": "socks5://warp:1080"},
+        )
+        self.assertEqual(direct_session.proxies, {})
 
     def _probe_response(self, status: int, body: str):
         response = Mock(status_code=status, text=body)
