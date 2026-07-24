@@ -73,6 +73,15 @@ class CpaRuntimeTests(unittest.TestCase):
         }
         with (
             patch.object(self.runtime, "config", return_value=self.config),
+            patch(
+                "api._cpa_runtime.probe_grok_account_session",
+                return_value={
+                    "ok": False,
+                    "account_alive": False,
+                    "error": "session unavailable",
+                    "probe_kind": "account_session",
+                },
+            ),
             patch("api._cpa_runtime.probe_cpa_account", return_value=probe) as live_probe,
             patch("api._cpa_runtime.exchange_sso_for_token") as mint,
         ):
@@ -90,16 +99,6 @@ class CpaRuntimeTests(unittest.TestCase):
 
     def test_expired_access_token_is_renewed_with_refresh_token(self):
         account_id = self.add_account()
-        expired_probe = {
-            "ok": False,
-            "account_alive": False,
-            "status": 401,
-            "error": "invalid_token",
-            "failure_kind": "token_expired",
-            "refresh_recommended": True,
-            "banned": False,
-            "probe_kind": "account_identity",
-        }
         session_probe = {
             "ok": True,
             "account_alive": True,
@@ -116,7 +115,7 @@ class CpaRuntimeTests(unittest.TestCase):
             patch.object(self.runtime, "config", return_value=self.config),
             patch(
                 "api._cpa_runtime.probe_cpa_account",
-                return_value=expired_probe,
+                side_effect=AssertionError("OAuth identity probe should not run"),
             ) as live_probe,
             patch(
                 "api._cpa_runtime.probe_grok_account_session",
@@ -131,7 +130,7 @@ class CpaRuntimeTests(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertEqual(error, "")
-        live_probe.assert_called_once()
+        live_probe.assert_not_called()
         sso_probe.assert_called_once()
         refresh.assert_called_once_with(
             "existing-refresh", proxy="", timeout=30, verify_tls=True
@@ -147,15 +146,6 @@ class CpaRuntimeTests(unittest.TestCase):
 
     def test_refresh_failure_keeps_live_sso_without_device_flow(self):
         account_id = self.add_account()
-        expired_probe = {
-            "ok": False,
-            "account_alive": False,
-            "status": 401,
-            "error": "invalid_token",
-            "failure_kind": "token_expired",
-            "refresh_recommended": True,
-            "probe_kind": "account_identity",
-        }
         session_probe = {
             "ok": True,
             "account_alive": True,
@@ -165,7 +155,10 @@ class CpaRuntimeTests(unittest.TestCase):
 
         with (
             patch.object(self.runtime, "config", return_value=self.config),
-            patch("api._cpa_runtime.probe_cpa_account", return_value=expired_probe),
+            patch(
+                "api._cpa_runtime.probe_cpa_account",
+                side_effect=AssertionError("OAuth identity probe should not run"),
+            ),
             patch(
                 "api._cpa_runtime.probe_grok_account_session",
                 return_value=session_probe,

@@ -311,29 +311,14 @@ class CpaMintRuntime:
         extra: dict[str, Any],
         config_extra: dict[str, Any],
     ) -> tuple[bool, dict[str, Any], str]:
-        access_token = str(extra.get("access_token") or "")
         try:
             timeout = min(max(5, int(config_extra.get("identity_timeout", 12))), 30)
         except (TypeError, ValueError):
             timeout = 12
         proxy = str(config_extra.get("proxy") or row["proxy_url"] or "")
         verify_tls = bool(config_extra.get("verify_tls", True))
-        token_probe: dict[str, Any] = {}
-        token_error = "access_token is empty" if not access_token else ""
-        if access_token:
-            try:
-                token_probe = probe_cpa_account(
-                    access_token,
-                    proxy=proxy,
-                    timeout=timeout,
-                    verify_tls=verify_tls,
-                )
-                if bool(token_probe.get("account_alive", token_probe.get("ok"))):
-                    return True, token_probe, ""
-                token_error = str(token_probe.get("error") or "OAuth identity unavailable")
-            except Exception as exc:
-                token_error = str(exc)
-
+        session_probe: dict[str, Any] = {}
+        session_error = ""
         sso = str(row["sso"] or extra.get("sso") or "").strip()
         if sso:
             try:
@@ -352,14 +337,32 @@ class CpaMintRuntime:
                 session_error = str(
                     session_probe.get("error") or "Grok account session unavailable"
                 )
-                return False, session_probe, session_error
             except Exception as exc:
                 session_error = str(exc)
-                if token_probe:
-                    return False, token_probe, f"{token_error}; SSO probe failed: {session_error}"
-                return False, {}, f"{token_error}; SSO probe failed: {session_error}"
 
-        return False, token_probe, token_error
+        # SSO 才是 Grok 账号存活的主口径。只有 SSO 不可用时，才用现有
+        # OAuth access_token 作为兼容兜底，避免过期 token 拖慢整批验活。
+        access_token = str(extra.get("access_token") or "")
+        token_probe: dict[str, Any] = {}
+        token_error = "access_token is empty" if not access_token else ""
+        if access_token:
+            try:
+                token_probe = probe_cpa_account(
+                    access_token,
+                    proxy=proxy,
+                    timeout=timeout,
+                    verify_tls=verify_tls,
+                )
+                if bool(token_probe.get("account_alive", token_probe.get("ok"))):
+                    return True, token_probe, ""
+                token_error = str(token_probe.get("error") or "OAuth identity unavailable")
+            except Exception as exc:
+                token_error = str(exc)
+
+        if session_probe:
+            return False, session_probe, session_error
+        combined_error = "; ".join(part for part in (session_error, token_error) if part)
+        return False, token_probe, combined_error or "account is unavailable"
 
     def _store_probe_success(
         self,
