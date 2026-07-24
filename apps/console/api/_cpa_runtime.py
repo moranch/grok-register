@@ -21,28 +21,70 @@ from core.cpa_auth import (
 
 from ._shared import execute_no_return, fetch_all, fetch_one, now_iso
 
+DEFAULT_CPA_WORKERS = 6
+MAX_CPA_WORKERS = 16
+CPA_QUEUE_MAXSIZE = 5000
+
 
 class CpaMintRuntime:
     def __init__(self) -> None:
-        self._queue: queue.Queue[tuple[int, bool, str]] = queue.Queue(maxsize=200)
+        self._queue: queue.Queue[tuple[int, bool, str]] = queue.Queue(
+            maxsize=CPA_QUEUE_MAXSIZE
+        )
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._threads: list[threading.Thread] = []
+        self._scheduler_thread: threading.Thread | None = None
         self._pending: set[int] = set()
         self._lock = threading.Lock()
+        self._jobs_lock = threading.Lock()
         self._jobs: dict[str, dict[str, Any]] = {}
         self._next_prevalidate_scan = 0.0
 
+    def worker_count(self) -> int:
+        configured = os.getenv("GROK_REGISTER_CPA_WORKERS", "").strip()
+        if not configured:
+            try:
+                configured = str((self.config().get("extra") or {}).get("workers") or "")
+            except Exception:
+                configured = ""
+        try:
+            return min(max(1, int(configured or DEFAULT_CPA_WORKERS)), MAX_CPA_WORKERS)
+        except (TypeError, ValueError):
+            return DEFAULT_CPA_WORKERS
+
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
+        if any(thread.is_alive() for thread in self._threads):
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="cpa-mint", daemon=True)
-        self._thread.start()
+        self._threads = [
+            threading.Thread(
+                target=self._run_worker,
+                name=f"cpa-mint-{index + 1}",
+                daemon=True,
+            )
+            for index in range(self.worker_count())
+        ]
+        print(
+            f"[cpa-prevalidate] workers={len(self._threads)} "
+            f"queue_maxsize={self._queue.maxsize}"
+        )
+        for thread in self._threads:
+            thread.start()
+        self._scheduler_thread = threading.Thread(
+            target=self._run_scheduler,
+            name="cpa-mint-scheduler",
+            daemon=True,
+        )
+        self._scheduler_thread.start()
 
     def stop(self) -> None:
         self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=5)
+        if self._scheduler_thread:
+            self._scheduler_thread.join(timeout=5)
+        for thread in self._threads:
+            thread.join(timeout=5)
+        self._scheduler_thread = None
+        self._threads = []
 
     def config(self) -> dict[str, Any]:
         row = fetch_one("SELECT value FROM settings WHERE key = 'exporter_cpa'")
@@ -118,36 +160,56 @@ class CpaMintRuntime:
             "errors": [],
             "created_at": now_iso(),
         }
-        self._jobs[job_id] = job
+        with self._jobs_lock:
+            self._jobs[job_id] = job
         for account_id in selected:
-            if self.enqueue(account_id, force=force, job_id=job_id):
-                job["queued"] += 1
-            else:
-                job["skipped"] += 1
-        if job["queued"] == 0:
-            job["status"] = "completed"
-        return dict(job)
+            queued = self.enqueue(account_id, force=force, job_id=job_id)
+            with self._jobs_lock:
+                job["queued" if queued else "skipped"] += 1
+        with self._jobs_lock:
+            finished = job["success"] + job["failed"] + job["skipped"]
+            if job["queued"] == 0 or finished >= job["total"]:
+                job["status"] = "completed"
+                job["finished_at"] = now_iso()
+            result = dict(job)
+            result["errors"] = list(job["errors"])
+            return result
 
     def job(self, job_id: str) -> dict[str, Any] | None:
-        job = self._jobs.get(job_id)
-        return dict(job) if job else None
+        with self._jobs_lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return None
+            result = dict(job)
+            result["errors"] = list(job.get("errors") or [])
+            return result
 
     def _finish_job(self, job_id: str, *, success: bool, error: str = "") -> None:
-        if not job_id or job_id not in self._jobs:
+        if not job_id:
             return
-        job = self._jobs[job_id]
-        job["status"] = "running"
-        job["success" if success else "failed"] += 1
-        if error and len(job["errors"]) < 20:
-            job["errors"].append(error[:300])
-        finished = job["success"] + job["failed"] + job["skipped"]
-        if finished >= job["total"]:
-            job["status"] = "completed"
-            job["finished_at"] = now_iso()
+        with self._jobs_lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            job["status"] = "running"
+            job["success" if success else "failed"] += 1
+            if error and len(job["errors"]) < 20:
+                job["errors"].append(error[:300])
+            finished = job["success"] + job["failed"] + job["skipped"]
+            if finished >= job["total"]:
+                job["status"] = "completed"
+                job["finished_at"] = now_iso()
 
-    def _run(self) -> None:
+    def _run_scheduler(self) -> None:
         while not self._stop.is_set():
-            self._schedule_prevalidation()
+            try:
+                self._schedule_prevalidation()
+            except Exception as exc:
+                print(f"[cpa-prevalidate] scheduler_error={str(exc)[:500]}")
+            self._stop.wait(1)
+
+    def _run_worker(self) -> None:
+        while not self._stop.is_set():
             try:
                 account_id, force, job_id = self._queue.get(timeout=1)
             except queue.Empty:

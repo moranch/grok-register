@@ -2,6 +2,8 @@ import gc
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -206,6 +208,63 @@ class CpaRuntimeTests(unittest.TestCase):
             effective = self.runtime.config()
 
         self.assertEqual(effective["extra"]["proxy"], "socks5://warp:1080")
+
+    def test_worker_count_uses_environment_and_clamps_range(self):
+        with patch.dict(os.environ, {"GROK_REGISTER_CPA_WORKERS": "8"}):
+            self.assertEqual(self.runtime.worker_count(), 8)
+        with patch.dict(os.environ, {"GROK_REGISTER_CPA_WORKERS": "999"}):
+            self.assertEqual(self.runtime.worker_count(), 16)
+        with patch.dict(os.environ, {"GROK_REGISTER_CPA_WORKERS": "0"}):
+            self.assertEqual(self.runtime.worker_count(), 1)
+        with patch.dict(os.environ, {"GROK_REGISTER_CPA_WORKERS": "invalid"}):
+            self.assertEqual(self.runtime.worker_count(), 6)
+
+    def test_runtime_processes_validation_queue_with_multiple_workers(self):
+        release = threading.Event()
+        all_started = threading.Event()
+        state_lock = threading.Lock()
+        state = {"active": 0, "max_active": 0, "started": 0}
+
+        def mint_account(_account_id, *, force):
+            self.assertFalse(force)
+            with state_lock:
+                state["active"] += 1
+                state["started"] += 1
+                state["max_active"] = max(state["max_active"], state["active"])
+                if state["started"] >= 3:
+                    all_started.set()
+            release.wait(5)
+            with state_lock:
+                state["active"] -= 1
+            return True, ""
+
+        for account_id in (101, 102, 103):
+            self.assertTrue(self.runtime.enqueue(account_id))
+
+        started_concurrently = False
+        try:
+            with (
+                patch.dict(os.environ, {"GROK_REGISTER_CPA_WORKERS": "3"}),
+                patch.object(self.runtime, "_schedule_prevalidation"),
+                patch.object(self.runtime, "_mint_account", side_effect=mint_account),
+            ):
+                self.runtime.start()
+                started_concurrently = all_started.wait(3)
+                self.assertEqual(
+                    [thread.name for thread in self.runtime._threads],
+                    ["cpa-mint-1", "cpa-mint-2", "cpa-mint-3"],
+                )
+                release.set()
+                deadline = time.monotonic() + 3
+                while self.runtime._pending and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertFalse(self.runtime._pending)
+        finally:
+            release.set()
+            self.runtime.stop()
+
+        self.assertTrue(started_concurrently)
+        self.assertEqual(state["max_active"], 3)
 
     def test_failed_prevalidation_does_not_generate_cpa_file(self):
         account_id = self.add_account()
