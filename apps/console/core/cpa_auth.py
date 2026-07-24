@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +30,9 @@ CPA_HEADERS = {
     "x-grok-client-identifier": "grok-shell",
     "User-Agent": "grok-shell/0.2.93 (linux; x86_64)",
 }
+IDENTITY_PROXY_BYPASS_SECONDS = 300
+_identity_proxy_bypass_until = 0.0
+_identity_proxy_bypass_lock = threading.Lock()
 
 
 def _proxies(proxy: str) -> dict[str, str] | None:
@@ -339,13 +343,20 @@ def probe_cpa_account(
             timeout=timeout,
         )
 
-    transport = "proxy" if proxy else "direct"
+    global _identity_proxy_bypass_until
+    with _identity_proxy_bypass_lock:
+        bypass_proxy = bool(proxy) and time.monotonic() < _identity_proxy_bypass_until
+    transport = "direct_bypass" if bypass_proxy else ("proxy" if proxy else "direct")
     try:
         try:
-            response = request_identity(proxy)
+            response = request_identity("" if bypass_proxy else proxy)
         except Exception as proxy_error:
-            if not proxy:
+            if not proxy or bypass_proxy:
                 raise
+            with _identity_proxy_bypass_lock:
+                _identity_proxy_bypass_until = (
+                    time.monotonic() + IDENTITY_PROXY_BYPASS_SECONDS
+                )
             try:
                 response = request_identity("")
                 transport = "direct_fallback"
