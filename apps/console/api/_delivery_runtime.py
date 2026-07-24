@@ -411,7 +411,8 @@ def _probe_account(account_id: int, required_model: str) -> dict[str, Any]:
         if (
             checked_at is not None
             and checked_at >= datetime.now() - timedelta(minutes=cache_ttl_minutes)
-            and cached_probe.get("probe_kind") in {"account_identity", "account_response"}
+            and cached_probe.get("probe_kind")
+            in {"account_identity", "account_response", "account_session"}
             and cached_alive
         ):
             result = dict(cached_probe)
@@ -498,6 +499,10 @@ def delivery_stock_snapshot(
                 extra = json.loads(row["extra_json"] or "{}")
             except (TypeError, ValueError):
                 continue
+            if not str(extra.get("access_token") or "").strip() or not str(
+                extra.get("refresh_token") or ""
+            ).strip():
+                continue
             cpa = extra.get("cpa") if isinstance(extra.get("cpa"), dict) else {}
             probe = cpa.get("probe") if isinstance(cpa.get("probe"), dict) else {}
             checked_text = str(cpa.get("probe_checked_at") or cpa.get("updated_at") or "")
@@ -510,7 +515,8 @@ def delivery_stock_snapshot(
             recent_account_probe = (
                 cutoff is not None
                 and checked_at >= cutoff
-                and probe.get("probe_kind") in {"account_identity", "account_response"}
+                and probe.get("probe_kind")
+                in {"account_identity", "account_response", "account_session"}
             )
             if recent_account_probe and bool(probe.get("account_alive", probe.get("ok"))):
                 verified_stock += 1
@@ -639,6 +645,13 @@ def reserve(
                       AND (
                           ? <> 'grok'
                           OR (
+                              COALESCE(json_extract(a.extra_json, '$.access_token'), '') <> ''
+                              AND COALESCE(json_extract(a.extra_json, '$.refresh_token'), '') <> ''
+                          )
+                      )
+                      AND (
+                          ? <> 'grok'
+                          OR (
                               COALESCE(
                                   json_extract(a.extra_json, '$.cpa.probe.account_alive'),
                                   json_extract(a.extra_json, '$.cpa.probe.ok'),
@@ -646,7 +659,7 @@ def reserve(
                               ) = 1
                               AND COALESCE(
                                   json_extract(a.extra_json, '$.cpa.probe.probe_kind'), ''
-                              ) IN ('account_identity', 'account_response')
+                              ) IN ('account_identity', 'account_response', 'account_session')
                               AND COALESCE(
                                   json_extract(a.extra_json, '$.cpa.probe_checked_at'),
                                   json_extract(a.extra_json, '$.cpa.updated_at'),
@@ -681,7 +694,7 @@ def reserve(
                                  ) = 1
                                  AND COALESCE(
                                      json_extract(a.extra_json, '$.cpa.probe.probe_kind'), ''
-                                 ) IN ('account_identity', 'account_response')
+                                 ) IN ('account_identity', 'account_response', 'account_session')
                                  AND COALESCE(
                                      json_extract(a.extra_json, '$.cpa.probe_checked_at'),
                                      json_extract(a.extra_json, '$.cpa.updated_at'),
@@ -698,6 +711,7 @@ def reserve(
                     LIMIT 1
                     """,
                     (
+                        platform,
                         platform,
                         platform,
                         platform,

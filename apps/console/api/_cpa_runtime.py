@@ -13,6 +13,7 @@ from typing import Any
 from core.cpa_auth import (
     exchange_sso_for_token,
     probe_cpa_account,
+    probe_grok_account_session,
     refresh_cpa_token,
     token_to_cpa_record,
     upload_cpa_record,
@@ -265,7 +266,7 @@ class CpaMintRuntime:
               )
               AND (
                   COALESCE(json_extract(a.extra_json, '$.cpa.probe.probe_kind'), '')
-                      NOT IN ('account_identity', 'account_response')
+                      NOT IN ('account_identity', 'account_response', 'account_session')
                   OR (
                       COALESCE(
                           json_extract(a.extra_json, '$.cpa.probe.account_alive'),
@@ -311,33 +312,72 @@ class CpaMintRuntime:
         config_extra: dict[str, Any],
     ) -> tuple[bool, dict[str, Any], str]:
         access_token = str(extra.get("access_token") or "")
-        if not access_token:
-            return False, {}, "access_token is empty"
         try:
             timeout = min(max(5, int(config_extra.get("identity_timeout", 12))), 30)
         except (TypeError, ValueError):
             timeout = 12
-        try:
-            probe = probe_cpa_account(
-                access_token,
-                proxy=str(config_extra.get("proxy") or row["proxy_url"] or ""),
-                timeout=timeout,
-                verify_tls=bool(config_extra.get("verify_tls", True)),
-            )
-        except Exception as exc:
-            return False, {}, str(exc)
-        alive = bool(probe.get("account_alive", probe.get("ok")))
-        return alive, probe, "" if alive else str(probe.get("error") or "account is unavailable")
+        proxy = str(config_extra.get("proxy") or row["proxy_url"] or "")
+        verify_tls = bool(config_extra.get("verify_tls", True))
+        token_probe: dict[str, Any] = {}
+        token_error = "access_token is empty" if not access_token else ""
+        if access_token:
+            try:
+                token_probe = probe_cpa_account(
+                    access_token,
+                    proxy=proxy,
+                    timeout=timeout,
+                    verify_tls=verify_tls,
+                )
+                if bool(token_probe.get("account_alive", token_probe.get("ok"))):
+                    return True, token_probe, ""
+                token_error = str(token_probe.get("error") or "OAuth identity unavailable")
+            except Exception as exc:
+                token_error = str(exc)
+
+        sso = str(row["sso"] or extra.get("sso") or "").strip()
+        if sso:
+            try:
+                session_probe = probe_grok_account_session(
+                    sso,
+                    sso_rw=str(extra.get("sso_rw") or ""),
+                    proxy=proxy,
+                    timeout=timeout,
+                    verify_tls=verify_tls,
+                )
+                session_alive = bool(
+                    session_probe.get("account_alive", session_probe.get("ok"))
+                )
+                if session_alive:
+                    return True, session_probe, ""
+                session_error = str(
+                    session_probe.get("error") or "Grok account session unavailable"
+                )
+                return False, session_probe, session_error
+            except Exception as exc:
+                session_error = str(exc)
+                if token_probe:
+                    return False, token_probe, f"{token_error}; SSO probe failed: {session_error}"
+                return False, {}, f"{token_error}; SSO probe failed: {session_error}"
+
+        return False, token_probe, token_error
 
     def _store_probe_success(
         self,
         account_id: int,
         extra: dict[str, Any],
         probe: dict[str, Any],
+        *,
+        renewal_error: str = "",
     ) -> None:
         checked_at = now_iso()
         cpa = extra.get("cpa") if isinstance(extra.get("cpa"), dict) else {}
         cpa.update({"status": "ready", "probe": probe, "probe_checked_at": checked_at})
+        cpa.pop("error", None)
+        cpa.pop("probe_error", None)
+        if renewal_error:
+            cpa["renewal_error"] = renewal_error[:500]
+        else:
+            cpa.pop("renewal_error", None)
         extra["cpa"] = cpa
         execute_no_return(
             "UPDATE accounts SET extra_json=?, validity_status='valid', "
@@ -391,14 +431,22 @@ class CpaMintRuntime:
         config_extra = config.get("extra") or {}
         last_probe: dict[str, Any] = {}
         last_probe_error = ""
-        if not force and extra.get("refresh_token"):
+        known_alive = False
+        if row["sso"] or extra.get("access_token") or extra.get("refresh_token"):
             probe_ok, last_probe, last_probe_error = self._probe_existing_token(
                 row, extra, config_extra
             )
             if probe_ok:
+                known_alive = True
                 self._store_probe_success(account_id, extra, last_probe)
-                return True, ""
-            if last_probe and not bool(last_probe.get("refresh_recommended")):
+                if not force and last_probe.get("probe_kind") == "account_identity":
+                    return True, ""
+            elif (
+                not force
+                and last_probe
+                and not extra.get("refresh_token")
+                and not bool(last_probe.get("refresh_recommended"))
+            ):
                 self._store_probe_failure(account_id, extra, last_probe, last_probe_error)
                 return False, last_probe_error
 
@@ -434,6 +482,16 @@ class CpaMintRuntime:
                     refresh_error = str(exc)[:500]
 
             if token is None:
+                if known_alive and saved_refresh_token:
+                    # SSO/账号页已经证明账号存活。续期失败只记录附加错误，
+                    # 不再执行最长 90 秒的 device flow，也不把活账号踢出库存。
+                    self._store_probe_success(
+                        account_id,
+                        extra,
+                        last_probe,
+                        renewal_error=refresh_error or "OAuth refresh failed",
+                    )
+                    return True, ""
                 try:
                     token = exchange_sso_for_token(
                         str(row["sso"] or extra.get("sso") or ""),
@@ -456,7 +514,9 @@ class CpaMintRuntime:
                 base_url=str(config_extra.get("base_url") or "https://cli-chat-proxy.grok.com/v1"),
             )
             probe = None
-            if bool(config_extra.get("probe", True)):
+            if known_alive:
+                probe = last_probe
+            elif bool(config_extra.get("probe", True)):
                 probe = probe_cpa_account(
                     record["access_token"],
                     proxy=proxy,

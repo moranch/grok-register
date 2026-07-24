@@ -14,6 +14,8 @@ from core.cpa_auth import (
     CPA_HEADERS,
     CPA_REDIRECT_URI,
     CPA_USERINFO_URL,
+    GROK_ACCOUNT_URL,
+    probe_grok_account_session,
     probe_cpa_account,
     refresh_cpa_token,
     token_to_cpa_record,
@@ -176,6 +178,40 @@ class ExporterTests(unittest.TestCase):
             {"http": "socks5://warp:1080", "https": "socks5://warp:1080"},
         )
         self.assertEqual(direct_session.proxies, {})
+
+    def test_grok_sso_probe_accepts_authenticated_account_page(self):
+        response = Mock(
+            status_code=200,
+            url="https://accounts.x.ai/account",
+            text="account page",
+        )
+        session = Mock()
+        session.request.return_value = response
+
+        with patch("core.cpa_auth.curl_requests.Session", return_value=session):
+            result = probe_grok_account_session("sso-cookie", sso_rw="rw-cookie")
+
+        self.assertTrue(result["account_alive"])
+        self.assertTrue(result["delivery_eligible"])
+        self.assertEqual(result["probe_kind"], "account_session")
+        args, kwargs = session.request.call_args
+        self.assertEqual(args[:2], ("GET", GROK_ACCOUNT_URL))
+        self.assertTrue(kwargs["allow_redirects"])
+
+    def test_grok_sso_probe_rejects_redirected_login_page(self):
+        response = Mock(
+            status_code=200,
+            url="https://accounts.x.ai/login",
+            text="login page",
+        )
+        session = Mock()
+        session.request.return_value = response
+
+        with patch("core.cpa_auth.curl_requests.Session", return_value=session):
+            result = probe_grok_account_session("expired-sso")
+
+        self.assertFalse(result["account_alive"])
+        self.assertEqual(result["failure_kind"], "session_invalid")
 
     def _probe_response(self, status: int, body: str):
         response = Mock(status_code=status, text=body)

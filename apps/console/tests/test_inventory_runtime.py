@@ -130,14 +130,17 @@ class AutoReplenishRuntimeTests(unittest.TestCase):
             checked_at: str,
             ok: bool = True,
             alive: bool | None = None,
+            probe_kind: str = "account_identity",
         ):
             return {
+                "access_token": "access-token",
+                "refresh_token": "refresh-token",
                 "cpa": {
                     "probe_checked_at": checked_at,
                     "probe": {
                         "ok": ok,
                         "account_alive": ok if alive is None else alive,
-                        "probe_kind": "account_identity",
+                        "probe_kind": probe_kind,
                     },
                 }
             }
@@ -146,7 +149,15 @@ class AutoReplenishRuntimeTests(unittest.TestCase):
         self.add_account(2, extra=cpa_probe(checked_at=stale))
         self.add_account(3, extra=cpa_probe(checked_at=recent, ok=False))
         self.add_account(4, extra=cpa_probe(checked_at=recent))
-        self.add_account(5, extra=cpa_probe(checked_at=recent, ok=False, alive=True))
+        self.add_account(
+            5,
+            extra=cpa_probe(
+                checked_at=recent,
+                ok=False,
+                alive=True,
+                probe_kind="account_session",
+            ),
+        )
 
         snapshot = _delivery_runtime.delivery_stock_snapshot()
 

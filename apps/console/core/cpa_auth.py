@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 import httpx
 from curl_cffi import requests as curl_requests
@@ -22,6 +23,7 @@ SCOPES = (
 )
 CPA_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 CPA_USERINFO_URL = f"{OIDC_ISSUER}/oauth2/userinfo"
+GROK_ACCOUNT_URL = "https://accounts.x.ai/account"
 CPA_REDIRECT_URI = "http://127.0.0.1:56121/callback"
 CPA_HEADERS = {
     "x-grok-client-version": "0.2.93",
@@ -314,6 +316,92 @@ def refresh_cpa_token(
         payload["refresh_token"] = refresh_token
     payload["transport"] = transport
     return payload
+
+
+def probe_grok_account_session(
+    sso: str,
+    *,
+    sso_rw: str = "",
+    proxy: str = "",
+    timeout: int = 20,
+    verify_tls: bool = True,
+) -> dict[str, Any]:
+    """Check the Grok account session without calling OAuth or a model endpoint."""
+    sso = str(sso or "").strip()
+    if not sso:
+        return {
+            "ok": False,
+            "account_alive": False,
+            "delivery_eligible": False,
+            "status": 0,
+            "error": "sso is empty",
+            "failure_kind": "session_missing",
+            "refresh_recommended": False,
+            "banned": False,
+            "probe_kind": "account_session",
+            "probe_version": 4,
+        }
+
+    def request_account(proxy_url: str):
+        session = curl_requests.Session()
+        session.proxies = _proxies(proxy_url) or {}
+        session.verify = verify_tls
+        _inject_sso_cookies(session, sso, sso_rw)
+        return _request_with_retry(
+            session,
+            "GET",
+            GROK_ACCOUNT_URL,
+            attempts=1,
+            impersonate="chrome",
+            timeout=timeout,
+            allow_redirects=True,
+        )
+
+    global _identity_proxy_bypass_until
+    with _identity_proxy_bypass_lock:
+        bypass_proxy = bool(proxy) and time.monotonic() < _identity_proxy_bypass_until
+    transport = "direct_bypass" if bypass_proxy else ("proxy" if proxy else "direct")
+    try:
+        response = request_account("" if bypass_proxy else proxy)
+    except Exception as proxy_error:
+        if not proxy or bypass_proxy:
+            raise
+        with _identity_proxy_bypass_lock:
+            _identity_proxy_bypass_until = time.monotonic() + IDENTITY_PROXY_BYPASS_SECONDS
+        try:
+            response = request_account("")
+            transport = "direct_fallback"
+        except Exception as direct_error:
+            raise RuntimeError(
+                f"proxy Grok session probe failed: {proxy_error}; "
+                f"direct Grok session probe failed: {direct_error}"
+            ) from direct_error
+
+    status = int(response.status_code)
+    final_url = str(getattr(response, "url", "") or "")
+    parsed = urlparse(final_url)
+    final_host = parsed.hostname or ""
+    final_path = parsed.path.rstrip("/") or "/"
+    alive = bool(
+        status == 200
+        and final_host.lower() == "accounts.x.ai"
+        and (final_path == "/account" or final_path.startswith("/account/"))
+    )
+    return {
+        "ok": alive,
+        "account_alive": alive,
+        "delivery_eligible": alive,
+        "status": status,
+        "account_state": "active" if alive else "unavailable",
+        "error": "" if alive else f"Grok account session unavailable: HTTP {status}",
+        "failure_kind": "" if alive else "session_invalid",
+        "refresh_recommended": False,
+        "banned": False,
+        "probe_kind": "account_session",
+        "probe_version": 4,
+        "transport": transport,
+        "final_path": final_path,
+    }
 
 
 def token_to_cpa_record(
