@@ -45,7 +45,7 @@ ADMIN_PATH = normalize_admin_path(os.environ.get("DOWNLOAD_GATE_ADMIN_PATH", "/d
 INTERNAL_API_TOKEN = os.environ.get("DOWNLOAD_GATE_INTERNAL_TOKEN", "").strip()
 CONSOLE_URL = os.environ.get("DOWNLOAD_GATE_CONSOLE_URL", "").strip().rstrip("/")
 CONSOLE_TIMEOUT_SECONDS = max(int(os.environ.get("DOWNLOAD_GATE_CONSOLE_TIMEOUT", "120") or 120), 5)
-APP_VERSION = "2026.07.24.01"
+APP_VERSION = "2026.07.25.01"
 CLIENT_COOKIE_NAME = "dg_client"
 CLIENT_COOKIE_MAX_AGE = 365 * 24 * 60 * 60
 CLAIM_TTL_SECONDS = 24 * 60 * 60
@@ -62,6 +62,7 @@ CARD_STATUS_LABELS = {
     "issued": "待验活",
     "provisioning": "正在验活",
     "claimed": "验活成功 · 已领取",
+    "retryable": "领取超时 · 可重试",
     "failed": "验活失败",
     "void": "已作废",
 }
@@ -101,8 +102,21 @@ def normalize_card_required_model(platform: str, value: str | None) -> str:
 
 def card_status_view(card: dict) -> tuple[str, str]:
     status = str(card.get("status") or "issued").strip().lower()
-    if status == "issued" and str(card.get("last_error") or "").strip():
-        status = "failed"
+    error = str(card.get("last_error") or "").strip()
+    if status == "issued" and error:
+        lowered = error.lower()
+        retryable_markers = (
+            "timed out",
+            "timeout",
+            "already in progress",
+            "connection failed",
+            "connection reset",
+            "temporarily unavailable",
+            "http 502",
+            "http 503",
+            "http 504",
+        )
+        status = "retryable" if any(marker in lowered for marker in retryable_markers) else "failed"
     if status not in CARD_STATUS_LABELS:
         status = "issued"
     return status, CARD_STATUS_LABELS[status]
@@ -1859,6 +1873,7 @@ def page_shell(
     .tag.expired{{color:var(--bad);background:var(--bad-bg)}}
     .tag.card-status.claimed{{color:var(--good);background:var(--good-bg)}}
     .tag.card-status.provisioning{{color:var(--warn);background:var(--warn-bg)}}
+    .tag.card-status.retryable{{color:var(--warn);background:var(--warn-bg)}}
     .tag.card-status.issued{{color:#2563a8;background:rgba(37,99,168,.10)}}
     .tag.card-status.failed{{color:var(--bad);background:var(--bad-bg)}}
     .tag.card-status.void{{color:var(--bad);background:var(--bad-bg)}}
@@ -3446,7 +3461,7 @@ def admin_page(
     )
     card_counts = {
         status: sum(1 for card in cards if card_status_view(card)[0] == status)
-        for status in ("issued", "provisioning", "claimed", "failed", "void")
+        for status in ("issued", "provisioning", "claimed", "retryable", "failed", "void")
     }
     issued_batch = str(issued_batch or "").strip()[:80]
     issued_platform = str(issued_platform or "").strip().lower()
@@ -3491,6 +3506,7 @@ def admin_page(
   <div class="stat"><span class="k">待验活</span><span class="v">{card_counts['issued']}</span></div>
   <div class="stat"><span class="k">正在验活</span><span class="v">{card_counts['provisioning']}</span></div>
   <div class="stat"><span class="k">验活成功</span><span class="v">{card_counts['claimed']}</span></div>
+  <div class="stat"><span class="k">领取超时可重试</span><span class="v">{card_counts['retryable']}</span></div>
   <div class="stat"><span class="k">验活失败</span><span class="v">{card_counts['failed']}</span></div>
   <div class="stat"><span class="k">已作废</span><span class="v">{card_counts['void']}</span></div>
 </section>

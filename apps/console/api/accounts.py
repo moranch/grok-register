@@ -66,7 +66,7 @@ def _raise_delivery_error(exc: Exception) -> None:
     if isinstance(exc, _delivery_runtime.DeliveryConflict):
         raise HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, _delivery_runtime.DeliveryUnavailable):
-        status = 503 if "not configured" in str(exc) else 409
+        status = 409 if str(exc) == "no active account is available" else 503
         raise HTTPException(status_code=status, detail=str(exc))
     raise exc
 

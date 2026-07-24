@@ -236,6 +236,34 @@ class DeliveryRuntimeTests(unittest.TestCase):
         self.assertEqual(account["lifecycle_status"], "suspended")
         self.assertIn("suspended", account["last_error"])
 
+    def test_transient_identity_failure_stops_after_one_account(self):
+        self.add_account("first-transient@example.com", "first-transient")
+        self.add_account("second-transient@example.com", "second-transient")
+        probed: list[int] = []
+
+        def transient_probe(account_id, _required_model):
+            probed.append(account_id)
+            return {
+                "ok": False,
+                "account_alive": False,
+                "status": 0,
+                "failure_kind": "transient",
+                "refresh_recommended": False,
+                "error": "timed out",
+            }
+
+        with patch.object(_delivery_runtime, "_probe_account", side_effect=transient_probe):
+            with self.assertRaisesRegex(_delivery_runtime.DeliveryUnavailable, "timed out"):
+                _delivery_runtime.reserve("TRANSIENT-CARD")
+
+        self.assertEqual(len(probed), 1)
+        leases = _shared.fetch_all(
+            "SELECT state, last_error FROM account_delivery_leases ORDER BY created_at"
+        )
+        self.assertEqual(len(leases), 1)
+        self.assertEqual(leases[0]["state"], "failed")
+        self.assertEqual(leases[0]["last_error"], "timed out")
+
     def test_commit_is_idempotent_and_account_is_never_reused(self):
         first_id = self.add_account("first@example.com", "first-sub")
         second_id = self.add_account("second@example.com", "second-sub")

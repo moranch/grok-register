@@ -423,9 +423,9 @@ def _probe_account(account_id: int, required_model: str) -> dict[str, Any]:
             result["cache_hit"] = True
             return result
     try:
-        probe_timeout = min(max(10, int(cpa_extra.get("timeout", 30))), 60)
+        probe_timeout = min(max(5, int(cpa_extra.get("identity_timeout", 12))), 30)
     except (TypeError, ValueError):
-        probe_timeout = 30
+        probe_timeout = 12
 
     def run_probe() -> dict[str, Any]:
         accounts = _shared.account_list_by_ids([account_id])
@@ -755,8 +755,10 @@ def reserve(
             probe = {
                 "ok": False,
                 "required_model": required_model,
+                "failure_kind": "transient",
                 "error": str(exc)[:500],
             }
+        stop_error = ""
         with _shared.db_lock:
             conn = _begin_immediate()
             try:
@@ -789,7 +791,27 @@ def reserve(
                 # access_token 为空时会先尝试从 SSO 自动补全 OAuth。补全失败的
                 # mint_error 才是真正根因（例如 CPA 目的地未配置或 SSO 失效），
                 # 不应再被笼统的 "access_token is empty" 掩盖。
-                error = str(probe.get("mint_error") or probe.get("error") or "required model unavailable")[:500]
+                error = str(probe.get("mint_error") or probe.get("error") or "account unavailable")[:500]
+                lowered_error = error.lower()
+                transient = (
+                    str(probe.get("failure_kind") or "") == "transient"
+                    or (
+                        int(probe.get("status") or 0) == 0
+                        and not bool(probe.get("refresh_recommended"))
+                    )
+                    or any(
+                        marker in lowered_error
+                        for marker in (
+                            "timed out",
+                            "timeout",
+                            "connection failed",
+                            "connection reset",
+                            "network",
+                            "proxy",
+                            "temporarily unavailable",
+                        )
+                    )
+                )
                 updated = conn.execute(
                     "UPDATE account_delivery_leases SET state='failed', probe_json=?, last_error=?, updated_at=? "
                     "WHERE id=? AND state='probing'",
@@ -810,10 +832,14 @@ def reserve(
                     "last_checked_at=?, last_error=? WHERE id=?",
                     (banned, banned, now, error, account_id),
                 )
+                if transient:
+                    stop_error = error
                 _finish(conn, ok=True)
             except Exception:
                 _finish(conn, ok=False)
                 raise
+        if stop_error:
+            raise DeliveryUnavailable(stop_error)
 
 
 def _consumption_result(row: sqlite3.Row) -> dict[str, Any]:

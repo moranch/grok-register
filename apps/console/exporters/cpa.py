@@ -44,6 +44,11 @@ class CpaExporter(BaseExporter):
             "default": "https://cli-chat-proxy.grok.com/v1",
         },
         "timeout": {"type": "integer", "title": "超时秒数", "default": 90},
+        "identity_timeout": {
+            "type": "integer",
+            "title": "账号存活验证超时秒数",
+            "default": 12,
+        },
         "verify_tls": {"type": "boolean", "title": "验证 TLS", "default": True},
         "probe": {"type": "boolean", "title": "导出后验证账号存活", "default": True},
         "probe_required": {"type": "boolean", "title": "账号验证失败视为导出失败", "default": True},
@@ -106,7 +111,7 @@ class CpaExporter(BaseExporter):
                 probe = probe_cpa_account(
                     record["access_token"],
                     proxy=str(extra.get("proxy") or ""),
-                    timeout=min(timeout, 30),
+                    timeout=min(max(5, int(extra.get("identity_timeout", 12))), 30),
                     verify_tls=verify_tls,
                 )
                 if bool(extra.get("probe_required", True)) and not bool(

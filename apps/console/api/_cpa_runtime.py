@@ -247,9 +247,9 @@ class CpaMintRuntime:
         if not access_token:
             return False, {}, "access_token is empty"
         try:
-            timeout = min(max(10, int(config_extra.get("timeout", 90))), 30)
+            timeout = min(max(5, int(config_extra.get("identity_timeout", 12))), 30)
         except (TypeError, ValueError):
-            timeout = 30
+            timeout = 12
         try:
             probe = probe_cpa_account(
                 access_token,
@@ -365,7 +365,7 @@ class CpaMintRuntime:
                 probe = probe_cpa_account(
                     record["access_token"],
                     proxy=proxy,
-                    timeout=min(timeout, 30),
+                    timeout=min(max(5, int(config_extra.get("identity_timeout", 12))), 30),
                     verify_tls=verify_tls,
                 )
                 if bool(config_extra.get("probe_required", True)) and not bool(

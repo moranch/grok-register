@@ -992,6 +992,7 @@ def init_db() -> None:
                 ).strip(),
                 "base_url": "https://cli-chat-proxy.grok.com/v1",
                 "timeout": 90,
+                "identity_timeout": 12,
                 "verify_tls": True,
                 "probe": True,
                 "probe_required": True,

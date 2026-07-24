@@ -225,7 +225,13 @@ class DynamicCardTests(unittest.TestCase):
         )
         self.assertEqual(
             gate.card_status_view({"status": "issued", "last_error": "timed out"}),
-            ("failed", "验活失败"),
+            ("retryable", "领取超时 · 可重试"),
+        )
+        self.assertEqual(
+            gate.card_status_view(
+                {"status": "issued", "last_error": "delivery reservation is already in progress"}
+            ),
+            ("retryable", "领取超时 · 可重试"),
         )
         self.assertEqual(gate.CARD_STATUS_LABELS["void"], "已作废")
 

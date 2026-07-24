@@ -329,6 +329,7 @@ def probe_cpa_account(
             session,
             "GET",
             CPA_USERINFO_URL,
+            attempts=1,
             headers={
                 "Authorization": f"Bearer {access_token}",
                 "Accept": "application/json",
