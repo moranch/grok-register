@@ -45,9 +45,7 @@ ADMIN_PATH = normalize_admin_path(os.environ.get("DOWNLOAD_GATE_ADMIN_PATH", "/d
 INTERNAL_API_TOKEN = os.environ.get("DOWNLOAD_GATE_INTERNAL_TOKEN", "").strip()
 CONSOLE_URL = os.environ.get("DOWNLOAD_GATE_CONSOLE_URL", "").strip().rstrip("/")
 CONSOLE_TIMEOUT_SECONDS = max(int(os.environ.get("DOWNLOAD_GATE_CONSOLE_TIMEOUT", "120") or 120), 5)
-APP_VERSION = "2026.07.25.01"
-CLIENT_COOKIE_NAME = "dg_client"
-CLIENT_COOKIE_MAX_AGE = 365 * 24 * 60 * 60
+APP_VERSION = "2026.07.25.02"
 CLAIM_TTL_SECONDS = 24 * 60 * 60
 BATCH_DOWNLOAD_TTL_SECONDS = 10 * 60
 MAX_BATCH_KEYS = 20
@@ -59,11 +57,11 @@ CARD_KEY_GROUP_SIZE = 4
 CARD_KEY_DEFAULT_LENGTH = 12
 CARD_KEY_LENGTHS = (12, 16, 20)
 CARD_STATUS_LABELS = {
-    "issued": "待验活",
-    "provisioning": "正在验活",
-    "claimed": "验活成功 · 已领取",
+    "issued": "待领取",
+    "provisioning": "正在分配",
+    "claimed": "领取成功",
     "retryable": "领取超时 · 可重试",
-    "failed": "验活失败",
+    "failed": "领取失败",
     "void": "已作废",
 }
 CARD_PLATFORMS = (
@@ -310,12 +308,13 @@ def migrate_manifest(data: dict) -> tuple[dict, bool]:
 
     for key, bundle_id in historical.items():
         bundle = bundles.get(bundle_id) if isinstance(bundles.get(bundle_id), dict) else {}
+        bundle_claimed = bool(bundle.get("bound_at") or bundle.get("bound_client"))
         card = cards.get(key)
         if not isinstance(card, dict):
             platform = normalize_card_platform(bundle.get("platform"))
             card = {
                 "key": key,
-                "status": "claimed" if bundle.get("bound_client") else "issued",
+                "status": "claimed" if bundle_claimed else "issued",
                 "batch": "legacy",
                 "created_at": str(bundle.get("created_at") or now_text()),
                 "bundle_id": bundle_id,
@@ -324,7 +323,7 @@ def migrate_manifest(data: dict) -> tuple[dict, bool]:
                     platform, bundle.get("required_model")
                 ),
             }
-            if bundle.get("bound_client"):
+            if bundle_claimed:
                 card["claimed_at"] = str(bundle.get("bound_at") or now_text())
             cards[key] = card
             changed = True
@@ -336,7 +335,7 @@ def migrate_manifest(data: dict) -> tuple[dict, bool]:
                 card["bundle_id"] = bundle_id
                 changed = True
             if card.get("status") not in {"issued", "provisioning", "claimed", "void"}:
-                card["status"] = "claimed" if bundle.get("bound_client") else "issued"
+                card["status"] = "claimed" if bundle_claimed else "issued"
                 changed = True
     for key, card in cards.items():
         if not isinstance(card, dict):
@@ -356,6 +355,12 @@ def migrate_manifest(data: dict) -> tuple[dict, bool]:
             changed = True
         if bundle and bundle.get("platform") != platform:
             bundle["platform"] = platform
+            changed = True
+    # Browser/device binding was removed. Keep the original claim timestamp and
+    # audit fields, but discard legacy fingerprint hashes on first load.
+    for bundle in bundles.values():
+        if isinstance(bundle, dict) and bundle.get("bound_client"):
+            bundle["bound_client"] = ""
             changed = True
     return data, changed
 
@@ -1068,7 +1073,7 @@ def write_dynamic_bundle_json_atomic(manifest: dict, card: dict, document: dict)
     bundle = {
         "id": bundle_id,
         "key": key,
-        "title": f"{platform} 现场验活账号 JSON",
+        "title": f"{platform} 账号交付 JSON",
         "platform": platform,
         "required_model": required_model,
         "zip_name": "",
@@ -1356,7 +1361,7 @@ def parse_time_text(value: str) -> float | None:
 
 
 def bundle_claim_expires_at(bundle: dict) -> float | None:
-    if not isinstance(bundle, dict) or not bundle.get("bound_client"):
+    if not isinstance(bundle, dict):
         return None
     bound_ts = parse_time_text(str(bundle.get("bound_at") or ""))
     if bound_ts is None:
@@ -1385,7 +1390,7 @@ def available_stock_bundle_ids(manifest: dict) -> list[str]:
             continue
         if normalize_key(str(bundle.get("key") or "")):
             continue
-        if bundle.get("bound_client"):
+        if bundle.get("bound_at"):
             continue
         zip_path = ZIP_DIR / f"{bundle_id}.zip"
         if not zip_path.exists():
@@ -2812,7 +2817,7 @@ def user_page(message: str = "", *, initial_key: str = "") -> bytes:
   <div class="live-pool-detail">
     <div class="live-pool-heading"><span>Grok 账号池</span><span id="livePoolCandidate">候选库存 --</span></div>
     <div class="live-pool-track" aria-hidden="true"><span id="livePoolBar"></span></div>
-    <div id="livePoolRule" class="live-pool-meta">兑换时仍会现场验活，失败账号自动剔除并继续换号。</div>
+    <div id="livePoolRule" class="live-pool-meta">账号由后台独立验活；领取时优先使用近期已验证库存。</div>
   </div>
 </section>
 {announcement_html}
@@ -2859,7 +2864,7 @@ def user_page(message: str = "", *, initial_key: str = "") -> bytes:
       </div>
       <div class="guide-item">
         <span class="guide-index">03</span>
-        <div class="guide-copy"><strong>浏览器绑定</strong><span>首次领取后请勿更换浏览器或清理 Cookie，否则无法继续下载。</span></div>
+        <div class="guide-copy"><strong>卡密取件</strong><span>首次领取后 24 小时内可在任意浏览器凭同一卡密重新下载。</span></div>
       </div>
       <div class="guide-item">
         <span class="guide-index">04</span>
@@ -2909,7 +2914,7 @@ async function refreshLivePool(){{
       : '号池状态暂时读取失败';
     livePoolRule.textContent = known
       ? `近 ${{ttl || 60}} 分钟账号存活验证通过；额度或模型权限不足不阻止凭据打包。`
-      : '兑换时仍会现场验活，失败账号自动剔除并继续换号。';
+      : '账号由后台独立验活；领取时优先使用近期已验证库存。';
   }}catch(_error){{
     livePoolAvailable.textContent = '--';
     livePoolCandidate.textContent = '候选库存 --';
@@ -3028,10 +3033,10 @@ async function performClaim(keys, downloadKind='cpa'){{
   const oldText = claimBtn ? claimBtn.textContent : '';
   const oldSubText = claimSubBtn ? claimSubBtn.textContent : '';
   const oldCockpitText = claimCockpitBtn ? claimCockpitBtn.textContent : '';
-  if(claimBtn){{claimBtn.disabled = true; claimBtn.textContent = '正在核验'; claimBtn.setAttribute('aria-busy', 'true');}}
-  if(claimSubBtn){{claimSubBtn.disabled = true; claimSubBtn.textContent = '正在核验'; claimSubBtn.setAttribute('aria-busy', 'true');}}
-  if(claimCockpitBtn){{claimCockpitBtn.disabled = true; claimCockpitBtn.textContent = '正在核验'; claimCockpitBtn.setAttribute('aria-busy', 'true');}}
-  hint.innerHTML='<div class="note warn">正在核验卡密...</div>';res.innerHTML='';
+  if(claimBtn){{claimBtn.disabled = true; claimBtn.textContent = '正在分配'; claimBtn.setAttribute('aria-busy', 'true');}}
+  if(claimSubBtn){{claimSubBtn.disabled = true; claimSubBtn.textContent = '正在分配'; claimSubBtn.setAttribute('aria-busy', 'true');}}
+  if(claimCockpitBtn){{claimCockpitBtn.disabled = true; claimCockpitBtn.textContent = '正在分配'; claimCockpitBtn.setAttribute('aria-busy', 'true');}}
+  hint.innerHTML='<div class="note warn">正在分配存活账号并生成文件...</div>';res.innerHTML='';
   try{{
     const batch = keys.length > 1;
     const r = await fetch(batch ? '/api/claim-batch' : '/api/claim', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(batch ? {{keys}} : {{key:value}})}}).then(x=>x.json());
@@ -3084,7 +3089,7 @@ async function performClaim(keys, downloadKind='cpa'){{
     const selected = selectedDownloads[downloadKind] && selectedDownloads[downloadKind].url
       ? selectedDownloads[downloadKind]
       : selectedDownloads.cpa;
-    hint.innerHTML='<div class="note ok">卡密有效，已开始下载 '+esc(selected.label)+'。当前浏览器已绑定该卡密。</div>';
+    hint.innerHTML='<div class="note ok">卡密有效，已开始下载 '+esc(selected.label)+'。24 小时内可凭同一卡密重新下载。</div>';
     res.innerHTML = `<article class="card result">
       <div class="hd"><div class="result-heading"><small>领取成功</small><strong>卡密 ${{esc(r.key)}}</strong></div><span class="tag">${{r.sub_download_url ? 'CPA / Sub2API / Cockpit' : (r.download_format === 'json' ? 'JSON 文件' : 'ZIP 文件')}}</span></div>
       <div class="rows">
@@ -3501,13 +3506,13 @@ def admin_page(
         for platform in CARD_PLATFORMS
     )
     cards_panel = f"""
-<p class="lead">预发行卡密不预占账号。用户首次取件时，系统才会向 Console 申请一个现场验活账号并原子打包；同一卡密只对应一个账号和一个 ZIP。</p>
+<p class="lead">账号由后台独立自动验活，预发行卡密不预占账号。用户首次取件时优先从近期已验证的账号池分配并原子打包；同一卡密只对应一个账号和一个交付包。</p>
 <section class="admin-summary" aria-label="卡密统计">
-  <div class="stat"><span class="k">待验活</span><span class="v">{card_counts['issued']}</span></div>
-  <div class="stat"><span class="k">正在验活</span><span class="v">{card_counts['provisioning']}</span></div>
-  <div class="stat"><span class="k">验活成功</span><span class="v">{card_counts['claimed']}</span></div>
+  <div class="stat"><span class="k">待领取</span><span class="v">{card_counts['issued']}</span></div>
+  <div class="stat"><span class="k">正在分配</span><span class="v">{card_counts['provisioning']}</span></div>
+  <div class="stat"><span class="k">领取成功</span><span class="v">{card_counts['claimed']}</span></div>
   <div class="stat"><span class="k">领取超时可重试</span><span class="v">{card_counts['retryable']}</span></div>
-  <div class="stat"><span class="k">验活失败</span><span class="v">{card_counts['failed']}</span></div>
+  <div class="stat"><span class="k">领取失败</span><span class="v">{card_counts['failed']}</span></div>
   <div class="stat"><span class="k">已作废</span><span class="v">{card_counts['void']}</span></div>
 </section>
 <form class="panel upload-panel" method="post" action="{ADMIN_PATH}/cards/issue">
@@ -3541,17 +3546,17 @@ def admin_page(
     claimed_count = sum(
         1
         for item in bundles
-        if item.get("bound_client") and not item.get("replaced_by") and not bundle_is_expired(item)
+        if item.get("bound_at") and not item.get("replaced_by") and not bundle_is_expired(item)
     )
     stock_count = sum(
         1
         for item in bundles
-        if not item.get("bound_client") and not item.get("replaced_by") and not normalize_key(str(item.get("key") or ""))
+        if not item.get("bound_at") and not item.get("replaced_by") and not normalize_key(str(item.get("key") or ""))
     )
     unused_count = sum(
         1
         for item in bundles
-        if not item.get("bound_client") and not item.get("replaced_by") and normalize_key(str(item.get("key") or ""))
+        if not item.get("bound_at") and not item.get("replaced_by") and normalize_key(str(item.get("key") or ""))
     )
     total_size_text = html.escape(format_size(sum(int(item.get("size") or 0) for item in bundles)))
     summary_html = f"""<section class="admin-summary" aria-label="后台统计">
@@ -3586,7 +3591,7 @@ def admin_page(
             status = '<span class="tag expired">已过期</span>'
             expires_text = bundle_expires_text(item)
             status_time = f"取件有效期已于 {expires_text} 结束" if expires_text else "首次取件后 24 小时已结束"
-        elif item.get("bound_client"):
+        elif item.get("bound_at"):
             status_key = "claimed"
             status_label = "已取件"
             status = '<span class="tag">已取件</span>'
@@ -3649,6 +3654,10 @@ def admin_page(
     <input type="hidden" name="action" value="clear_unused">
     <button class="secondary compact" type="submit">&#28165;&#31354;&#26410;&#21462;&#20214;</button>
   </form>
+  <form class="inline-form" method="post" action="{ADMIN_PATH}/cleanup" onsubmit="return confirm('确认清理已过期的交付包和文件？')">
+    <input type="hidden" name="action" value="clear_expired">
+    <button class="secondary compact" type="submit">&#28165;&#29702;&#24050;&#36807;&#26399;</button>
+  </form>
   <form class="inline-form" method="post" action="{ADMIN_PATH}/cleanup" onsubmit="return confirm('\\u786e\\u8ba4\\u6e05\\u7a7a\\u5df2\\u66ff\\u6362\\u7684\\u65e7\\u5305\\uff1f')">
     <input type="hidden" name="action" value="clear_replaced">
     <button class="secondary compact" type="submit">&#28165;&#31354;&#24050;&#26367;&#25442;</button>
@@ -3704,7 +3713,7 @@ def admin_page(
         [
             item
             for item in bundles
-            if item.get("bound_client") and not item.get("replaced_by")
+            if item.get("bound_at") and not item.get("replaced_by")
         ],
         key=lambda item: str(item.get("bound_at") or ""),
         reverse=True,
@@ -3834,7 +3843,7 @@ def admin_page(
   <button class="admin-tab" type="button" data-admin-tab="announcement" role="tab" aria-selected="false">公告设置</button>
 </div>
 <section class="admin-tab-panel" data-admin-panel="upload">
-<p class="lead">上传一个或多个 JSON 文件，服务端会校验 JSON 格式并压缩为 ZIP。卡密由后台生成，用户首次取件后会自动绑定浏览器。</p>
+<p class="lead">上传一个或多个 JSON 文件，服务端会校验 JSON 格式并压缩为 ZIP。卡密由后台生成，首次取件后 24 小时内可重复下载。</p>
 <form id="uploadForm" class="panel upload-panel" method="post" action="{ADMIN_PATH}/upload" enctype="multipart/form-data">
   <div class="panel-title">
     <span>上传 JSON 并生成卡密</span>
@@ -4270,7 +4279,7 @@ def bundle_status(bundle: dict) -> tuple[str, str]:
         return "expired", "已过期"
     if not normalize_key(str(bundle.get("key") or "")):
         return "stock", "库存"
-    if bundle.get("bound_client"):
+    if bundle.get("bound_at"):
         return "claimed", "已取件"
     return "unused", "未取件"
 
@@ -4365,27 +4374,13 @@ def clear_session(handler: BaseHTTPRequestHandler) -> None:
     handler.send_header("Set-Cookie", "dg_session=; Max-Age=0; HttpOnly; Path=/; SameSite=Lax")
 
 
-def client_cookie_header(client_id: str) -> str:
-    return f"{CLIENT_COOKIE_NAME}={client_id}; Max-Age={CLIENT_COOKIE_MAX_AGE}; HttpOnly; Path=/; SameSite=Lax"
-
-
-def get_or_create_client(handler: BaseHTTPRequestHandler) -> tuple[str, dict[str, str]]:
-    cookie = parse_cookies(handler).get(CLIENT_COOKIE_NAME)
-    client_id = cookie.value if cookie else ""
-    if not client_id or len(client_id) < 24:
-        client_id = secrets.token_urlsafe(32)
-        return client_id, {"Set-Cookie": client_cookie_header(client_id)}
-    return client_id, {}
+def clear_client_cookie_headers() -> dict[str, str]:
+    return {"Set-Cookie": "dg_client=; Max-Age=0; HttpOnly; Path=/; SameSite=Lax"}
 
 
 def request_ip(handler: BaseHTTPRequestHandler) -> str:
     forwarded = (handler.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
     return forwarded or handler.client_address[0]
-
-
-def client_fingerprint(handler: BaseHTTPRequestHandler, client_id: str) -> str:
-    user_agent = (handler.headers.get("User-Agent") or "")[:300]
-    return hashlib.sha256(f"{client_id}|{user_agent}".encode("utf-8")).hexdigest()
 
 
 def cleanup_batch_downloads() -> None:
@@ -4438,7 +4433,6 @@ def prepare_claim_items(
     handler: BaseHTTPRequestHandler,
     manifest: dict,
     raw_keys: list[str],
-    client_id: str,
 ) -> tuple[list[dict], list[dict], bool]:
     keys: list[str] = []
     seen: set[str] = set()
@@ -4453,7 +4447,6 @@ def prepare_claim_items(
     if len(keys) > MAX_BATCH_KEYS:
         return [], [{"message": f"一次最多支持 {MAX_BATCH_KEYS} 个卡密批量取件", "status": HTTPStatus.BAD_REQUEST}], False
 
-    fingerprint = client_fingerprint(handler, client_id)
     pool_closed = bool(load_announcement().get("pool_closed"))
     items: list[dict] = []
     errors: list[dict] = []
@@ -4474,8 +4467,8 @@ def prepare_claim_items(
         if not bundle_payload_exists(bundle_id, bundle):
             errors.append({"message": f"{key}: 交付文件不存在，请联系管理员", "status": HTTPStatus.NOT_FOUND})
             continue
-        bound_client = str(bundle.get("bound_client") or "")
-        if bound_client and bundle_is_expired(bundle):
+        claimed_at = str(bundle.get("bound_at") or "")
+        if claimed_at and bundle_is_expired(bundle):
             expires_text = bundle_expires_text(bundle)
             errors.append(
                 {
@@ -4484,15 +4477,7 @@ def prepare_claim_items(
                 }
             )
             continue
-        if bound_client and not hmac.compare_digest(bound_client, fingerprint):
-            errors.append(
-                {
-                    "message": f"{key}: 卡密已绑定其他用户或设备，不能在当前浏览器下载",
-                    "status": HTTPStatus.FORBIDDEN,
-                }
-            )
-            continue
-        if not bound_client and pool_closed:
+        if not claimed_at and pool_closed:
             errors.append({"message": f"{key}: {pool_closed_message()}", "status": HTTPStatus.FORBIDDEN})
             continue
         items.append(
@@ -4500,7 +4485,7 @@ def prepare_claim_items(
                 "key": key,
                 "bundle_id": str(bundle_id),
                 "bundle": bundle,
-                "bind": not bool(bound_client),
+                "claim": not bool(claimed_at),
             }
         )
 
@@ -4521,8 +4506,8 @@ def prepare_claim_items(
                     continue
                 item["bundle"] = bundle
                 valid_items.append(item)
-                if item.get("bind") and not bundle.get("bound_client"):
-                    bundle["bound_client"] = fingerprint
+                if item.get("claim") and not bundle.get("bound_at"):
+                    bundle["bound_client"] = ""
                     bundle["bound_at"] = now_text()
                     bundle["bound_ip"] = request_ip(handler)
                     bundle["bound_user_agent"] = (handler.headers.get("User-Agent") or "")[:180]
@@ -4531,18 +4516,20 @@ def prepare_claim_items(
                         card["status"] = "claimed"
                         card["claimed_at"] = str(card.get("claimed_at") or now_text())
                     changed = True
+                elif bundle.get("bound_client"):
+                    bundle["bound_client"] = ""
+                    changed = True
             if changed:
                 save_manifest(manifest)
             items = valid_items
     return items, errors, changed
 
 
-def create_batch_download(handler: BaseHTTPRequestHandler, items: list[dict], client_id: str) -> dict:
+def create_batch_download(items: list[dict]) -> dict:
     cleanup_batch_downloads()
     token = secrets.token_urlsafe(24)
     batch = {
         "token": token,
-        "fingerprint": client_fingerprint(handler, client_id),
         "expires_at": time.time() + BATCH_DOWNLOAD_TTL_SECONDS,
         "zip_name": f"DG-BATCH-{time.strftime('%Y%m%d-%H%M%S', time.localtime())}-{len(items)}.zip",
         "items": [
@@ -4682,8 +4669,10 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
             return
         if path == "/":
             key = (query.get("key") or [""])[0]
-            _, headers = get_or_create_client(self)
-            self.send_html(user_page(initial_key=key), extra_headers=headers)
+            self.send_html(
+                user_page(initial_key=key),
+                extra_headers=clear_client_cookie_headers(),
+            )
             return
         if path == f"{ADMIN_PATH}/export.csv":
             if not is_admin(self):
@@ -5286,7 +5275,7 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
             targets = [
                 bundle_id
                 for bundle_id, bundle in list(bundles.items())
-                if not bundle.get("bound_client")
+                if not bundle.get("bound_at")
             ]
             if targets:
                 ensure_cleanup_backup()
@@ -5297,6 +5286,16 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
                 bundle_id
                 for bundle_id, bundle in list(bundles.items())
                 if bundle.get("replaced_by")
+            ]
+            if targets:
+                ensure_cleanup_backup()
+            for bundle_id in targets:
+                deleted += delete_bundle_from_manifest(manifest, bundle_id)
+        elif action == "clear_expired":
+            targets = [
+                bundle_id
+                for bundle_id, bundle in list(bundles.items())
+                if bundle_is_expired(bundle)
             ]
             if targets:
                 ensure_cleanup_backup()
@@ -5327,10 +5326,7 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
 
     def handle_claim(self) -> None:
         admin_request = False
-        client_id = ""
-        client_headers: dict[str, str] = {}
-        if not admin_request:
-            client_id, client_headers = get_or_create_client(self)
+        client_headers = clear_client_cookie_headers()
         try:
             payload = json.loads(self.read_body().decode("utf-8-sig"))
         except Exception:
@@ -5362,7 +5358,6 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "交付文件不存在，请管理员重新生成"}, HTTPStatus.NOT_FOUND, client_headers)
                 return
             if not admin_request:
-                fingerprint = client_fingerprint(self, client_id)
                 with MANIFEST_LOCK:
                     sync_manifest(manifest, load_manifest())
                     card = (manifest.get("cards") or {}).get(key)
@@ -5370,8 +5365,8 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
                     if not isinstance(card, dict) or not isinstance(bundle, dict):
                         self.send_json({"error": "卡密交付记录不存在"}, HTTPStatus.NOT_FOUND, client_headers)
                         return
-                    bound_client = str(bundle.get("bound_client") or "")
-                    if bound_client and bundle_is_expired(bundle):
+                    claimed_at = str(bundle.get("bound_at") or "")
+                    if claimed_at and bundle_is_expired(bundle):
                         expires_text = bundle_expires_text(bundle)
                         self.send_json(
                             {"error": f"该卡密首次取件后 24 小时有效，已于 {expires_text or '当前时间'} 过期"},
@@ -5379,14 +5374,7 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
                             client_headers,
                         )
                         return
-                    if bound_client and not hmac.compare_digest(bound_client, fingerprint):
-                        self.send_json(
-                            {"error": "该卡密已绑定其他用户或设备，不能在当前浏览器下载"},
-                            HTTPStatus.FORBIDDEN,
-                            client_headers,
-                        )
-                        return
-                    if not bound_client:
+                    if not claimed_at:
                         if load_announcement().get("pool_closed"):
                             self.send_json(
                                 {"error": pool_closed_message()},
@@ -5394,12 +5382,15 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
                                 client_headers,
                             )
                             return
-                        bundle["bound_client"] = fingerprint
+                        bundle["bound_client"] = ""
                         bundle["bound_at"] = now_text()
                         bundle["bound_ip"] = request_ip(self)
                         bundle["bound_user_agent"] = (self.headers.get("User-Agent") or "")[:180]
                         card["status"] = "claimed"
                         card["claimed_at"] = str(card.get("claimed_at") or now_text())
+                        save_manifest(manifest)
+                    elif bundle.get("bound_client"):
+                        bundle["bound_client"] = ""
                         save_manifest(manifest)
 
         download_path = bundle_download_path(bundle_id, bundle)
@@ -5449,7 +5440,7 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
         )
 
     def handle_claim_batch(self) -> None:
-        client_id, client_headers = get_or_create_client(self)
+        client_headers = clear_client_cookie_headers()
         try:
             payload = json.loads(self.read_body().decode("utf-8-sig"))
         except Exception:
@@ -5467,7 +5458,7 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
 
         with lock_card_keys(keys):
             manifest = load_manifest()
-            items, errors, _changed = prepare_claim_items(self, manifest, keys, client_id)
+            items, errors, _changed = prepare_claim_items(self, manifest, keys)
         if errors and not items:
             statuses = [int(item.get("status") or HTTPStatus.BAD_REQUEST) for item in errors]
             status = (
@@ -5489,7 +5480,7 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
             )
             return
 
-        batch = create_batch_download(self, items, client_id)
+        batch = create_batch_download(items)
         total_files = sum(
             3
             if bundle_payload_path(item["bundle_id"], item["bundle"])
@@ -5533,11 +5524,7 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
             self.send_html(user_page("批量下载链接已过期，请重新输入卡密取件。"), HTTPStatus.GONE)
             return
 
-        client_id, client_headers = get_or_create_client(self)
-        fingerprint = client_fingerprint(self, client_id)
-        if not hmac.compare_digest(str(batch.get("fingerprint") or ""), fingerprint):
-            self.send_html(user_page("批量下载链接已绑定原取件浏览器，当前浏览器不能下载。"), HTTPStatus.FORBIDDEN, client_headers)
-            return
+        client_headers = clear_client_cookie_headers()
 
         manifest = load_manifest()
         errors: list[str] = []
@@ -5551,15 +5538,12 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
             if not bundle_payload_exists(bundle_id, bundle):
                 errors.append(f"{key}: 交付文件不存在")
                 continue
-            bound_client = str(bundle.get("bound_client") or "")
-            if not bound_client:
+            if not bundle.get("bound_at"):
                 errors.append(f"{key}: 请重新输入卡密取件后再下载")
                 continue
             if bundle_is_expired(bundle):
                 errors.append(f"{key}: 卡密取件有效期已过")
                 continue
-            if not hmac.compare_digest(bound_client, fingerprint):
-                errors.append(f"{key}: 卡密已绑定其他用户或设备")
         if errors:
             self.send_html(user_page("；".join(errors)), HTTPStatus.FORBIDDEN, client_headers)
             return
@@ -5593,7 +5577,7 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
         admin_download = is_admin(self) and (query.get("admin") or [""])[0] == "1"
         client_headers: dict[str, str] = {}
         if not admin_download:
-            client_id, client_headers = get_or_create_client(self)
+            client_headers = clear_client_cookie_headers()
             key = normalize_key((query.get("key") or [""])[0])
             expected_id = manifest.get("keys", {}).get(key)
             if expected_id != bundle_id:
@@ -5603,8 +5587,7 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
                     client_headers,
                 )
                 return
-            bound_client = str(bundle.get("bound_client") or "")
-            if not bound_client:
+            if not bundle.get("bound_at"):
                 if load_announcement().get("pool_closed"):
                     self.send_html(
                         user_page(pool_closed_message(), initial_key=key),
@@ -5613,7 +5596,7 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
                     )
                     return
                 self.send_html(
-                    user_page("卡密还没有绑定，请先回到取件页输入卡密。", initial_key=key),
+                    user_page("卡密还没有完成首次取件，请先回到取件页输入卡密。", initial_key=key),
                     HTTPStatus.FORBIDDEN,
                     client_headers,
                 )
@@ -5622,14 +5605,6 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
                 expires_text = bundle_expires_text(bundle)
                 self.send_html(
                     user_page(f"该卡密首次取件后 24 小时有效，已于 {expires_text or '当前时间'} 过期。"),
-                    HTTPStatus.FORBIDDEN,
-                    client_headers,
-                )
-                return
-            fingerprint = client_fingerprint(self, client_id)
-            if not hmac.compare_digest(bound_client, fingerprint):
-                self.send_html(
-                    user_page("该卡密已绑定其他用户或设备，当前浏览器不能下载。"),
                     HTTPStatus.FORBIDDEN,
                     client_headers,
                 )

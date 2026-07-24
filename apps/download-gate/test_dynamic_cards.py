@@ -57,6 +57,7 @@ class DynamicCardTests(unittest.TestCase):
         migrated = gate.load_manifest()
         self.assertEqual(migrated["cards"]["OLD-CARD"]["status"], "claimed")
         self.assertEqual(migrated["cards"]["OLD-CARD"]["bundle_id"], "old-bundle")
+        self.assertEqual(migrated["bundles"]["old-bundle"]["bound_client"], "")
 
     def test_legacy_utc_card_times_are_migrated_once_for_shanghai(self):
         manifest = {
@@ -214,14 +215,14 @@ class DynamicCardTests(unittest.TestCase):
         self.assertIn("账号存活验证通过", page)
 
     def test_card_status_labels_are_localized(self):
-        self.assertEqual(gate.card_status_view({"status": "issued"}), ("issued", "待验活"))
+        self.assertEqual(gate.card_status_view({"status": "issued"}), ("issued", "待领取"))
         self.assertEqual(
             gate.card_status_view({"status": "provisioning"}),
-            ("provisioning", "正在验活"),
+            ("provisioning", "正在分配"),
         )
         self.assertEqual(
             gate.card_status_view({"status": "claimed"}),
-            ("claimed", "验活成功 · 已领取"),
+            ("claimed", "领取成功"),
         )
         self.assertEqual(
             gate.card_status_view({"status": "issued", "last_error": "timed out"}),
@@ -731,7 +732,6 @@ class DynamicCardTests(unittest.TestCase):
                 handler,
                 manifest,
                 [first, second],
-                "client-id",
             )
 
         self.assertTrue(changed)
@@ -740,8 +740,50 @@ class DynamicCardTests(unittest.TestCase):
         self.assertIn(second, errors[0]["message"])
         saved = gate.load_manifest()
         bundle_id = saved["keys"][first]
-        self.assertTrue(saved["bundles"][bundle_id]["bound_client"])
+        self.assertTrue(saved["bundles"][bundle_id]["bound_at"])
+        self.assertFalse(saved["bundles"][bundle_id]["bound_client"])
         self.assertEqual(saved["cards"][second]["status"], "issued")
+
+    def test_claimed_card_is_not_bound_to_browser(self):
+        manifest = gate.load_manifest()
+        key = gate.issue_cards(manifest, 1, "no-browser-binding")[0]
+        gate.save_manifest(manifest)
+        responses = [
+            {
+                "state": "ready",
+                "order_id": "order-1",
+                "lease_id": "lease-1",
+                "lease_token": "token-1",
+            },
+            {
+                "state": "consumed",
+                "order_id": "order-1",
+                "account_id": "acct-1",
+                "document": {"account_id": "acct-1", "email": "open@example.com"},
+            },
+        ]
+        first_handler = SimpleNamespace(
+            headers={"User-Agent": "browser-one"},
+            client_address=("127.0.0.1", 1234),
+        )
+        with patch.object(gate, "console_json_post", side_effect=responses):
+            items, errors, changed = gate.prepare_claim_items(first_handler, manifest, [key])
+
+        self.assertTrue(changed)
+        self.assertFalse(errors)
+        self.assertEqual([item["key"] for item in items], [key])
+        saved = gate.load_manifest()
+        bundle = saved["bundles"][saved["keys"][key]]
+        self.assertTrue(bundle["bound_at"])
+        self.assertFalse(bundle["bound_client"])
+
+        second_handler = SimpleNamespace(
+            headers={"User-Agent": "browser-two"},
+            client_address=("203.0.113.5", 4321),
+        )
+        items, errors, _changed = gate.prepare_claim_items(second_handler, saved, [key])
+        self.assertFalse(errors)
+        self.assertEqual([item["key"] for item in items], [key])
 
 
 if __name__ == "__main__":
