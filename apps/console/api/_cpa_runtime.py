@@ -152,7 +152,11 @@ class CpaMintRuntime:
             except queue.Empty:
                 continue
             try:
-                ok, error = self._mint_account(account_id, force=force)
+                try:
+                    ok, error = self._mint_account(account_id, force=force)
+                except Exception as exc:
+                    ok, error = False, str(exc)[:500]
+                    print(f"[cpa-prevalidate] account={account_id} unexpected_error={error}")
                 self._finish_job(job_id, success=ok, error=error)
             finally:
                 with self._lock:

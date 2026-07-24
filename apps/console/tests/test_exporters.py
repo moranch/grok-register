@@ -128,6 +128,28 @@ class ExporterTests(unittest.TestCase):
         self.assertNotIn("json", kwargs)
         self.assertNotIn("model", str(kwargs).lower())
 
+    def test_cpa_identity_probe_falls_back_to_direct_when_proxy_times_out(self):
+        proxy_session = Mock()
+        proxy_session.request.side_effect = TimeoutError("proxy timed out")
+        direct_response = Mock(status_code=200, text='{"sub":"account-1"}')
+        direct_session = Mock()
+        direct_session.request.return_value = direct_response
+
+        with patch(
+            "core.cpa_auth.curl_requests.Session",
+            side_effect=[proxy_session, direct_session],
+        ):
+            result = probe_cpa_account(
+                "access",
+                proxy="socks5://warp:1080",
+                timeout=5,
+            )
+
+        self.assertTrue(result["account_alive"])
+        self.assertEqual(result["transport"], "direct_fallback")
+        self.assertEqual(proxy_session.proxies, {"http": "socks5://warp:1080", "https": "socks5://warp:1080"})
+        self.assertEqual(direct_session.proxies, {})
+
     def test_cpa_probe_marks_explicit_suspension_as_banned(self):
         result = self._probe_response(403, '{"error":"account suspended"}')
         self.assertFalse(result["ok"])

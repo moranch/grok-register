@@ -321,11 +321,12 @@ def probe_cpa_account(
     verify_tls: bool = True,
 ) -> dict[str, Any]:
     """Verify the OAuth identity only; never call a model endpoint."""
-    session = curl_requests.Session()
-    session.proxies = _proxies(proxy) or {}
-    session.verify = verify_tls
-    try:
-        response = _request_with_retry(
+
+    def request_identity(proxy_url: str):
+        session = curl_requests.Session()
+        session.proxies = _proxies(proxy_url) or {}
+        session.verify = verify_tls
+        return _request_with_retry(
             session,
             "GET",
             CPA_USERINFO_URL,
@@ -337,6 +338,22 @@ def probe_cpa_account(
             impersonate="chrome",
             timeout=timeout,
         )
+
+    transport = "proxy" if proxy else "direct"
+    try:
+        try:
+            response = request_identity(proxy)
+        except Exception as proxy_error:
+            if not proxy:
+                raise
+            try:
+                response = request_identity("")
+                transport = "direct_fallback"
+            except Exception as direct_error:
+                raise RuntimeError(
+                    f"proxy identity check failed: {proxy_error}; "
+                    f"direct identity check failed: {direct_error}"
+                ) from direct_error
         status = int(response.status_code)
         summary = str(getattr(response, "text", "") or "").replace("\n", " ").strip()[:500]
         lowered = summary.lower()
@@ -390,6 +407,7 @@ def probe_cpa_account(
             "status": status,
             "probe_kind": "account_identity",
             "probe_version": 3,
+            "transport": transport,
             "account_state": account_state,
             "banned": banned,
             "failure_kind": failure_kind,
@@ -404,6 +422,7 @@ def probe_cpa_account(
             "status": 0,
             "probe_kind": "account_identity",
             "probe_version": 3,
+            "transport": transport,
             "account_state": "unknown",
             "banned": False,
             "failure_kind": "transient",
