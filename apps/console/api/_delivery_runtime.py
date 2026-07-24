@@ -13,8 +13,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from core.cpa_auth import probe_cpa_account
-
 from . import _shared
 
 
@@ -390,7 +388,6 @@ def _probe_account(account_id: int, required_model: str) -> dict[str, Any]:
 
         cpa_config = cpa_mint_runtime.config()
     except Exception:
-        cpa_mint_runtime = None
         cpa_config = {}
     cpa_extra = cpa_config.get("extra") if isinstance(cpa_config.get("extra"), dict) else {}
     try:
@@ -423,61 +420,19 @@ def _probe_account(account_id: int, required_model: str) -> dict[str, Any]:
             result["delivery_eligible"] = True
             result["cache_hit"] = True
             return result
-    try:
-        probe_timeout = min(max(5, int(cpa_extra.get("identity_timeout", 12))), 30)
-    except (TypeError, ValueError):
-        probe_timeout = 12
-
-    def run_probe() -> dict[str, Any]:
-        accounts = _shared.account_list_by_ids([account_id])
-        if not accounts:
-            return {"ok": False, "error": "account not found"}
-        account = accounts[0]
-        tokens = account.get("tokens") or {}
-        try:
-            extra = json.loads(account.get("extra_json") or "{}")
-        except Exception:
-            extra = {}
-        access_token = str(tokens.get("access_token") or "")
-        if not access_token:
-            return {
-                "ok": False,
-                "account_alive": False,
-                "delivery_eligible": False,
-                "error": "access_token is empty",
-                "failure_kind": "token_expired",
-                "refresh_recommended": True,
-                "banned": False,
-                "probe_kind": "account_identity",
-            }
-        result = probe_cpa_account(
-            access_token,
-            proxy=str(cpa_extra.get("proxy") or account.get("proxy_url") or ""),
-            timeout=probe_timeout,
-            verify_tls=bool(cpa_extra.get("verify_tls", True)),
-        )
-        result["required_model"] = ""
-        result["delivery_eligible"] = bool(result.get("account_alive", result.get("ok")))
-        return result
-
-    first = run_probe()
-    if first.get("account_alive", first.get("ok")):
-        return first
-    if not first.get("refresh_recommended"):
-        return first
-    if cpa_mint_runtime is None:
-        minted, mint_error = False, "CPA mint runtime is unavailable"
-    else:
-        try:
-            minted, mint_error = cpa_mint_runtime._mint_account(account_id, force=True)
-        except Exception as exc:
-            minted, mint_error = False, str(exc)
-    second = run_probe() if minted else dict(first)
-    second["mint_attempted"] = True
-    second["mint_ok"] = bool(minted)
-    if mint_error:
-        second["mint_error"] = str(mint_error)[:500]
-    return second
+    # 领取请求绝不现场访问 OAuth 或执行 token 续期。只有后台验活线程近期
+    # 确认存活的 Grok 账号才能进入交付；无缓存时应立即返回库存不足。
+    return {
+        "ok": False,
+        "account_alive": False,
+        "delivery_eligible": False,
+        "error": "account has no recent background validation",
+        "failure_kind": "unverified",
+        "refresh_recommended": False,
+        "banned": False,
+        "probe_kind": "account_identity",
+        "required_model": "",
+    }
 
 
 def _delivery_candidate_rows(platform: str) -> list[sqlite3.Row]:
@@ -681,6 +636,24 @@ def reserve(
                       )
                       AND a.lifecycle_status NOT IN ('expired', 'invalid')
                       AND a.validity_status <> 'invalid'
+                      AND (
+                          ? <> 'grok'
+                          OR (
+                              COALESCE(
+                                  json_extract(a.extra_json, '$.cpa.probe.account_alive'),
+                                  json_extract(a.extra_json, '$.cpa.probe.ok'),
+                                  0
+                              ) = 1
+                              AND COALESCE(
+                                  json_extract(a.extra_json, '$.cpa.probe.probe_kind'), ''
+                              ) IN ('account_identity', 'account_response')
+                              AND COALESCE(
+                                  json_extract(a.extra_json, '$.cpa.probe_checked_at'),
+                                  json_extract(a.extra_json, '$.cpa.updated_at'),
+                                  ''
+                              ) >= ?
+                          )
+                      )
                       AND NOT EXISTS (
                           SELECT 1 FROM account_delivery_consumptions c
                           WHERE c.account_id=a.id
@@ -728,6 +701,8 @@ def reserve(
                         platform,
                         platform,
                         platform,
+                        platform,
+                        prevalidate_cutoff,
                         order_id,
                         (datetime.now() - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S"),
                         platform,
@@ -737,10 +712,10 @@ def reserve(
                 if not candidate:
                     conn.execute(
                         "UPDATE delivery_orders SET state='pending', last_error=?, updated_at=? WHERE id=?",
-                        ("no active account is available", now, order_id),
+                        ("no recently verified account is available", now, order_id),
                     )
                     _finish(conn, ok=True)
-                    raise DeliveryUnavailable("no active account is available")
+                    raise DeliveryUnavailable("no recently verified account is available")
                 lease_id = uuid.uuid4().hex
                 lease_token = uuid.uuid4().hex + uuid.uuid4().hex
                 expires_at = (

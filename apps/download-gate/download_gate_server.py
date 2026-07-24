@@ -45,7 +45,7 @@ ADMIN_PATH = normalize_admin_path(os.environ.get("DOWNLOAD_GATE_ADMIN_PATH", "/d
 INTERNAL_API_TOKEN = os.environ.get("DOWNLOAD_GATE_INTERNAL_TOKEN", "").strip()
 CONSOLE_URL = os.environ.get("DOWNLOAD_GATE_CONSOLE_URL", "").strip().rstrip("/")
 CONSOLE_TIMEOUT_SECONDS = max(int(os.environ.get("DOWNLOAD_GATE_CONSOLE_TIMEOUT", "120") or 120), 5)
-APP_VERSION = "2026.07.25.03"
+APP_VERSION = "2026.07.25.04"
 CLAIM_TTL_SECONDS = 24 * 60 * 60
 BATCH_DOWNLOAD_TTL_SECONDS = 10 * 60
 MAX_BATCH_KEYS = 20
@@ -57,7 +57,7 @@ CARD_KEY_GROUP_SIZE = 4
 CARD_KEY_DEFAULT_LENGTH = 12
 CARD_KEY_LENGTHS = (12, 16, 20)
 CARD_STATUS_LABELS = {
-    "issued": "待领取",
+    "issued": "未使用卡密",
     "provisioning": "正在分配",
     "claimed": "领取成功",
     "retryable": "领取超时 · 可重试",
@@ -2828,7 +2828,7 @@ def user_page(message: str = "", *, initial_key: str = "") -> bytes:
   <div class="live-pool-detail">
     <div class="live-pool-heading"><span>Grok 账号池</span><span id="livePoolCandidate">候选库存 --</span></div>
     <div class="live-pool-track" aria-hidden="true"><span id="livePoolBar"></span></div>
-    <div id="livePoolRule" class="live-pool-meta">账号由后台独立验活；领取时优先使用近期已验证库存。</div>
+    <div id="livePoolRule" class="live-pool-meta">账号由后台独立验活；领取仅使用近期已验证库存。</div>
   </div>
 </section>
 {announcement_html}
@@ -2906,6 +2906,8 @@ const defaultSubClaimText = claimSubBtn ? claimSubBtn.textContent : '下载 Sub2
 const defaultCockpitClaimText = claimCockpitBtn ? claimCockpitBtn.textContent : '下载 Cockpit auth.json';
 const poolClosed = {pool_closed_js};
 const poolClosedMessage = {pool_closed_message_js};
+let livePoolKnown = false;
+let livePoolAvailableCount = 0;
 async function refreshLivePool(){{
   try{{
     const response = await fetch('/api/pool-summary', {{cache:'no-store', credentials:'same-origin'}});
@@ -2920,17 +2922,22 @@ async function refreshLivePool(){{
     livePoolAvailable.textContent = known ? `${{available}} 个` : '--';
     livePoolCandidate.textContent = known ? `候选库存 ${{candidate}}` : '候选库存 --';
     livePoolBar.style.width = `${{known ? percent : 0}}%`;
+    livePoolKnown = known;
+    livePoolAvailableCount = available;
     livePoolStatus.textContent = known
-      ? (available > 0 ? '号池在线，可提交卡密兑换' : '暂无近期验活库存，兑换时将现场尝试验活')
+      ? (available > 0 ? '号池在线，可提交卡密兑换' : '暂无近期验活库存，新卡暂不可领取')
       : '号池状态暂时读取失败';
     livePoolRule.textContent = known
       ? `近 ${{ttl || 60}} 分钟账号存活验证通过；额度或模型权限不足不阻止凭据打包。`
-      : '账号由后台独立验活；领取时优先使用近期已验证库存。';
+      : '账号由后台独立验活；领取仅使用近期已验证库存。';
+    updateKeyHint();
   }}catch(_error){{
     livePoolAvailable.textContent = '--';
     livePoolCandidate.textContent = '候选库存 --';
     livePoolBar.style.width = '0%';
     livePoolStatus.textContent = '号池状态暂时读取失败';
+    livePoolKnown = false;
+    updateKeyHint();
   }}
 }}
 function esc(s){{return String(s ?? '').replace(/[&<>"]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c]));}}
@@ -3010,21 +3017,30 @@ if(poolClosedModal){{
 }}
 function updateKeyHint(){{
   const keys = extractKeys(q.value);
+  const noVerifiedStock = livePoolKnown && livePoolAvailableCount <= 0;
   if(!keyCountHint) return keys;
   setClaimButtonMode(keys.length > 1);
   keyCountHint.classList.toggle('is-batch', keys.length > 1 || poolClosed);
   if(keys.length > 1){{
     keyCountHint.innerHTML = poolClosed
       ? `已识别 <strong>${{keys.length}}</strong> 个卡密。当前号池为空：未激活卡密暂不可取件；已取件卡密可合并下载。`
-      : `已识别 <strong>${{keys.length}}</strong> 个卡密，每个账号的 CPA、Sub2API 与 Cockpit 文件会分目录合并成 1 个 ZIP。`;
+      : (noVerifiedStock
+          ? `已识别 <strong>${{keys.length}}</strong> 个卡密。近期验活库存为 0：新卡暂不可领取，已领取卡密仍可合并下载。`
+          : `已识别 <strong>${{keys.length}}</strong> 个卡密，每个账号的 CPA、Sub2API 与 Cockpit 文件会分目录合并成 1 个 ZIP。`);
     setClaimButtonText('批量下载三格式 ZIP');
   }}else if(keys.length === 1){{
     keyCountHint.innerHTML = poolClosed
       ? '已识别 <strong>1</strong> 个卡密。当前号池为空：未激活卡密暂不可取件；已取件卡密可下载。'
-      : '已识别 <strong>1</strong> 个卡密，请分别选择 CPA、Sub2API 或 Cockpit。';
+      : (noVerifiedStock
+          ? '已识别 <strong>1</strong> 个卡密。近期验活库存为 0：新卡暂不可领取，已领取卡密仍可下载。'
+          : '已识别 <strong>1</strong> 个卡密，请分别选择 CPA、Sub2API 或 Cockpit。');
     setClaimButtonText(defaultClaimText);
   }}else{{
-    keyCountHint.textContent = poolClosed ? poolClosedMessage : '单卡可分别下载 CPA、Sub2API 或 Cockpit；多卡会按三种格式分目录合并下载。';
+    keyCountHint.textContent = poolClosed
+      ? poolClosedMessage
+      : (noVerifiedStock
+          ? '近期验活库存为 0；新卡暂不可领取，已领取卡密仍可重新下载。'
+          : '单卡可分别下载 CPA、Sub2API 或 Cockpit；多卡会按三种格式分目录合并下载。');
     setClaimButtonText(defaultClaimText);
   }}
   return keys;
@@ -3044,12 +3060,16 @@ async function performClaim(keys, downloadKind='cpa'){{
   const oldText = claimBtn ? claimBtn.textContent : '';
   const oldSubText = claimSubBtn ? claimSubBtn.textContent : '';
   const oldCockpitText = claimCockpitBtn ? claimCockpitBtn.textContent : '';
-  if(claimBtn){{claimBtn.disabled = true; claimBtn.textContent = '正在分配'; claimBtn.setAttribute('aria-busy', 'true');}}
-  if(claimSubBtn){{claimSubBtn.disabled = true; claimSubBtn.textContent = '正在分配'; claimSubBtn.setAttribute('aria-busy', 'true');}}
-  if(claimCockpitBtn){{claimCockpitBtn.disabled = true; claimCockpitBtn.textContent = '正在分配'; claimCockpitBtn.setAttribute('aria-busy', 'true');}}
-  hint.innerHTML='<div class="note warn">正在分配存活账号并生成文件...</div>';res.innerHTML='';
+  const batch = keys.length > 1;
+  const activeButton = batch || downloadKind === 'cpa'
+    ? claimBtn
+    : (downloadKind === 'sub2api' ? claimSubBtn : claimCockpitBtn);
+  if(claimBtn){{claimBtn.disabled = true; claimBtn.setAttribute('aria-busy', 'true');}}
+  if(claimSubBtn){{claimSubBtn.disabled = true; claimSubBtn.setAttribute('aria-busy', 'true');}}
+  if(claimCockpitBtn){{claimCockpitBtn.disabled = true; claimCockpitBtn.setAttribute('aria-busy', 'true');}}
+  if(activeButton) activeButton.textContent = '正在分配';
+  hint.innerHTML='<div class="note warn">正在分配近期已验活账号并生成文件...</div>';res.innerHTML='';
   try{{
-    const batch = keys.length > 1;
     const r = await fetch(batch ? '/api/claim-batch' : '/api/claim', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(batch ? {{keys}} : {{key:value}})}}).then(x=>x.json());
     if(r.error){{
       hint.innerHTML='<div class="note err">'+esc(r.error)+'</div>';
@@ -3517,9 +3537,9 @@ def admin_page(
         for platform in CARD_PLATFORMS
     )
     cards_panel = f"""
-<p class="lead">账号由后台独立自动验活，预发行卡密不预占账号。用户首次取件时优先从近期已验证的账号池分配并原子打包；同一卡密只对应一个账号和一个交付包。</p>
+<p class="lead">账号由后台独立自动验活，预发行卡密不预占账号。用户首次取件时仅从近期已验证的账号池分配并原子打包；同一卡密只对应一个账号和一个交付包。</p>
 <section class="admin-summary" aria-label="卡密统计">
-  <div class="stat"><span class="k">待领取</span><span class="v">{card_counts['issued']}</span></div>
+  <div class="stat"><span class="k">未使用卡密</span><span class="v">{card_counts['issued']}</span></div>
   <div class="stat"><span class="k">正在分配</span><span class="v">{card_counts['provisioning']}</span></div>
   <div class="stat"><span class="k">领取成功</span><span class="v">{card_counts['claimed']}</span></div>
   <div class="stat"><span class="k">领取超时可重试</span><span class="v">{card_counts['retryable']}</span></div>
@@ -5366,9 +5386,17 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
             try:
                 bundle_id, bundle = provision_card_bundle(manifest, key)
             except Exception as exc:
+                error_text = str(exc)
+                no_verified_stock = "no recently verified account is available" in error_text.lower()
                 self.send_json(
-                    {"error": f"自动验活打包失败：{exc}"},
-                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {
+                        "error": (
+                            "暂无近期验活可交付账号，请等待后台验活完成后重试"
+                            if no_verified_stock
+                            else f"账号分配打包失败：{exc}"
+                        )
+                    },
+                    HTTPStatus.CONFLICT if no_verified_stock else HTTPStatus.SERVICE_UNAVAILABLE,
                     client_headers,
                 )
                 return

@@ -92,19 +92,18 @@ class DeliveryRuntimeTests(unittest.TestCase):
         ):
             _delivery_runtime.prepare_selected_request([grok_id, kiro_id], "mixed")
 
-    def set_prevalidation(self, account_id: int, checked_at: str, model_ids=None) -> None:
+    def set_prevalidation(self, account_id: int, checked_at: str) -> None:
         row = _shared.fetch_one("SELECT extra_json FROM accounts WHERE id=?", (account_id,))
         extra = json.loads(row["extra_json"] or "{}")
-        models = list(model_ids if model_ids is not None else ["grok-4.5"])
         extra["cpa"] = {
             "status": "ready",
             "probe": {
                 "ok": True,
+                "account_alive": True,
+                "delivery_eligible": True,
                 "status": 200,
-                "model_ids": models,
-                "has_grok_45": "grok-4.5" in models,
-                "probe_kind": "account_response",
-                "probe_version": 2,
+                "probe_kind": "account_identity",
+                "probe_version": 3,
             },
             "probe_checked_at": checked_at,
             "updated_at": checked_at,
@@ -118,12 +117,7 @@ class DeliveryRuntimeTests(unittest.TestCase):
         account_id = self.add_account("cached@example.com", "cached-sub")
         self.set_prevalidation(account_id, _shared.now_iso())
 
-        with patch.object(
-            _delivery_runtime,
-            "probe_cpa_account",
-            side_effect=AssertionError("live probe should not run"),
-        ):
-            reservation = _delivery_runtime.reserve("CACHED-CARD")
+        reservation = _delivery_runtime.reserve("CACHED-CARD")
 
         lease = _shared.fetch_one(
             "SELECT account_id, probe_json FROM account_delivery_leases WHERE id=?",
@@ -142,12 +136,7 @@ class DeliveryRuntimeTests(unittest.TestCase):
         )
         self.set_prevalidation(recent_id, _shared.now_iso())
 
-        with patch.object(
-            _delivery_runtime,
-            "probe_cpa_account",
-            side_effect=AssertionError("stale account should not be selected"),
-        ):
-            reservation = _delivery_runtime.reserve("PRIORITY-CARD")
+        reservation = _delivery_runtime.reserve("PRIORITY-CARD")
 
         lease = _shared.fetch_one(
             "SELECT account_id FROM account_delivery_leases WHERE id=?",
@@ -155,48 +144,30 @@ class DeliveryRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(int(lease["account_id"]), recent_id)
 
-    def test_expired_prevalidation_falls_back_to_live_probe(self):
+    def test_expired_prevalidation_is_rejected_without_live_probe(self):
         account_id = self.add_account("expired-cache@example.com", "expired-cache-sub")
         self.set_prevalidation(
             account_id,
             (datetime.now() - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S"),
         )
-        live_result = {
-            "ok": True,
-            "account_alive": True,
-            "status": 200,
-            "probe_kind": "account_identity",
-        }
-        with patch.object(
-            _delivery_runtime,
-            "probe_cpa_account",
-            return_value=live_result,
-        ) as live_probe:
-            reservation = _delivery_runtime.reserve("EXPIRED-CACHE-CARD")
+        with patch("api._cpa_runtime.cpa_mint_runtime._mint_account") as mint:
+            with self.assertRaisesRegex(
+                _delivery_runtime.DeliveryUnavailable,
+                "no recently verified account",
+            ):
+                _delivery_runtime.reserve("EXPIRED-CACHE-CARD")
 
-        live_probe.assert_called_once()
-        lease = _shared.fetch_one(
-            "SELECT account_id, state FROM account_delivery_leases WHERE id=?",
-            (reservation["lease_id"],),
+        mint.assert_not_called()
+        self.assertIsNone(
+            _shared.fetch_one(
+                "SELECT id FROM account_delivery_leases WHERE account_id=?", (account_id,)
+            )
         )
-        self.assertEqual(int(lease["account_id"]), account_id)
-        self.assertEqual(lease["state"], "ready")
 
     def test_alive_account_can_be_delivered_without_model_validation(self):
         account_id = self.add_account("alive@example.com", "alive-sub")
-        identity_probe = {
-            "ok": True,
-            "account_alive": True,
-            "delivery_eligible": True,
-            "status": 200,
-            "probe_kind": "account_identity",
-        }
-        with patch.object(
-            _delivery_runtime,
-            "probe_cpa_account",
-            return_value=identity_probe,
-        ):
-            reservation = _delivery_runtime.reserve("ALIVE-CARD")
+        self.set_prevalidation(account_id, _shared.now_iso())
+        reservation = _delivery_runtime.reserve("ALIVE-CARD")
 
         lease = _shared.fetch_one(
             "SELECT account_id, state, probe_json FROM account_delivery_leases WHERE id=?",
@@ -206,66 +177,42 @@ class DeliveryRuntimeTests(unittest.TestCase):
         self.assertEqual(lease["state"], "ready")
         self.assertTrue(json.loads(lease["probe_json"])["account_alive"])
 
-    def test_explicitly_banned_account_is_removed_without_mint(self):
-        account_id = self.add_account("banned@example.com", "banned-sub")
-        banned_probe = {
-            "ok": False,
-            "account_alive": False,
-            "status": 403,
-            "probe_kind": "account_identity",
-            "probe_version": 3,
-            "account_state": "banned",
-            "banned": True,
-            "failure_kind": "banned",
-            "refresh_recommended": False,
-            "error": "account suspended",
-        }
-        with (
-            patch.object(_delivery_runtime, "probe_cpa_account", return_value=banned_probe),
-            patch("api._cpa_runtime.cpa_mint_runtime._mint_account") as mint,
-        ):
-            with self.assertRaises(_delivery_runtime.DeliveryUnavailable):
-                _delivery_runtime.reserve("BANNED-CARD")
+    def test_unverified_account_is_rejected_without_mint(self):
+        account_id = self.add_account("unverified@example.com", "unverified-sub")
+        with patch("api._cpa_runtime.cpa_mint_runtime._mint_account") as mint:
+            with self.assertRaisesRegex(
+                _delivery_runtime.DeliveryUnavailable,
+                "no recently verified account",
+            ):
+                _delivery_runtime.reserve("UNVERIFIED-CARD")
 
         mint.assert_not_called()
         account = _shared.fetch_one(
-            "SELECT validity_status, lifecycle_status, last_error FROM accounts WHERE id=?",
+            "SELECT validity_status, lifecycle_status FROM accounts WHERE id=?",
             (account_id,),
         )
-        self.assertEqual(account["validity_status"], "invalid")
-        self.assertEqual(account["lifecycle_status"], "suspended")
-        self.assertIn("suspended", account["last_error"])
+        self.assertEqual(account["validity_status"], "valid")
+        self.assertEqual(account["lifecycle_status"], "registered")
 
-    def test_transient_identity_failure_stops_after_one_account(self):
+    def test_zero_verified_stock_returns_without_probing_any_account(self):
         self.add_account("first-transient@example.com", "first-transient")
         self.add_account("second-transient@example.com", "second-transient")
-        probed: list[int] = []
-
-        def transient_probe(account_id, _required_model):
-            probed.append(account_id)
-            return {
-                "ok": False,
-                "account_alive": False,
-                "status": 0,
-                "failure_kind": "transient",
-                "refresh_recommended": False,
-                "error": "timed out",
-            }
-
-        with patch.object(_delivery_runtime, "_probe_account", side_effect=transient_probe):
-            with self.assertRaisesRegex(_delivery_runtime.DeliveryUnavailable, "timed out"):
+        with patch.object(_delivery_runtime, "_probe_account") as probe:
+            with self.assertRaisesRegex(
+                _delivery_runtime.DeliveryUnavailable,
+                "no recently verified account",
+            ):
                 _delivery_runtime.reserve("TRANSIENT-CARD")
 
-        self.assertEqual(len(probed), 1)
-        leases = _shared.fetch_all(
-            "SELECT state, last_error FROM account_delivery_leases ORDER BY created_at"
+        probe.assert_not_called()
+        self.assertEqual(
+            _shared.fetch_one("SELECT COUNT(*) count FROM account_delivery_leases")["count"],
+            0,
         )
-        self.assertEqual(len(leases), 1)
-        self.assertEqual(leases[0]["state"], "failed")
-        self.assertEqual(leases[0]["last_error"], "timed out")
 
     def test_stale_probing_lease_is_recovered_after_two_minutes(self):
         account_id = self.add_account("stale-lease@example.com", "stale-lease")
+        self.set_prevalidation(account_id, _shared.now_iso())
         old_time = (datetime.now() - timedelta(minutes=3)).strftime("%Y-%m-%d %H:%M:%S")
         future_expiry = (datetime.now() + timedelta(minutes=7)).strftime("%Y-%m-%d %H:%M:%S")
         order_id = _shared.execute(
@@ -285,12 +232,7 @@ class DeliveryRuntimeTests(unittest.TestCase):
             (order_id, account_id, old_time, old_time, future_expiry),
         )
 
-        with patch.object(
-            _delivery_runtime,
-            "_probe_account",
-            return_value={"ok": True, "account_alive": True},
-        ):
-            reservation = _delivery_runtime.reserve("STALE-LEASE-CARD")
+        reservation = _delivery_runtime.reserve("STALE-LEASE-CARD")
 
         self.assertNotEqual(reservation["lease_id"], "stale-lease")
         old_lease = _shared.fetch_one(
@@ -302,21 +244,18 @@ class DeliveryRuntimeTests(unittest.TestCase):
     def test_commit_is_idempotent_and_account_is_never_reused(self):
         first_id = self.add_account("first@example.com", "first-sub")
         second_id = self.add_account("second@example.com", "second-sub")
-        with patch.object(
-            _delivery_runtime,
-            "_probe_account",
-            return_value={"ok": True, "model_ids": ["grok-4.5"]},
-        ):
-            first = _delivery_runtime.reserve("CARD-1")
-            self.assertNotIn("document", first)
-            committed = _delivery_runtime.commit(
-                "CARD-1", first["lease_id"], first["lease_token"], "bundle-1"
-            )
-            repeated = _delivery_runtime.commit(
-                "CARD-1", first["lease_id"], first["lease_token"], "bundle-1"
-            )
-            recovered = _delivery_runtime.reserve("CARD-1")
-            second = _delivery_runtime.reserve("CARD-2")
+        self.set_prevalidation(first_id, _shared.now_iso())
+        self.set_prevalidation(second_id, _shared.now_iso())
+        first = _delivery_runtime.reserve("CARD-1")
+        self.assertNotIn("document", first)
+        committed = _delivery_runtime.commit(
+            "CARD-1", first["lease_id"], first["lease_token"], "bundle-1"
+        )
+        repeated = _delivery_runtime.commit(
+            "CARD-1", first["lease_id"], first["lease_token"], "bundle-1"
+        )
+        recovered = _delivery_runtime.reserve("CARD-1")
+        second = _delivery_runtime.reserve("CARD-2")
 
         self.assertEqual(committed["account_id"], first_id)
         self.assertEqual(repeated["document"], committed["document"])
@@ -335,6 +274,8 @@ class DeliveryRuntimeTests(unittest.TestCase):
             self.add_account("one@example.com", "one-sub"),
             self.add_account("two@example.com", "two-sub"),
         }
+        for account_id in ids:
+            self.set_prevalidation(account_id, _shared.now_iso())
         barrier = threading.Barrier(2)
 
         def probe(_account_id, _required_model):
@@ -359,6 +300,7 @@ class DeliveryRuntimeTests(unittest.TestCase):
     def test_history_manifest_excludes_previously_bundled_account(self):
         delivered_id = self.add_account("old@example.com", "old-sub")
         fresh_id = self.add_account("fresh@example.com", "fresh-sub")
+        self.set_prevalidation(fresh_id, _shared.now_iso())
         _delivery_runtime.MANIFEST_PATH.write_text(
             json.dumps(
                 {
@@ -376,12 +318,7 @@ class DeliveryRuntimeTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        with patch.object(
-            _delivery_runtime,
-            "_probe_account",
-            return_value={"ok": True, "model_ids": ["grok-4.5"]},
-        ):
-            reservation = _delivery_runtime.reserve("NEW-CARD")
+        reservation = _delivery_runtime.reserve("NEW-CARD")
 
         consumed = _shared.fetch_one(
             "SELECT card_key FROM account_delivery_consumptions WHERE account_id=?",
@@ -439,6 +376,8 @@ class DeliveryRuntimeTests(unittest.TestCase):
     def test_expired_probe_result_cannot_mark_lease_ready(self):
         expired_id = self.add_account("expired-probe@example.com", "expired-probe-sub")
         fresh_id = self.add_account("fresh-probe@example.com", "fresh-probe-sub")
+        self.set_prevalidation(expired_id, _shared.now_iso())
+        self.set_prevalidation(fresh_id, _shared.now_iso())
         probed: list[int] = []
 
         def probe(account_id, _required_model):

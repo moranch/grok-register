@@ -213,9 +213,15 @@ class DynamicCardTests(unittest.TestCase):
         self.assertIn('id="claimCockpitBtn"', page)
         self.assertNotIn('name="required_model"', page)
         self.assertIn("账号存活验证通过", page)
+        self.assertIn("领取仅使用近期已验证库存", page)
+        self.assertIn("暂无近期验活库存，新卡暂不可领取", page)
+        self.assertNotIn("兑换时将现场尝试验活", page)
+        self.assertEqual(page.count("activeButton.textContent = '正在分配'"), 1)
 
     def test_card_status_labels_are_localized(self):
-        self.assertEqual(gate.card_status_view({"status": "issued"}), ("issued", "待领取"))
+        self.assertEqual(
+            gate.card_status_view({"status": "issued"}), ("issued", "未使用卡密")
+        )
         self.assertEqual(
             gate.card_status_view({"status": "provisioning"}),
             ("provisioning", "正在分配"),
