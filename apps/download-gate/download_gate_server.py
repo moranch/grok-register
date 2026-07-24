@@ -45,7 +45,7 @@ ADMIN_PATH = normalize_admin_path(os.environ.get("DOWNLOAD_GATE_ADMIN_PATH", "/d
 INTERNAL_API_TOKEN = os.environ.get("DOWNLOAD_GATE_INTERNAL_TOKEN", "").strip()
 CONSOLE_URL = os.environ.get("DOWNLOAD_GATE_CONSOLE_URL", "").strip().rstrip("/")
 CONSOLE_TIMEOUT_SECONDS = max(int(os.environ.get("DOWNLOAD_GATE_CONSOLE_TIMEOUT", "120") or 120), 5)
-APP_VERSION = "2026.07.25.02"
+APP_VERSION = "2026.07.25.03"
 CLAIM_TTL_SECONDS = 24 * 60 * 60
 BATCH_DOWNLOAD_TTL_SECONDS = 10 * 60
 MAX_BATCH_KEYS = 20
@@ -404,6 +404,17 @@ def card_lock(card_key: str) -> threading.RLock:
             lock = threading.RLock()
             CARD_LOCKS[key] = lock
         return lock
+
+
+@contextmanager
+def try_card_lock(card_key: str):
+    lock = card_lock(card_key)
+    acquired = lock.acquire(blocking=False)
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            lock.release()
 
 
 @contextmanager
@@ -5336,7 +5347,14 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
         if not key:
             self.send_json({"error": "请输入卡密 KEY"}, HTTPStatus.BAD_REQUEST, client_headers)
             return
-        with card_lock(key):
+        with try_card_lock(key) as acquired:
+            if not acquired:
+                self.send_json(
+                    {"error": "该卡密正在分配，请稍候后重试", "retryable": True},
+                    HTTPStatus.CONFLICT,
+                    client_headers,
+                )
+                return
             manifest = load_manifest()
             card = (manifest.get("cards") or {}).get(key)
             if not isinstance(card, dict) or card.get("status") == "void":

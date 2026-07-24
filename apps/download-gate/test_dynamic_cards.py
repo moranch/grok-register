@@ -245,6 +245,28 @@ class DynamicCardTests(unittest.TestCase):
             self.assertRegex(key, r"^DG-(?:[A-HJ-NP-Z2-9]{4}-){2}[A-HJ-NP-Z2-9]{4}$")
             self.assertNotRegex(key, r"[01IO]")
 
+    def test_duplicate_claim_does_not_wait_for_existing_card_lock(self):
+        key = "DG-LOCK-TEST-CARD"
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold_lock():
+            with gate.card_lock(key):
+                held.set()
+                release.wait(timeout=5)
+
+        worker = threading.Thread(target=hold_lock)
+        worker.start()
+        self.assertTrue(held.wait(timeout=2))
+        try:
+            started = time.monotonic()
+            with gate.try_card_lock(key) as acquired:
+                self.assertFalse(acquired)
+            self.assertLess(time.monotonic() - started, 0.5)
+        finally:
+            release.set()
+            worker.join(timeout=5)
+
     def test_legacy_ungrouped_card_key_remains_compatible(self):
         legacy_key = "DG-ABCDEFGHJKLMNP"
         manifest = gate.load_manifest()
