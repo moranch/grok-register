@@ -28,6 +28,7 @@ HISTORY_IMPORT_KEY = "account_delivery_history_import_v1"
 HISTORY_IMPORT_BUNDLE_PREFIX = "account_delivery_history_bundle_v2:"
 ACTIVE_LEASE_STATES = ("probing", "ready", "packing")
 DEFAULT_DELIVERY_PLATFORM = "grok"
+PROBE_LEASE_MINUTES = 2
 
 
 def normalize_delivery_platform(value: str | None) -> str:
@@ -601,10 +602,13 @@ def reserve(
             conn = _begin_immediate()
             try:
                 now = _shared.now_iso()
+                stale_probe_cutoff = (
+                    datetime.now() - timedelta(minutes=PROBE_LEASE_MINUTES)
+                ).strftime("%Y-%m-%d %H:%M:%S")
                 conn.execute(
                     "UPDATE account_delivery_leases SET state='failed', last_error='probe lease expired', updated_at=? "
-                    "WHERE state='probing' AND expires_at IS NOT NULL AND expires_at < ?",
-                    (now, now),
+                    "WHERE state='probing' AND ((expires_at IS NOT NULL AND expires_at < ?) OR updated_at < ?)",
+                    (now, now, stale_probe_cutoff),
                 )
                 order = conn.execute(
                     "SELECT * FROM delivery_orders WHERE card_key = ?", (card_key,)
@@ -688,7 +692,13 @@ def reserve(
                       AND NOT EXISTS (
                           SELECT 1 FROM account_delivery_leases tried
                           WHERE tried.account_id=a.id AND tried.order_id=?
-                            AND (tried.state <> 'failed' OR tried.updated_at > ?)
+                            AND (
+                                tried.state <> 'failed'
+                                OR (
+                                    COALESCE(tried.last_error, '') <> 'probe lease expired'
+                                    AND tried.updated_at > ?
+                                )
+                            )
                       )
                     ORDER BY CASE WHEN ?='grok' AND
                                  COALESCE(
@@ -733,7 +743,9 @@ def reserve(
                     raise DeliveryUnavailable("no active account is available")
                 lease_id = uuid.uuid4().hex
                 lease_token = uuid.uuid4().hex + uuid.uuid4().hex
-                expires_at = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+                expires_at = (
+                    datetime.now() + timedelta(minutes=PROBE_LEASE_MINUTES)
+                ).strftime("%Y-%m-%d %H:%M:%S")
                 conn.execute(
                     """
                     INSERT INTO account_delivery_leases

@@ -264,6 +264,41 @@ class DeliveryRuntimeTests(unittest.TestCase):
         self.assertEqual(leases[0]["state"], "failed")
         self.assertEqual(leases[0]["last_error"], "timed out")
 
+    def test_stale_probing_lease_is_recovered_after_two_minutes(self):
+        account_id = self.add_account("stale-lease@example.com", "stale-lease")
+        old_time = (datetime.now() - timedelta(minutes=3)).strftime("%Y-%m-%d %H:%M:%S")
+        future_expiry = (datetime.now() + timedelta(minutes=7)).strftime("%Y-%m-%d %H:%M:%S")
+        order_id = _shared.execute(
+            """
+            INSERT INTO delivery_orders
+                (card_key, platform, required_model, state, source, created_at, updated_at)
+            VALUES ('STALE-LEASE-CARD', 'grok', '', 'pending', 'dynamic', ?, ?)
+            """,
+            (old_time, old_time),
+        )
+        _shared.execute_no_return(
+            """
+            INSERT INTO account_delivery_leases
+                (id, order_id, account_id, lease_token, state, created_at, updated_at, expires_at)
+            VALUES ('stale-lease', ?, ?, 'old-token', 'probing', ?, ?, ?)
+            """,
+            (order_id, account_id, old_time, old_time, future_expiry),
+        )
+
+        with patch.object(
+            _delivery_runtime,
+            "_probe_account",
+            return_value={"ok": True, "account_alive": True},
+        ):
+            reservation = _delivery_runtime.reserve("STALE-LEASE-CARD")
+
+        self.assertNotEqual(reservation["lease_id"], "stale-lease")
+        old_lease = _shared.fetch_one(
+            "SELECT state, last_error FROM account_delivery_leases WHERE id='stale-lease'"
+        )
+        self.assertEqual(old_lease["state"], "failed")
+        self.assertEqual(old_lease["last_error"], "probe lease expired")
+
     def test_commit_is_idempotent_and_account_is_never_reused(self):
         first_id = self.add_account("first@example.com", "first-sub")
         second_id = self.add_account("second@example.com", "second-sub")
