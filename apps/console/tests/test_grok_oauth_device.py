@@ -12,6 +12,7 @@ from grok_oauth_device import (
     approve_in_registered_browser,
     mint_in_registered_browser,
     poll_device_token,
+    prepare_registered_account,
     request_device_code,
 )
 
@@ -30,10 +31,22 @@ class _Session:
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls = []
+        self.headers = {}
 
     def post(self, url, **kwargs):
         self.calls.append((url, kwargs))
         return self.responses.pop(0)
+
+
+class _SetupPage:
+    def cookies(self, **_kwargs):
+        return [
+            {"name": "sso", "value": "session"},
+            {"name": "unrelated", "value": "ignored"},
+        ]
+
+    def run_js(self, _script):
+        return "browser-agent"
 
 
 class _Element:
@@ -118,15 +131,52 @@ class RegistrationDeviceFlowTests(unittest.TestCase):
                 _Response(
                     400,
                     {"error": "invalid_grant", "error_description": "Access denied"},
-                )
+                ),
+                _Response(
+                    400,
+                    {"error": "invalid_grant", "error_description": "Access denied"},
+                ),
+                _Response(
+                    400,
+                    {"error": "invalid_grant", "error_description": "Access denied"},
+                ),
             ]
         )
-        with self.assertRaises(DeviceFlowEntitlementDenied):
-            poll_device_token(
+        with patch("grok_oauth_device.time.sleep"):
+            with self.assertRaises(DeviceFlowEntitlementDenied):
+                poll_device_token(
+                    session,
+                    {"device_code": "device", "expires_in": 30, "interval": 1},
+                    timeout=20,
+                )
+
+    def test_access_denied_race_can_recover_during_grace(self):
+        session = _Session(
+            [
+                _Response(
+                    400,
+                    {"error": "invalid_grant", "error_description": "Access denied"},
+                ),
+                _Response(200, {"access_token": "access", "refresh_token": "refresh"}),
+            ]
+        )
+        with patch("grok_oauth_device.time.sleep"):
+            token = poll_device_token(
                 session,
                 {"device_code": "device", "expires_in": 30, "interval": 1},
                 timeout=20,
             )
+        self.assertEqual(token["refresh_token"], "refresh")
+
+    def test_registered_account_setup_accepts_tos_and_birth_date(self):
+        session = _Session([_Response(200, {}), _Response(204, {})])
+        with patch("grok_oauth_device._new_session", return_value=session):
+            result = prepare_registered_account(_SetupPage())
+        self.assertTrue(result["ok"])
+        self.assertIn("SetTosAcceptedVersion", session.calls[0][0])
+        self.assertEqual(session.calls[1][0], "https://grok.com/rest/auth/set-birth-date")
+        self.assertIn("sso=session", session.headers["Cookie"])
+        self.assertNotIn("unrelated", session.headers["Cookie"])
 
     def test_device_endpoint_falls_back_to_direct_transport(self):
         proxy_session = object()
@@ -145,6 +195,7 @@ class RegistrationDeviceFlowTests(unittest.TestCase):
                 "grok_oauth_device.request_device_code",
                 side_effect=[RuntimeError("SOCKS failure"), device],
             ),
+            patch("grok_oauth_device.prepare_registered_account"),
             patch("grok_oauth_device.approve_in_registered_browser"),
             patch(
                 "grok_oauth_device.poll_device_token",

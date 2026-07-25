@@ -133,7 +133,13 @@ try:
 except Exception:
     pass
 if _browser_proxy:
-    co.set_proxy(_browser_proxy)
+    # DrissionPage prints a misleading "SOCKS is unsupported" warning even
+    # though it ultimately writes the same Chromium --proxy-server argument.
+    # Set the argument directly so the WARP proxy stays active without noise.
+    if _browser_proxy.lower().startswith("socks"):
+        co.set_argument("--proxy-server", _browser_proxy)
+    else:
+        co.set_proxy(_browser_proxy)
     print(f"[*] 浏览器代理: {_browser_proxy}")
 
 # Linux 服务器自动检测 chromium 路径

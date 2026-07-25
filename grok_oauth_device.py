@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import struct
 import time
 import uuid
+from datetime import date
 from pathlib import Path
 from typing import Any, Callable
 
@@ -50,6 +53,122 @@ def _new_session(proxy: str = "", verify_tls: bool = True):
         }
     )
     return session
+
+
+def _registered_cookie_header(page: Any) -> str:
+    """Copy only the account-session cookies needed by the setup endpoints."""
+    values: dict[str, str] = {}
+    try:
+        cookies = page.cookies(all_domains=True, all_info=True) or []
+    except Exception:
+        cookies = []
+    for item in cookies:
+        if isinstance(item, dict):
+            name = str(item.get("name") or "").strip()
+            value = str(item.get("value") or "").strip()
+        else:
+            name = str(getattr(item, "name", "") or "").strip()
+            value = str(getattr(item, "value", "") or "").strip()
+        if name in {"sso", "sso-rw", "cf_clearance"} and value:
+            values[name] = value
+    return "; ".join(f"{name}={value}" for name, value in values.items())
+
+
+def _adult_birth_date() -> str:
+    today = date.today()
+    rng = random.SystemRandom()
+    year = today.year - rng.randint(20, 40)
+    return f"{year}-{rng.randint(1, 12):02d}-{rng.randint(1, 28):02d}T16:00:00.000Z"
+
+
+def prepare_registered_account(
+    page: Any,
+    *,
+    proxy: str = "",
+    timeout: int = 20,
+    verify_tls: bool = True,
+    log: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Finish the account state required before requesting Grok CLI consent.
+
+    The upstream registration flow accepts the current ToS version and records an
+    adult birth date before starting device OAuth.  A freshly-created Web session
+    can otherwise render the consent success page while the token endpoint rejects
+    the grant with ``invalid_grant: Access denied``.
+    """
+    logger = log or (lambda _: None)
+    session = _new_session(proxy=proxy, verify_tls=verify_tls)
+    cookie_header = _registered_cookie_header(page)
+    try:
+        user_agent = str(page.run_js("return navigator.userAgent") or "").strip()
+    except Exception:
+        user_agent = ""
+    common_headers: dict[str, str] = {}
+    if cookie_header:
+        common_headers["Cookie"] = cookie_header
+    if user_agent:
+        common_headers["User-Agent"] = user_agent
+    if common_headers:
+        session.headers.update(common_headers)
+
+    tos_payload = bytes((0x10, 0x01))
+    tos_frame = b"\x00" + struct.pack(">I", len(tos_payload)) + tos_payload
+    tos_response = session.post(
+        "https://accounts.x.ai/auth_mgmt.AuthManagement/SetTosAcceptedVersion",
+        data=tos_frame,
+        headers={
+            "Content-Type": "application/grpc-web+proto",
+            "X-Grpc-Web": "1",
+            "X-User-Agent": "connect-es/2.1.1",
+            "Origin": "https://accounts.x.ai",
+            "Referer": "https://accounts.x.ai/accept-tos",
+        },
+        impersonate="chrome",
+        timeout=timeout,
+    )
+    tos_ok = 200 <= int(tos_response.status_code) < 300
+    logger(f"account setup tos_status={tos_response.status_code}")
+
+    # Use a fresh connection pool when crossing from accounts.x.ai to grok.com.
+    # Some curl/HTTP2 builds otherwise reuse stale TLS state across the two hosts.
+    birth_session = _new_session(proxy=proxy, verify_tls=verify_tls)
+    if common_headers:
+        birth_session.headers.update(common_headers)
+    birth_url = "https://grok.com/rest/auth/set-birth-date"
+    birth_payload = {"birthDate": _adult_birth_date()}
+    birth_headers = {
+        "Content-Type": "application/json",
+        "Origin": "https://grok.com",
+        "Referer": "https://grok.com/",
+    }
+    try:
+        birth_response = birth_session.post(
+            birth_url,
+            json=birth_payload,
+            headers=birth_headers,
+            impersonate="chrome",
+            timeout=timeout,
+        )
+    except Exception as exc:
+        # curl_cffi occasionally reports an OpenSSL cross-host connection error
+        # here even though the same endpoint works through requests/OpenSSL.
+        logger(f"account setup birth transport fallback: {type(exc).__name__}")
+        import requests as standard_requests
+
+        birth_response = standard_requests.post(
+            birth_url,
+            json=birth_payload,
+            headers={**common_headers, **birth_headers},
+            timeout=timeout,
+            verify=verify_tls,
+        )
+    birth_ok = 200 <= int(birth_response.status_code) < 300
+    logger(f"account setup birth_status={birth_response.status_code}")
+    return {
+        "ok": tos_ok and birth_ok,
+        "tos_status": int(tos_response.status_code),
+        "birth_status": int(birth_response.status_code),
+    }
 
 
 def request_device_code(
@@ -161,6 +280,7 @@ def poll_device_token(
 ) -> dict[str, Any]:
     logger = log or (lambda _: None)
     interval = max(1, int(device.get("interval") or 5))
+    denial_grace_attempts = 2
     deadline = time.monotonic() + min(
         max(20, int(timeout)),
         max(20, int(device.get("expires_in") or timeout)),
@@ -198,6 +318,14 @@ def poll_device_token(
         if code in {"access_denied", "authorization_denied"} or (
             code == "invalid_grant" and "access denied" in detail.casefold()
         ):
+            # accounts.x.ai can reach /device/done slightly before auth.x.ai has
+            # replicated the consent.  Retry the same still-live device grant a
+            # couple of times before classifying the account as ineligible.
+            if denial_grace_attempts > 0 and time.monotonic() + interval < deadline:
+                denial_grace_attempts -= 1
+                logger("oauth poll: access-denied grace retry")
+                time.sleep(interval)
+                continue
             raise DeviceFlowEntitlementDenied(
                 f"OAuth entitlement denied: {code}: {detail or 'Access denied'}"
             )
@@ -217,6 +345,41 @@ def mint_in_registered_browser(
     log: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     logger = log or (lambda _: None)
+    try:
+        setup = prepare_registered_account(
+            page,
+            proxy=proxy,
+            timeout=min(max(10, int(timeout)), 30),
+            verify_tls=verify_tls,
+            log=logger,
+        )
+        if not setup.get("ok"):
+            logger("account setup incomplete; continuing device OAuth")
+    except Exception as exc:
+        if proxy:
+            try:
+                logger(f"account setup proxy failed, retrying direct: {type(exc).__name__}")
+                setup = prepare_registered_account(
+                    page,
+                    proxy="",
+                    timeout=min(max(10, int(timeout)), 30),
+                    verify_tls=verify_tls,
+                    log=logger,
+                )
+                if not setup.get("ok"):
+                    logger("account setup incomplete; continuing device OAuth")
+            except Exception as direct_exc:
+                # Preserve the registered Web account even if optional setup is
+                # blocked. The token result remains the eligibility authority.
+                logger(
+                    "account setup failed; continuing device OAuth: "
+                    f"{type(direct_exc).__name__}: {str(direct_exc)[:160]}"
+                )
+        else:
+            logger(
+                "account setup failed; continuing device OAuth: "
+                f"{type(exc).__name__}: {str(exc)[:160]}"
+            )
     session = _new_session(proxy=proxy, verify_tls=verify_tls)
     try:
         device = request_device_code(session)
