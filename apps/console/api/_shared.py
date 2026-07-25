@@ -1025,6 +1025,53 @@ def init_db() -> None:
                 now_iso(),
             ),
         )
+        sub2api_auto_import = os.getenv(
+            "GROK_REGISTER_SUB2API_AUTO_IMPORT", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            sub2api_group_id = int(os.getenv("GROK_REGISTER_SUB2API_GROUP_ID") or 0)
+        except (TypeError, ValueError):
+            sub2api_group_id = 0
+        try:
+            sub2api_workers = min(
+                max(1, int(os.getenv("GROK_REGISTER_SUB2API_WORKERS") or 2)), 8
+            )
+        except (TypeError, ValueError):
+            sub2api_workers = 2
+        default_sub2api_config = {
+            "enabled": sub2api_auto_import,
+            "endpoint": str(os.getenv("GROK_REGISTER_SUB2API_URL") or "").strip(),
+            "api_append": True,
+            "template": "",
+            "extra": {
+                "base_url": str(os.getenv("GROK_REGISTER_SUB2API_URL") or "").strip(),
+                "auth_mode": str(
+                    os.getenv("GROK_REGISTER_SUB2API_AUTH_MODE") or "api_key"
+                ),
+                "api_key": str(os.getenv("GROK_REGISTER_SUB2API_API_KEY") or ""),
+                "admin_email": str(
+                    os.getenv("GROK_REGISTER_SUB2API_ADMIN_EMAIL") or ""
+                ),
+                "admin_password": str(
+                    os.getenv("GROK_REGISTER_SUB2API_ADMIN_PASSWORD") or ""
+                ),
+                "group_id": sub2api_group_id,
+                "auto_import": sub2api_auto_import,
+                "sso_fallback": True,
+                "retries": 2,
+                "workers": sub2api_workers,
+                "timeout": 45,
+                "verify_tls": True,
+            },
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO settings(key, value, updated_at) VALUES (?, ?, ?)",
+            (
+                "exporter_sub2api",
+                json.dumps(default_sub2api_config, ensure_ascii=False),
+                now_iso(),
+            ),
+        )
         conn.commit()
 
 

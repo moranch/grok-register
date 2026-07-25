@@ -49,6 +49,60 @@ class HotmailImportRequest(BaseModel):
     imap_last_n: int = Field(30, ge=1, le=500)
     imap_hosts: str = "outlook.office365.com,imap-mail.outlook.com"
     require_recipient_match: bool = True
+    reservation_ttl_seconds: int = Field(1800, ge=60, le=86400)
+    replace: bool = False
+
+
+class HotmailProbeRequest(BaseModel):
+    workers: int = Field(4, ge=1, le=12)
+    limit: int = Field(0, ge=0, le=10000)
+
+
+class HotmailReserveRequest(BaseModel):
+    owner: str = Field("console", min_length=1, max_length=120)
+
+
+class HotmailReleaseRequest(BaseModel):
+    alias: str = Field(..., min_length=3, max_length=320)
+    consumed: bool = False
+
+
+def _hotmail_row(mbox_id: int):
+    row = fetch_one("SELECT * FROM mailbox_providers WHERE id = ?", (mbox_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="mailbox provider not found")
+    return row
+
+
+def _hotmail_pool_from_row(row: Any):
+    if row["provider_type"] not in {"hotmail", "outlookmail"}:
+        raise HTTPException(status_code=400, detail="该 Provider 不是 Hotmail/Outlook 类型")
+    import json
+    from core.hotmail_pool import HotmailPool
+
+    try:
+        config = json.loads(row["config_json"] or "{}")
+    except Exception:
+        config = {}
+    hosts = [
+        part.strip()
+        for part in str(config.get("imap_hosts") or "").replace("，", ",").split(",")
+        if part.strip()
+    ]
+    return HotmailPool(
+        row["api_base"],
+        state_path=str(config.get("state_path") or ""),
+        max_aliases=int(config.get("max_aliases", 5) or 5),
+        alias_mode=str(config.get("alias_mode") or "random"),
+        alias_length=int(config.get("alias_length", 8) or 8),
+        poll_interval=float(config.get("poll_interval", 5) or 5),
+        recent_seconds=int(config.get("recent_seconds", 900) or 900),
+        imap_last_n=int(config.get("imap_last_n", 30) or 30),
+        imap_hosts=hosts or None,
+        require_recipient_match=bool(config.get("require_recipient_match", True)),
+        reservation_ttl_seconds=int(config.get("reservation_ttl_seconds", 1800) or 1800),
+        proxy=str(merged_defaults().get("proxy") or ""),
+    )
 
 
 @router.get("")
@@ -69,7 +123,7 @@ def api_import_hotmail(request: Request, payload: HotmailImportRequest) -> dict[
     check_auth(request)
     from core.hotmail_pool import load_credentials, parse_credential_line
 
-    valid_lines: list[str] = []
+    imported_by_email: dict[str, dict[str, str]] = {}
     invalid = 0
     for raw in payload.credentials.splitlines():
         line = raw.strip()
@@ -79,17 +133,31 @@ def api_import_hotmail(request: Request, payload: HotmailImportRequest) -> dict[
         if not item:
             invalid += 1
             continue
-        valid_lines.append(
-            f"{item['email']}----{item['password']}----{item['client_id']}----{item['refresh_token']}"
-        )
-    if not valid_lines:
+        imported_by_email[item["email"].lower()] = item
+    if not imported_by_email:
         raise HTTPException(status_code=400, detail="没有有效四段凭证")
 
     base_dir = Path(os.getenv("GROK_HOTMAIL_DATA_DIR", "/workspace/runtime/hotmail")).resolve()
     base_dir.mkdir(parents=True, exist_ok=True)
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", payload.name).strip("-") or "hotmail"
     path = base_dir / f"{safe_name}.txt"
-    path.write_text("\n".join(valid_lines) + "\n", encoding="utf-8")
+    merged_by_email: dict[str, dict[str, str]] = {}
+    if path.exists() and not payload.replace:
+        try:
+            merged_by_email.update(
+                {item["email"].lower(): item for item in load_credentials(path)}
+            )
+        except (FileNotFoundError, ValueError):
+            pass
+    before_count = len(merged_by_email)
+    merged_by_email.update(imported_by_email)
+    valid_lines = [
+        f"{item['email']}----{item['password']}----{item['client_id']}----{item['refresh_token']}"
+        for item in merged_by_email.values()
+    ]
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text("\n".join(valid_lines) + "\n", encoding="utf-8")
+    os.replace(temp_path, path)
     try:
         os.chmod(path, 0o600)
     except OSError:
@@ -104,24 +172,98 @@ def api_import_hotmail(request: Request, payload: HotmailImportRequest) -> dict[
         "imap_last_n": payload.imap_last_n,
         "imap_hosts": payload.imap_hosts,
         "require_recipient_match": payload.require_recipient_match,
+        "reservation_ttl_seconds": payload.reservation_ttl_seconds,
         "state_path": str(path.with_suffix(".state.json")),
     }
-    mailbox = mailbox_add(
-        MailboxItem(
-            name=payload.name,
-            provider_type=payload.provider_type,
-            api_base=str(path),
-            config=config,
-            enabled=True,
-        )
+    existing = fetch_one(
+        "SELECT * FROM mailbox_providers WHERE provider_type IN ('hotmail','outlookmail') "
+        "AND (name=? OR api_base=?) ORDER BY id LIMIT 1",
+        (payload.name, str(path)),
     )
+    if existing:
+        mailbox = mailbox_update(
+            int(existing["id"]),
+            MailboxUpdate(
+                name=payload.name,
+                provider_type=payload.provider_type,
+                api_base=str(path),
+                config=config,
+                enabled=True,
+            ),
+        )
+    else:
+        mailbox = mailbox_add(
+            MailboxItem(
+                name=payload.name,
+                provider_type=payload.provider_type,
+                api_base=str(path),
+                config=config,
+                enabled=True,
+            )
+        )
     return {
         "ok": True,
         "mailbox": mailbox,
-        "imported": len(accounts),
+        "imported": len(imported_by_email),
+        "added": max(0, len(accounts) - before_count),
+        "total": len(accounts),
         "invalid": invalid,
         "format": "email----password----ClientID----refresh_token",
     }
+
+
+@router.get("/{mbox_id}/hotmail/status")
+def api_hotmail_status(request: Request, mbox_id: int) -> dict[str, Any]:
+    check_auth(request)
+    pool = _hotmail_pool_from_row(_hotmail_row(mbox_id))
+    return {"ok": True, **pool.snapshot()}
+
+
+@router.get("/{mbox_id}/hotmail/verifications")
+def api_hotmail_verifications(
+    request: Request,
+    mbox_id: int,
+    alias: str = Query("", max_length=320),
+) -> dict[str, Any]:
+    check_auth(request)
+    pool = _hotmail_pool_from_row(_hotmail_row(mbox_id))
+    return {"ok": True, **pool.verification_status(alias)}
+
+
+@router.post("/{mbox_id}/hotmail/probe")
+def api_hotmail_probe(
+    request: Request, mbox_id: int, payload: HotmailProbeRequest
+) -> dict[str, Any]:
+    check_auth(request)
+    pool = _hotmail_pool_from_row(_hotmail_row(mbox_id))
+    return pool.probe_accounts(workers=payload.workers, limit=payload.limit)
+
+
+@router.post("/{mbox_id}/hotmail/reserve")
+def api_hotmail_reserve(
+    request: Request, mbox_id: int, payload: HotmailReserveRequest
+) -> dict[str, Any]:
+    check_auth(request)
+    pool = _hotmail_pool_from_row(_hotmail_row(mbox_id))
+    alias, account = pool.acquire(owner=payload.owner)
+    return {"ok": True, "alias": alias, "main_email": account["email"]}
+
+
+@router.post("/{mbox_id}/hotmail/release")
+def api_hotmail_release(
+    request: Request, mbox_id: int, payload: HotmailReleaseRequest
+) -> dict[str, Any]:
+    check_auth(request)
+    pool = _hotmail_pool_from_row(_hotmail_row(mbox_id))
+    pool.release(payload.alias, consumed=payload.consumed)
+    return {"ok": True, "alias": payload.alias, "consumed": payload.consumed}
+
+
+@router.delete("/{mbox_id}/hotmail/used")
+def api_hotmail_delete_used(request: Request, mbox_id: int) -> dict[str, Any]:
+    check_auth(request)
+    pool = _hotmail_pool_from_row(_hotmail_row(mbox_id))
+    return {"ok": True, **pool.delete_used_accounts()}
 
 
 @router.patch("/{mbox_id}")
@@ -170,21 +312,8 @@ def api_test_mailbox(request: Request, mbox_id: int) -> dict[str, Any]:
     if not row:
         raise HTTPException(status_code=404, detail="mailbox provider not found")
     if row["provider_type"] in {"hotmail", "outlookmail"}:
-        import json
-        from core.hotmail_pool import HotmailPool
-
         try:
-            config = json.loads(row["config_json"] or "{}")
-        except Exception:
-            config = {}
-        hosts = [part.strip() for part in str(config.get("imap_hosts") or "").split(",") if part.strip()]
-        try:
-            pool = HotmailPool(
-                row["api_base"],
-                state_path=str(config.get("state_path") or ""),
-                imap_hosts=hosts or None,
-                proxy=str(merged_defaults().get("proxy") or ""),
-            )
+            pool = _hotmail_pool_from_row(row)
             result = pool.test()
             return {**result, "checked_at": now_iso()}
         except Exception as exc:

@@ -237,6 +237,9 @@ class TaskSupervisor:
                 task_config["hotmail_require_recipient_match"] = hotmail_config.get(
                     "require_recipient_match", True
                 )
+                task_config["hotmail_reservation_ttl_seconds"] = hotmail_config.get(
+                    "reservation_ttl_seconds", 1800
+                )
                 task_config["hotmail_state_path"] = hotmail_config.get("state_path", "")
 
         # Complete xAI device authorization before the registration browser is

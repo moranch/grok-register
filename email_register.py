@@ -79,6 +79,9 @@ def _get_hotmail_pool():
             imap_last_n=int(_conf.get("hotmail_imap_last_n", 30) or 30),
             imap_hosts=hosts,
             require_recipient_match=bool(_conf.get("hotmail_require_recipient_match", True)),
+            reservation_ttl_seconds=int(
+                _conf.get("hotmail_reservation_ttl_seconds", 1800) or 1800
+            ),
             proxy=PROXY,
             log=print,
         )

@@ -28,6 +28,7 @@ from api._shared import WEBUI_DIR, init_db, seed_mailbox_from_defaults
 from api._supervisor import supervisor
 from api._lifecycle_runtime import start_lifecycle_thread
 from api._cpa_runtime import cpa_mint_runtime
+from api._sub2api_runtime import sub2api_import_runtime
 from api._inventory_runtime import auto_replenish_runtime
 from core.grok2api_clearance import grok2api_clearance_refresher
 
@@ -61,6 +62,7 @@ async def lifespan(_: FastAPI):
 
     # 3.1 CPA OAuth 补全队列（单 worker，避免阻塞注册与触发并发风控）
     cpa_mint_runtime.start()
+    sub2api_import_runtime.start()
     grok2api_clearance_refresher.start()
 
     # 4. 多平台插件加载（按 design 顺序：platform → mailbox → captcha → strategy → exporter）
@@ -99,6 +101,7 @@ async def lifespan(_: FastAPI):
     finally:
         auto_replenish_runtime.stop()
         grok2api_clearance_refresher.stop()
+        sub2api_import_runtime.stop()
         cpa_mint_runtime.stop()
         supervisor.stop()
 

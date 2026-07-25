@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime
 from typing import Any
@@ -56,6 +57,59 @@ class InternalDeliveryCommit(BaseModel):
     lease_id: str = Field(..., min_length=1, max_length=100)
     lease_token: str = Field(..., min_length=1, max_length=200)
     bundle_id: str = Field("", max_length=200)
+
+
+class Sub2ApiImportRequest(BaseModel):
+    account_ids: list[int] = Field(default_factory=list)
+    group_id: int = Field(0, ge=0)
+    force: bool = False
+
+
+class Sub2ApiOAuthStartRequest(BaseModel):
+    email: str = Field("", max_length=320)
+
+
+class Sub2ApiOAuthCompleteRequest(BaseModel):
+    session_id: str = Field(..., min_length=1, max_length=500)
+    state: str = Field(..., min_length=1, max_length=1000)
+    callback: str = Field(..., min_length=1, max_length=5000)
+    email: str = Field("", max_length=320)
+    group_id: int = Field(0, ge=0)
+
+
+class Sub2ApiConfigUpdate(BaseModel):
+    enabled: bool = False
+    base_url: str = Field("", max_length=1000)
+    auth_mode: str = Field("api_key", pattern="^(api_key|password)$")
+    api_key: str = Field("", max_length=2000)
+    admin_email: str = Field("", max_length=320)
+    admin_password: str = Field("", max_length=2000)
+    group_id: int = Field(0, ge=0)
+    auto_import: bool = False
+    sso_fallback: bool = True
+    retries: int = Field(2, ge=0, le=5)
+    workers: int = Field(2, ge=1, le=8)
+    timeout: int = Field(45, ge=5, le=300)
+    verify_tls: bool = True
+
+
+def _sub2api_client_config() -> dict[str, Any]:
+    from ._sub2api_runtime import sub2api_import_runtime
+
+    config = sub2api_import_runtime.config()
+    extra = dict(config.get("extra") or {})
+    if config.get("endpoint"):
+        extra["base_url"] = str(config["endpoint"])
+    for key in (
+        "group_id",
+        "auto_import",
+        "sso_fallback",
+        "retries",
+        "workers",
+        "oauth_base_url",
+    ):
+        extra.pop(key, None)
+    return extra
 
 
 def _raise_delivery_error(exc: Exception) -> None:
@@ -320,6 +374,170 @@ def api_accounts_cpa_job(request: Request, job_id: str) -> dict[str, Any]:
     if not job:
         raise HTTPException(status_code=404, detail="CPA backfill job not found")
     return {"job": job}
+
+
+@router.get("/api/accounts/sub2api/groups")
+def api_accounts_sub2api_groups(request: Request) -> dict[str, Any]:
+    check_auth(request)
+    from core.sub2api_client import list_groups
+
+    result = list_groups(**_sub2api_client_config())
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail=result)
+    return result
+
+
+@router.get("/api/accounts/sub2api/config")
+def api_accounts_sub2api_config(request: Request) -> dict[str, Any]:
+    check_auth(request)
+    from ._sub2api_runtime import sub2api_import_runtime
+
+    config = sub2api_import_runtime.config()
+    extra = dict(config.get("extra") or {})
+    return {
+        "enabled": bool(config.get("enabled")),
+        "base_url": str(config.get("endpoint") or extra.get("base_url") or ""),
+        "auth_mode": str(extra.get("auth_mode") or "api_key"),
+        "api_key": "",
+        "has_api_key": bool(str(extra.get("api_key") or "")),
+        "admin_email": str(extra.get("admin_email") or ""),
+        "admin_password": "",
+        "has_admin_password": bool(str(extra.get("admin_password") or "")),
+        "group_id": int(extra.get("group_id") or 0),
+        "auto_import": bool(extra.get("auto_import", False)),
+        "sso_fallback": bool(extra.get("sso_fallback", True)),
+        "retries": int(extra.get("retries") or 2),
+        "workers": int(extra.get("workers") or 2),
+        "timeout": int(extra.get("timeout") or 45),
+        "verify_tls": bool(extra.get("verify_tls", True)),
+    }
+
+
+@router.patch("/api/accounts/sub2api/config")
+def api_accounts_sub2api_config_update(
+    request: Request, payload: Sub2ApiConfigUpdate
+) -> dict[str, Any]:
+    check_auth(request)
+    from ._sub2api_runtime import sub2api_import_runtime
+
+    previous = sub2api_import_runtime.config()
+    old_extra = dict(previous.get("extra") or {})
+    api_key = payload.api_key.strip() or str(old_extra.get("api_key") or "")
+    admin_password = payload.admin_password or str(
+        old_extra.get("admin_password") or ""
+    )
+    extra = {
+        **old_extra,
+        "base_url": payload.base_url.strip().rstrip("/"),
+        "auth_mode": payload.auth_mode,
+        "api_key": api_key,
+        "admin_email": payload.admin_email.strip(),
+        "admin_password": admin_password,
+        "group_id": payload.group_id,
+        "auto_import": payload.auto_import,
+        "sso_fallback": payload.sso_fallback,
+        "retries": payload.retries,
+        "workers": payload.workers,
+        "timeout": payload.timeout,
+        "verify_tls": payload.verify_tls,
+    }
+    config = {
+        "enabled": payload.enabled,
+        "endpoint": payload.base_url.strip().rstrip("/"),
+        "api_append": True,
+        "template": "",
+        "extra": extra,
+    }
+    execute_no_return(
+        """
+        INSERT INTO settings(key, value, updated_at) VALUES('exporter_sub2api', ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+        """,
+        (json.dumps(config, ensure_ascii=False), now_iso()),
+    )
+    return {"ok": True, **api_accounts_sub2api_config(request)}
+
+
+@router.post("/api/accounts/sub2api/import")
+def api_accounts_sub2api_import(
+    request: Request, payload: Sub2ApiImportRequest
+) -> dict[str, Any]:
+    check_auth(request)
+    if not payload.account_ids:
+        raise HTTPException(status_code=400, detail="account_ids 不能为空")
+    from ._sub2api_runtime import sub2api_import_runtime
+
+    return {
+        "ok": True,
+        "job": sub2api_import_runtime.enqueue_many(
+            payload.account_ids,
+            group_id=payload.group_id,
+            force=payload.force,
+        ),
+    }
+
+
+@router.post("/api/accounts/sub2api/backfill")
+def api_accounts_sub2api_backfill(
+    request: Request,
+    limit: int = Query(0, ge=0, le=5000),
+    group_id: int = Query(0, ge=0),
+    force: bool = Query(False),
+) -> dict[str, Any]:
+    check_auth(request)
+    from ._sub2api_runtime import sub2api_import_runtime
+
+    return {
+        "ok": True,
+        "job": sub2api_import_runtime.enqueue_backfill(
+            limit=limit, group_id=group_id, force=force
+        ),
+    }
+
+
+@router.get("/api/accounts/sub2api/jobs/{job_id}")
+def api_accounts_sub2api_job(request: Request, job_id: str) -> dict[str, Any]:
+    check_auth(request)
+    from ._sub2api_runtime import sub2api_import_runtime
+
+    job = sub2api_import_runtime.job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Sub2API import job not found")
+    return {"job": job}
+
+
+@router.post("/api/accounts/sub2api/oauth/start")
+def api_accounts_sub2api_oauth_start(
+    request: Request, payload: Sub2ApiOAuthStartRequest
+) -> dict[str, Any]:
+    check_auth(request)
+    from core.sub2api_client import start_oauth
+
+    result = start_oauth(**_sub2api_client_config())
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail=result)
+    result["email"] = payload.email
+    return result
+
+
+@router.post("/api/accounts/sub2api/oauth/complete")
+def api_accounts_sub2api_oauth_complete(
+    request: Request, payload: Sub2ApiOAuthCompleteRequest
+) -> dict[str, Any]:
+    check_auth(request)
+    from core.sub2api_client import complete_oauth
+
+    result = complete_oauth(
+        session_id=payload.session_id,
+        state=payload.state,
+        callback=payload.callback,
+        email=payload.email,
+        group_id=payload.group_id,
+        **_sub2api_client_config(),
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail=result)
+    return result
 
 
 @router.post("/api/accounts/{account_id}/mint-cpa")

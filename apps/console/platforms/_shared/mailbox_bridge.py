@@ -84,6 +84,7 @@ class BridgeMailbox(BaseMailbox):
                 imap_last_n=int(cfg.get("imap_last_n", 30) or 30),
                 imap_hosts=hosts,
                 require_recipient_match=bool(cfg.get("require_recipient_match", True)),
+                reservation_ttl_seconds=int(cfg.get("reservation_ttl_seconds", 1800) or 1800),
                 proxy=self.proxy,
                 stop_event=self._stop_event,
                 log=lambda message: logger.info(message),

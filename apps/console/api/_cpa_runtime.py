@@ -718,6 +718,33 @@ class CpaMintRuntime:
                 "probe_checked_at": now_iso(),
                 "updated_at": now_iso(),
             }
+            post_process = (
+                extra.get("post_process")
+                if isinstance(extra.get("post_process"), dict)
+                else {}
+            )
+            post_process["registration"] = {
+                "status": "completed",
+                "attempt_id": attempt_id,
+                "updated_at": now_iso(),
+            }
+            post_process["probe"] = {
+                "status": "completed",
+                "checked_at": now_iso(),
+                "result": probe,
+            }
+            imports = (
+                post_process.get("imports")
+                if isinstance(post_process.get("imports"), dict)
+                else {}
+            )
+            imports["cpa"] = {
+                "status": "completed",
+                "filename": filename,
+                "updated_at": now_iso(),
+            }
+            post_process["imports"] = imports
+            extra["post_process"] = post_process
             try:
                 status = json.loads(row["exporter_status_json"] or "{}")
             except Exception:
@@ -739,6 +766,15 @@ class CpaMintRuntime:
                     account_id,
                 ),
             )
+            try:
+                from ._sub2api_runtime import sub2api_import_runtime
+
+                if sub2api_import_runtime.is_auto_enabled():
+                    sub2api_import_runtime.enqueue(account_id)
+            except Exception as exc:
+                print(
+                    f"[sub2api-import] account={account_id} enqueue_error={str(exc)[:300]}"
+                )
             return True, ""
         except Exception as exc:
             return False, str(exc)[:500]
@@ -884,6 +920,31 @@ class CpaMintRuntime:
             }
             if probe is not None:
                 extra["cpa"]["probe_checked_at"] = now_iso()
+            post_process = (
+                extra.get("post_process")
+                if isinstance(extra.get("post_process"), dict)
+                else {}
+            )
+            post_process.setdefault(
+                "registration", {"status": "completed", "updated_at": row["created_at"]}
+            )
+            post_process["probe"] = {
+                "status": "completed" if probe_alive else "failed",
+                "checked_at": now_iso(),
+                "result": probe or last_probe,
+            }
+            imports = (
+                post_process.get("imports")
+                if isinstance(post_process.get("imports"), dict)
+                else {}
+            )
+            imports["cpa"] = {
+                "status": "completed" if probe_alive else "blocked",
+                "filename": filename,
+                "updated_at": now_iso(),
+            }
+            post_process["imports"] = imports
+            extra["post_process"] = post_process
             try:
                 status = json.loads(row["exporter_status_json"] or "{}")
             except Exception:
@@ -911,6 +972,16 @@ class CpaMintRuntime:
                     account_id,
                 ),
             )
+            if probe_alive:
+                try:
+                    from ._sub2api_runtime import sub2api_import_runtime
+
+                    if sub2api_import_runtime.is_auto_enabled():
+                        sub2api_import_runtime.enqueue(account_id)
+                except Exception as exc:
+                    print(
+                        f"[sub2api-import] account={account_id} enqueue_error={str(exc)[:300]}"
+                    )
             return True, ""
         except Exception as exc:
             error_text = str(exc)
@@ -930,6 +1001,32 @@ class CpaMintRuntime:
             if last_probe_error:
                 failed_cpa["probe_error"] = last_probe_error[:500]
             extra["cpa"] = failed_cpa
+            post_process = (
+                extra.get("post_process")
+                if isinstance(extra.get("post_process"), dict)
+                else {}
+            )
+            post_process["probe"] = {
+                "status": "failed",
+                "checked_at": now_iso(),
+                "error": error_text[:500],
+                "result": last_probe,
+            }
+            imports = (
+                post_process.get("imports")
+                if isinstance(post_process.get("imports"), dict)
+                else {}
+            )
+            imports.setdefault(
+                "cpa",
+                {
+                    "status": "blocked",
+                    "error": "等待账号测活或 OAuth 续期成功",
+                    "updated_at": now_iso(),
+                },
+            )
+            post_process["imports"] = imports
+            extra["post_process"] = post_process
             execute_no_return(
                 "UPDATE accounts SET extra_json=?, exporter_status_json=?, "
                 "last_checked_at=?, last_error=? WHERE id=?",
