@@ -288,10 +288,50 @@ class RegistrationDeviceFlowTests(unittest.TestCase):
         with patch("grok_oauth_device._new_session", return_value=session):
             result = prepare_registered_account(_SetupPage())
         self.assertTrue(result["ok"])
+        self.assertEqual(result["birth_state"], "updated")
         self.assertIn("SetTosAcceptedVersion", session.calls[0][0])
         self.assertEqual(session.calls[1][0], "https://grok.com/rest/auth/set-birth-date")
         self.assertIn("sso=session", session.headers["Cookie"])
         self.assertNotIn("unrelated", session.headers["Cookie"])
+
+    def test_registered_account_setup_accepts_locked_birth_date(self):
+        session = _Session(
+            [
+                _Response(200, {}),
+                _Response(
+                    429,
+                    {
+                        "code": 8,
+                        "message": (
+                            "Birth date is locked once set. "
+                            "[WKE=account:birth-date-change-limit-reached]"
+                        ),
+                    },
+                ),
+            ]
+        )
+        with patch("grok_oauth_device._new_session", return_value=session):
+            result = prepare_registered_account(_SetupPage())
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["birth_status"], 429)
+        self.assertEqual(result["birth_state"], "already_set")
+
+    def test_registered_account_setup_retries_generic_birth_rate_limit(self):
+        session = _Session(
+            [
+                _Response(200, {}),
+                _Response(429, {"error": "rate limited"}),
+                _Response(204, {}),
+            ]
+        )
+        with (
+            patch("grok_oauth_device._new_session", return_value=session),
+            patch("grok_oauth_device.time.sleep") as sleep,
+        ):
+            result = prepare_registered_account(_SetupPage())
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["birth_state"], "updated")
+        sleep.assert_called_once_with(5)
 
     def test_device_endpoint_falls_back_to_direct_transport(self):
         proxy_session = object()

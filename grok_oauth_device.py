@@ -351,33 +351,80 @@ def prepare_registered_account(
         "Origin": "https://grok.com",
         "Referer": "https://grok.com/",
     }
-    try:
-        birth_response = birth_session.post(
-            birth_url,
-            json=birth_payload,
-            headers=birth_headers,
-            impersonate="chrome",
-            timeout=timeout,
-        )
-    except Exception as exc:
-        # curl_cffi occasionally reports an OpenSSL cross-host connection error
-        # here even though the same endpoint works through requests/OpenSSL.
-        logger(f"account setup birth transport fallback: {type(exc).__name__}")
-        import requests as standard_requests
+    birth_response = None
+    use_standard_transport = False
+    for attempt in range(3):
+        try:
+            if use_standard_transport:
+                import requests as standard_requests
 
-        birth_response = standard_requests.post(
-            birth_url,
-            json=birth_payload,
-            headers={**common_headers, **birth_headers},
-            timeout=timeout,
-            verify=verify_tls,
+                birth_response = standard_requests.post(
+                    birth_url,
+                    json=birth_payload,
+                    headers={**common_headers, **birth_headers},
+                    timeout=timeout,
+                    verify=verify_tls,
+                )
+            else:
+                birth_response = birth_session.post(
+                    birth_url,
+                    json=birth_payload,
+                    headers=birth_headers,
+                    impersonate="chrome",
+                    timeout=timeout,
+                )
+        except Exception as exc:
+            # curl_cffi occasionally reports an OpenSSL cross-host connection
+            # error even though requests/OpenSSL reaches the same endpoint.
+            if not use_standard_transport:
+                logger(f"account setup birth transport fallback: {type(exc).__name__}")
+                use_standard_transport = True
+                continue
+            raise
+        status = int(birth_response.status_code)
+        text = str(getattr(birth_response, "text", "") or "")
+        already_set = status in {400, 409, 429} and any(
+            marker in text.casefold()
+            for marker in (
+                "birth-date-change-limit-reached",
+                "birth date is locked",
+                "already set",
+            )
         )
-    birth_ok = 200 <= int(birth_response.status_code) < 300
-    logger(f"account setup birth_status={birth_response.status_code}")
+        if status != 429 or already_set or attempt >= 2:
+            break
+        retry_after = str(
+            getattr(birth_response, "headers", {}).get("retry-after") or ""
+        ).strip()
+        try:
+            wait_seconds = min(max(1, int(float(retry_after))), 20)
+        except (TypeError, ValueError):
+            wait_seconds = min(5 * (attempt + 1), 20)
+        logger(
+            f"account setup birth rate_limited retry={attempt + 1}/2 "
+            f"sleep={wait_seconds}s"
+        )
+        time.sleep(wait_seconds)
+    if birth_response is None:
+        raise RuntimeError("birth-date setup returned no response")
+    birth_status = int(birth_response.status_code)
+    birth_text = str(getattr(birth_response, "text", "") or "")
+    birth_already_set = birth_status in {400, 409, 429} and any(
+        marker in birth_text.casefold()
+        for marker in (
+            "birth-date-change-limit-reached",
+            "birth date is locked",
+            "already set",
+        )
+    )
+    birth_ok = 200 <= birth_status < 300 or birth_already_set
+    birth_state = "already_set" if birth_already_set else "updated" if birth_ok else "failed"
+    logger(f"account setup birth_status={birth_status} state={birth_state}")
     return {
         "ok": tos_ok and birth_ok,
         "tos_status": int(tos_response.status_code),
-        "birth_status": int(birth_response.status_code),
+        "birth_status": birth_status,
+        "birth_state": birth_state,
     }
 
 
