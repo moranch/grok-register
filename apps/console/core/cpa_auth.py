@@ -202,6 +202,21 @@ def exchange_sso_for_token(
         raise RuntimeError(f"device flow 授权失败: HTTP {approved.status_code}")
 
     interval = max(2, int(device_data.get("interval") or 5))
+    try:
+        denial_grace_attempts = min(
+            max(
+                0,
+                int(
+                    os.getenv(
+                        "GROK_REGISTER_OAUTH_DENIAL_GRACE_ATTEMPTS",
+                        "6",
+                    )
+                ),
+            ),
+            20,
+        )
+    except (TypeError, ValueError):
+        denial_grace_attempts = 6
     deadline = time.time() + min(int(device_data.get("expires_in") or timeout), max(timeout, 30))
     transient_errors = 0
     while time.time() < deadline:
@@ -245,6 +260,22 @@ def exchange_sso_for_token(
             continue
         if error == "slow_down":
             interval += 5
+            continue
+        if (
+            error == "invalid_grant"
+            and "access denied" in error_description.casefold()
+            and denial_grace_attempts > 0
+            and time.time() + interval < deadline
+        ):
+            # The consent page can reach its final state before auth.x.ai has
+            # replicated the grant to the token endpoint.  Registration-side
+            # OAuth already tolerates this window; historical SSO backfill must
+            # do the same or it quarantines every otherwise-valid account.
+            denial_grace_attempts -= 1
+            logger(
+                "OAuth poll: access-denied grace retry "
+                f"remaining={denial_grace_attempts}"
+            )
             continue
         detail = error or str(response.status_code)
         if error_description:

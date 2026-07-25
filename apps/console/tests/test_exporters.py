@@ -15,6 +15,7 @@ from core.cpa_auth import (
     CPA_REDIRECT_URI,
     CPA_USERINFO_URL,
     GROK_ACCOUNT_URL,
+    exchange_sso_for_token,
     probe_grok_account_session,
     probe_cpa_account,
     refresh_cpa_token,
@@ -25,6 +26,64 @@ from exporters.grok2api import Grok2APIExporter
 
 
 class ExporterTests(unittest.TestCase):
+    def test_cpa_device_flow_retries_replication_access_denied(self):
+        def response(status=200, *, url="", text="", payload=None):
+            item = Mock(status_code=status, url=url, text=text)
+            item.json.return_value = payload or {}
+            return item
+
+        session = Mock()
+        session.request.side_effect = [
+            response(url="https://accounts.x.ai/"),
+            response(
+                payload={
+                    "user_code": "ABCD-1234",
+                    "device_code": "device-code",
+                    "verification_uri_complete": (
+                        "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234"
+                    ),
+                    "interval": 2,
+                    "expires_in": 90,
+                }
+            ),
+            response(url="https://accounts.x.ai/oauth2/device?user_code=ABCD-1234"),
+            response(url="https://accounts.x.ai/oauth2/device/consent"),
+            response(url="https://accounts.x.ai/oauth2/device/done"),
+        ]
+        denied = response(
+            400,
+            payload={
+                "error": "invalid_grant",
+                "error_description": "Access denied",
+            },
+        )
+        granted = response(
+            payload={
+                "access_token": "access",
+                "refresh_token": "refresh",
+            }
+        )
+        session.post.side_effect = [denied, denied, granted]
+        messages = []
+
+        with (
+            patch("core.cpa_auth.curl_requests.Session", return_value=session),
+            patch("core.cpa_auth.time.sleep"),
+            patch.dict(
+                "os.environ",
+                {"GROK_REGISTER_OAUTH_DENIAL_GRACE_ATTEMPTS": "2"},
+            ),
+        ):
+            token = exchange_sso_for_token("sso-cookie", log=messages.append)
+
+        self.assertEqual(token["access_token"], "access")
+        self.assertEqual(token["refresh_token"], "refresh")
+        self.assertEqual(session.post.call_count, 3)
+        self.assertEqual(
+            sum("access-denied grace retry" in message for message in messages),
+            2,
+        )
+
     @patch("exporters.grok2api.httpx.Client")
     def test_grok2api_upgrades_legacy_endpoint_to_v3_import(self, client_cls):
         client = client_cls.return_value.__enter__.return_value
