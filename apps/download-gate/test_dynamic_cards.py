@@ -125,6 +125,72 @@ class DynamicCardTests(unittest.TestCase):
             self.assertEqual(manifest["cards"][key]["bundle_id"], "")
             self.assertNotIn(key, manifest["keys"])
 
+    def test_bulk_card_parser_accepts_keys_links_and_deduplicates(self):
+        parsed = gate.parse_card_keys_input(
+            "DG-AAAA-BBBB-CCCC\n"
+            "https://example.test/?key=DG-DDDD-EEEE-FFFF\n"
+            "DG-AAAA-BBBB-CCCC, DG-GGGG-HHHH-JJJJ"
+        )
+        self.assertEqual(
+            parsed,
+            [
+                "DG-AAAA-BBBB-CCCC",
+                "DG-DDDD-EEEE-FFFF",
+                "DG-GGGG-HHHH-JJJJ",
+            ],
+        )
+
+    def test_batch_revoke_and_delete_unused_cards(self):
+        manifest = gate.load_manifest()
+        revoke_key, delete_key = gate.issue_cards(manifest, 2, "batch-a")
+
+        revoked = gate.batch_manage_cards(
+            manifest,
+            [revoke_key, "DG-NOT-FOUND"],
+            mode="revoke",
+        )
+        deleted = gate.batch_manage_cards(manifest, [delete_key], mode="delete")
+
+        self.assertEqual(revoked["revoked"], 1)
+        self.assertEqual(revoked["missing"], 1)
+        self.assertEqual(manifest["cards"][revoke_key]["status"], "void")
+        self.assertFalse(manifest["cards"][revoke_key].get("deleted", False))
+        self.assertEqual(deleted["deleted"], 1)
+        self.assertTrue(manifest["cards"][delete_key]["deleted"])
+        self.assertEqual(manifest["cards"][delete_key]["status"], "void")
+        self.assertIn(delete_key, gate.existing_card_keys(manifest))
+
+    def test_delete_claimed_card_revokes_but_preserves_delivery_audit(self):
+        key = "DG-CLAIMED-CARD"
+        manifest = {
+            "bundles": {
+                "bundle-1": {
+                    "id": "bundle-1",
+                    "key": key,
+                    "bound_at": "2026-07-25 01:02:03",
+                }
+            },
+            "keys": {key: "bundle-1"},
+            "cards": {
+                key: {
+                    "key": key,
+                    "status": "claimed",
+                    "bundle_id": "bundle-1",
+                    "claimed_at": "2026-07-25 01:02:03",
+                }
+            },
+        }
+
+        result = gate.batch_manage_cards(manifest, [key], mode="delete")
+        gate.save_manifest(manifest)
+        reloaded = gate.load_manifest()
+
+        self.assertEqual(result["claimed_preserved"], 1)
+        self.assertIn("bundle-1", reloaded["bundles"])
+        self.assertEqual(reloaded["cards"][key]["status"], "void")
+        self.assertFalse(reloaded["cards"][key].get("deleted", False))
+        self.assertNotIn(key, reloaded["keys"])
+
     def test_cards_are_bound_to_one_target_platform(self):
         manifest = gate.load_manifest()
         key = gate.issue_cards(manifest, 1, "kiro-batch", platform="kiro")[0]

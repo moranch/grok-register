@@ -10,6 +10,7 @@ import io
 import json
 import mimetypes
 import os
+import re
 import shutil
 import secrets
 import threading
@@ -45,7 +46,7 @@ ADMIN_PATH = normalize_admin_path(os.environ.get("DOWNLOAD_GATE_ADMIN_PATH", "/d
 INTERNAL_API_TOKEN = os.environ.get("DOWNLOAD_GATE_INTERNAL_TOKEN", "").strip()
 CONSOLE_URL = os.environ.get("DOWNLOAD_GATE_CONSOLE_URL", "").strip().rstrip("/")
 CONSOLE_TIMEOUT_SECONDS = max(int(os.environ.get("DOWNLOAD_GATE_CONSOLE_TIMEOUT", "120") or 120), 5)
-APP_VERSION = "2026.07.25.04"
+APP_VERSION = "2026.07.25.05"
 CLAIM_TTL_SECONDS = 24 * 60 * 60
 BATCH_DOWNLOAD_TTL_SECONDS = 10 * 60
 MAX_BATCH_KEYS = 20
@@ -290,17 +291,22 @@ def migrate_manifest(data: dict) -> tuple[dict, bool]:
     keys = data["keys"]
     cards = data["cards"]
 
+    raw_cards = data.get("cards") if isinstance(data.get("cards"), dict) else {}
     historical: dict[str, str] = {}
     for raw_key, raw_bundle_id in list(keys.items()):
         key = normalize_key(str(raw_key or ""))
         bundle_id = str(raw_bundle_id or "").strip()
-        if key and bundle_id:
+        card = raw_cards.get(key)
+        revoked = isinstance(card, dict) and str(card.get("status") or "") == "void"
+        if key and bundle_id and not revoked:
             historical[key] = bundle_id
     for bundle_id, bundle in bundles.items():
         if not isinstance(bundle, dict):
             continue
         key = normalize_key(str(bundle.get("key") or ""))
-        if key:
+        card = raw_cards.get(key)
+        revoked = isinstance(card, dict) and str(card.get("status") or "") == "void"
+        if key and not revoked:
             historical.setdefault(key, str(bundle_id))
     if historical != keys:
         data["keys"] = keys = historical
@@ -340,6 +346,9 @@ def migrate_manifest(data: dict) -> tuple[dict, bool]:
     for key, card in cards.items():
         if not isinstance(card, dict):
             continue
+        if str(card.get("status") or "") == "void" and key in keys:
+            keys.pop(key, None)
+            changed = True
         bundle_id = str(card.get("bundle_id") or "")
         bundle = bundles.get(bundle_id) if isinstance(bundles.get(bundle_id), dict) else {}
         platform = normalize_card_platform(card.get("platform") or bundle.get("platform"))
@@ -1730,6 +1739,129 @@ def issue_cards(
         }
         issued.append(key)
     return issued
+
+
+def parse_card_keys_input(value: str, *, limit: int = 5000) -> list[str]:
+    """Extract unique card keys from lines, pasted links, or mixed separators."""
+    text = str(value or "")
+    candidates: list[str] = []
+    for part in re.split(r"[\r\n,，;；\s]+", text):
+        part = part.strip()
+        if not part:
+            continue
+        parsed_key = ""
+        try:
+            parsed = urlparse(part)
+            if parsed.scheme and parsed.netloc:
+                parsed_key = str((parse_qs(parsed.query).get("key") or [""])[0]).strip()
+        except Exception:
+            parsed_key = ""
+        matches = re.findall(r"DG-[A-Za-z0-9_-]+", part, flags=re.IGNORECASE)
+        if parsed_key:
+            candidates.append(parsed_key)
+        elif matches:
+            candidates.extend(matches)
+        else:
+            candidates.append(part)
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = normalize_key(candidate)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(key)
+        if len(result) >= max(1, int(limit or 1)):
+            break
+    return result
+
+
+def batch_manage_cards(manifest: dict, card_keys: list[str], *, mode: str) -> dict:
+    """Revoke cards or hide-delete unused cards while retaining audit tombstones."""
+    mode = str(mode or "revoke").strip().lower()
+    if mode not in {"revoke", "delete"}:
+        raise ValueError("不支持的卡密操作")
+    cards = manifest.setdefault("cards", {})
+    keys = manifest.setdefault("keys", {})
+    bundles = manifest.setdefault("bundles", {})
+    result = {
+        "requested": len(card_keys),
+        "revoked": 0,
+        "deleted": 0,
+        "claimed_preserved": 0,
+        "busy": 0,
+        "missing": 0,
+        "unchanged": 0,
+    }
+    changed = False
+    timestamp = now_text()
+
+    for raw_key in card_keys:
+        key = normalize_key(raw_key)
+        card = cards.get(key)
+        if not isinstance(card, dict):
+            result["missing"] += 1
+            continue
+        if str(card.get("status") or "") == "provisioning":
+            result["busy"] += 1
+            continue
+        if bool(card.get("deleted")):
+            result["unchanged"] += 1
+            continue
+
+        bundle_id = str(card.get("bundle_id") or keys.get(key) or "").strip()
+        bundle = bundles.get(bundle_id) if isinstance(bundles.get(bundle_id), dict) else {}
+        claimed = bool(
+            str(card.get("status") or "") == "claimed"
+            or card.get("claimed_at")
+            or bundle.get("bound_at")
+        )
+
+        if mode == "delete" and not claimed:
+            if bundle_id:
+                delete_bundle_from_manifest(
+                    manifest,
+                    bundle_id,
+                    delete_zip=True,
+                    include_related=True,
+                )
+            keys.pop(key, None)
+            card = cards.get(key) if isinstance(cards.get(key), dict) else card
+            card.update(
+                {
+                    "status": "void",
+                    "deleted": True,
+                    "deleted_at": timestamp,
+                    "voided_at": timestamp,
+                    "bundle_id": "",
+                    "last_error": "管理员批量删除卡密",
+                }
+            )
+            result["deleted"] += 1
+            changed = True
+            continue
+
+        already_void = str(card.get("status") or "") == "void"
+        keys.pop(key, None)
+        card.update(
+            {
+                "status": "void",
+                "voided_at": str(card.get("voided_at") or timestamp),
+                "last_error": "管理员批量销卡",
+            }
+        )
+        if claimed and mode == "delete":
+            card["delete_requested_at"] = timestamp
+            result["claimed_preserved"] += 1
+        elif already_void:
+            result["unchanged"] += 1
+        else:
+            result["revoked"] += 1
+        changed = True
+
+    result["changed"] = changed
+    return result
 
 
 def page_shell(
@@ -3491,7 +3623,11 @@ def admin_page(
     manifest = load_manifest()
     auto_replenish_panel = admin_auto_replenish_panel()
     cards = sorted(
-        [card for card in (manifest.get("cards") or {}).values() if isinstance(card, dict)],
+        [
+            card
+            for card in (manifest.get("cards") or {}).values()
+            if isinstance(card, dict) and not bool(card.get("deleted"))
+        ],
         key=lambda item: str(item.get("created_at") or ""),
         reverse=True,
     )
@@ -3554,6 +3690,23 @@ def admin_page(
     <label>目标平台<select name="platform" required>{platform_options}</select></label>
   </div>
   <button class="full" type="submit">生成预发行卡密</button>
+</form>
+<form class="panel upload-panel" method="post" action="{ADMIN_PATH}/cards/bulk"
+      onsubmit="return confirm('确认批量处理这些卡密？作废后将立即无法领取。已领取卡会保留交付审计记录。')">
+  <div class="panel-title"><span>批量销卡 / 删除卡密</span><small>每行一个卡密，也支持粘贴取件链接</small></div>
+  <label>卡密列表
+    <textarea name="card_keys" rows="7" required placeholder="DG-XXXX-XXXX-XXXX&#10;DG-YYYY-YYYY-YYYY"></textarea>
+  </label>
+  <div class="grid">
+    <label>处理方式
+      <select name="mode" required>
+        <option value="revoke">批量作废（保留记录）</option>
+        <option value="delete">删除未领取卡（已领取卡仅作废）</option>
+      </select>
+    </label>
+  </div>
+  <div class="note warn">作废会立即阻止领取和原下载链接；删除模式只隐藏并清理未领取卡，已领取卡保留交付记录用于防重复。</div>
+  <button class="danger full" type="submit">执行批量销卡</button>
 </form>
 {issued_result}
 <div class="admin-table"><table>
@@ -4788,6 +4941,12 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
                 return
             self.handle_issue_cards()
             return
+        if parsed.path == f"{ADMIN_PATH}/cards/bulk":
+            if not is_admin(self):
+                self.send_html(login_page("请先登录。"), HTTPStatus.UNAUTHORIZED)
+                return
+            self.handle_bulk_cards()
+            return
         if parsed.path == f"{ADMIN_PATH}/cleanup":
             if not is_admin(self):
                 self.send_html(login_page("请先登录。"), HTTPStatus.UNAUTHORIZED)
@@ -4958,6 +5117,48 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
             f"&issued_platform={quote(normalize_card_platform(platform), safe='')}#cards",
             status=303,
         )
+
+    def handle_bulk_cards(self) -> None:
+        params = parse_qs(
+            self.read_body().decode("utf-8", errors="replace"),
+            keep_blank_values=True,
+        )
+        mode = str((params.get("mode") or ["revoke"])[0]).strip().lower()
+        card_keys = parse_card_keys_input((params.get("card_keys") or [""])[0])
+        if not card_keys:
+            notice = quote("没有识别到可处理的卡密", safe="")
+            self.redirect(f"{ADMIN_PATH}?notice={notice}#cards", status=303)
+            return
+
+        manifest = load_manifest()
+        existing = [key for key in card_keys if isinstance(manifest.get("cards", {}).get(key), dict)]
+        backup_path = backup_manifest(f"cards-{mode}") if existing else None
+        try:
+            result = batch_manage_cards(manifest, card_keys, mode=mode)
+            if result["changed"]:
+                save_manifest(manifest)
+        except Exception as exc:
+            notice = quote(f"批量卡密操作失败：{exc}", safe="")
+            self.redirect(f"{ADMIN_PATH}?notice={notice}#cards", status=303)
+            return
+
+        parts = [
+            f"识别 {result['requested']} 张",
+            f"作废 {result['revoked']} 张",
+            f"删除未领取卡 {result['deleted']} 张",
+        ]
+        if result["claimed_preserved"]:
+            parts.append(f"已领取卡仅作废并保留记录 {result['claimed_preserved']} 张")
+        if result["busy"]:
+            parts.append(f"正在分配暂未处理 {result['busy']} 张")
+        if result["missing"]:
+            parts.append(f"不存在 {result['missing']} 张")
+        if result["unchanged"]:
+            parts.append(f"无需重复处理 {result['unchanged']} 张")
+        if backup_path:
+            parts.append(f"已备份 {backup_path.name}")
+        notice = quote("；".join(parts), safe="")
+        self.redirect(f"{ADMIN_PATH}?notice={notice}#cards", status=303)
 
     def handle_auto_replenish(self) -> None:
         params = parse_qs(self.read_body().decode("utf-8", errors="replace"), keep_blank_values=True)
