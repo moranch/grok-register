@@ -117,7 +117,7 @@ co.set_argument("--disable-software-rasterizer")
 #   - 其它情况（无 DISPLAY）       -> 加 --headless=new
 if _debug_mode_enabled and os.environ.get("DISPLAY"):
     print("[*] 调试模式：使用有头浏览器（Xvfb 虚拟显示器 + noVNC 可观察）")
-elif not os.environ.get("DISPLAY"):
+else:
     co.set_argument("--headless=new")
     print("[*] 生产模式：使用 --headless=new")
 
@@ -1395,7 +1395,13 @@ def main():
             except Exception as error:
                 print(f"[Error] 第 {current_round} 轮失败: {error}")
             finally:
-                restart_browser()
+                # Each account must start from a new Chromium process/profile.
+                # Reusing a tab after a CDP disconnect leaves DrissionPage with
+                # a stale page object and makes every following round fail with
+                # "page was refreshed" even though the original crash is over.
+                stop_browser()
+                if args.count == 0 or current_round < args.count:
+                    start_browser()
 
             if args.count == 0 or current_round < args.count:
                 time.sleep(2)
