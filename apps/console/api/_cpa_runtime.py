@@ -135,7 +135,39 @@ class CpaMintRuntime:
             return False
 
     def enqueue_backfill(self, *, limit: int = 0, force: bool = False) -> dict[str, Any]:
-        sql = "SELECT id, extra_json FROM accounts WHERE platform = 'grok' AND sso <> '' ORDER BY id ASC"
+        # Backfill can include historical/consumed accounts, but those accounts can
+        # never increase the pickup inventory.  Put currently deliverable accounts
+        # first so a large historical table does not keep verified_stock at zero
+        # while workers spend minutes renewing credentials that cannot be assigned.
+        sql = """
+            SELECT a.id, a.extra_json
+            FROM accounts a
+            WHERE a.platform = 'grok' AND a.sso <> ''
+            ORDER BY
+                CASE WHEN
+                    a.status = 'active'
+                    AND a.lifecycle_status NOT IN ('expired', 'invalid')
+                    AND a.validity_status <> 'invalid'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM account_delivery_consumptions c
+                        WHERE c.account_id = a.id
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM account_delivery_leases l
+                        WHERE l.account_id = a.id
+                          AND l.state IN ('probing', 'ready', 'packing')
+                    )
+                THEN 0 ELSE 1 END ASC,
+                CASE WHEN COALESCE(
+                    json_extract(a.extra_json, '$.cpa.credential_ready'), 0
+                ) <> 1 THEN 0 ELSE 1 END ASC,
+                COALESCE(
+                    json_extract(a.extra_json, '$.cpa.probe_checked_at'),
+                    json_extract(a.extra_json, '$.cpa.updated_at'),
+                    ''
+                ) ASC,
+                a.id ASC
+        """
         rows = fetch_all(sql)
         selected: list[int] = []
         for row in rows:

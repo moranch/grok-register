@@ -202,6 +202,27 @@ class CpaRuntimeTests(unittest.TestCase):
 
         enqueue.assert_called_once_with(account_id, force=False)
 
+    def test_forced_backfill_prioritizes_deliverable_inventory(self):
+        historical_id = _shared.execute(
+            """
+            INSERT INTO accounts
+                (platform, email, sso, extra_json, status, lifecycle_status,
+                 validity_status, created_at)
+            VALUES ('grok', 'historical@example.com', 'old-sso', '{}', 'active',
+                    'expired', 'valid', ?)
+            """,
+            (_shared.now_iso(),),
+        )
+        candidate_id = self.add_account()
+
+        with patch.object(self.runtime, "enqueue", return_value=True) as enqueue:
+            job = self.runtime.enqueue_backfill(limit=1, force=True)
+
+        self.assertNotEqual(historical_id, candidate_id)
+        enqueue.assert_called_once_with(candidate_id, force=True, job_id=job["id"])
+        self.assertEqual(job["total"], 1)
+        self.assertEqual(job["queued"], 1)
+
     def test_init_db_seeds_enabled_local_cpa_exporter(self):
         row = _shared.fetch_one("SELECT value FROM settings WHERE key='exporter_cpa'")
         self.assertIsNotNone(row)
