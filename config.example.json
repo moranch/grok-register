@@ -8,6 +8,7 @@
     "temp_mail_site_password": "",
     "proxy": "",
     "browser_proxy": "",
+    "verification_code_timeout": 120,
     "post_register_oauth": {
         "enabled": true,
         "timeout": 90,

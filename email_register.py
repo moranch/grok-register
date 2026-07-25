@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 import string
@@ -103,7 +104,11 @@ def get_email_and_token() -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
-def get_oai_code(dev_token: str, email: str, timeout: int = 30) -> Optional[str]:
+def get_oai_code(
+    dev_token: str,
+    email: str,
+    timeout: Optional[int] = None,
+) -> Optional[str]:
     """
     轮询收件箱获取 OTP 验证码。
     供 DrissionPage_example.py 调用。
@@ -111,6 +116,19 @@ def get_oai_code(dev_token: str, email: str, timeout: int = 30) -> Optional[str]
     Returns:
         验证码字符串（去除连字符，如 "MM0SF3"）或 None
     """
+    if timeout is None:
+        configured_timeout = (
+            os.getenv("GROK_REGISTER_MAIL_CODE_TIMEOUT")
+            or _conf.get("verification_code_timeout")
+            or 120
+        )
+        try:
+            timeout = min(max(30, int(configured_timeout)), 600)
+        except (TypeError, ValueError):
+            timeout = 120
+    else:
+        timeout = min(max(1, int(timeout)), 600)
+
     if str(dev_token or "").startswith("hotmail:"):
         account = _hotmail_accounts.get(dev_token)
         if not account:
