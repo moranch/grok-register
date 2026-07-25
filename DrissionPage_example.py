@@ -170,6 +170,7 @@ co.add_extension(EXTENSION_PATH)
 _chrome_temp_dir: str = ""
 browser = None
 page = None
+_profile_submit_listener_started = False
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 
@@ -274,6 +275,189 @@ return !!(givenInput && familyInput && passwordInput);
         ))
     except Exception:
         return False
+
+
+def save_debug_snapshot(label, *, extra=None):
+    """Persist a small, secret-redacted snapshot for signup regressions.
+
+    The account frontend changes independently of this project.  Keeping the
+    decisive post-submit page state makes it possible to distinguish a rejected
+    form from a successful navigation instead of reporting every failure as a
+    missing cookie.
+    """
+    if not _debug_mode_enabled:
+        return ""
+
+    try:
+        refresh_active_page()
+        if page is None:
+            return ""
+
+        debug_dir = os.path.join(os.path.dirname(__file__), "debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        stem = f"{label}_{ts}"
+
+        summary = page.run_js(
+            r"""
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+const inputs = Array.from(document.querySelectorAll('input, textarea, select')).map((node) => {
+    const name = String(node.name || node.id || node.getAttribute('data-testid') || '');
+    const type = String(node.type || node.tagName || '').toLowerCase();
+    const raw = String(node.value || '');
+    const secret = type === 'password' || /token|secret|challenge|turnstile/i.test(name);
+    return {
+        name,
+        type,
+        visible: isVisible(node),
+        disabled: !!node.disabled,
+        ariaDisabled: node.getAttribute('aria-disabled') || '',
+        value: secret ? `<redacted:${raw.length}>` : raw.slice(0, 200),
+    };
+});
+const buttons = Array.from(document.querySelectorAll('button, [role="button"]')).filter(isVisible).map((node) => ({
+    text: String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 300),
+    type: node.getAttribute('type') || '',
+    disabled: !!node.disabled,
+    ariaDisabled: node.getAttribute('aria-disabled') || '',
+}));
+const alerts = Array.from(document.querySelectorAll('[role="alert"], [data-sonner-toast], .error, [class*="error"]'))
+    .filter(isVisible)
+    .map((node) => String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 1000))
+    .filter(Boolean);
+return {
+    url: location.href,
+    title: document.title,
+    readyState: document.readyState,
+    bodyText: String(document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 12000),
+    inputs,
+    buttons,
+    alerts,
+};
+            """
+        ) or {}
+
+        cookies = page.cookies(all_domains=True, all_info=True) or []
+        summary["cookies"] = [
+            {
+                "name": str(item.get("name", "")),
+                "domain": str(item.get("domain", "")),
+                "path": str(item.get("path", "")),
+            }
+            for item in cookies
+            if isinstance(item, dict)
+        ]
+        if extra is not None:
+            summary["extra"] = extra
+
+        with open(os.path.join(debug_dir, f"{stem}.json"), "w", encoding="utf-8") as handle:
+            json.dump(summary, handle, ensure_ascii=False, indent=2, default=str)
+        html = page.run_js(
+            r"""
+const clone = document.documentElement.cloneNode(true);
+for (const node of clone.querySelectorAll('input, textarea')) {
+    const name = String(node.name || node.id || node.getAttribute('data-testid') || '');
+    const type = String(node.type || '').toLowerCase();
+    if (type === 'password' || /token|secret|challenge|turnstile/i.test(name)) {
+        node.value = '<redacted>';
+        node.setAttribute('value', '<redacted>');
+        if (node.tagName === 'TEXTAREA') node.textContent = '<redacted>';
+    }
+}
+return clone.outerHTML;
+            """
+        ) or ""
+        with open(os.path.join(debug_dir, f"{stem}.html"), "w", encoding="utf-8") as handle:
+            handle.write(str(html))
+        page.get_screenshot(path=os.path.join(debug_dir, f"{stem}.png"))
+        print(f"[Debug] 已保存页面快照 {stem}: url={summary.get('url', '')}")
+        return stem
+    except Exception as exc:
+        print(f"[Debug] 保存页面快照失败 ({label}): {type(exc).__name__}: {exc}")
+        return ""
+
+
+def start_profile_submit_listener():
+    global _profile_submit_listener_started
+    if not _debug_mode_enabled or page is None:
+        return
+    try:
+        page.listen.start(targets="accounts.x.ai", method="POST")
+        _profile_submit_listener_started = True
+    except Exception as exc:
+        print(f"[Debug] 启动资料提交网络监听失败: {type(exc).__name__}: {exc}")
+
+
+def save_profile_submit_packets(timeout=3):
+    """Drain post-submit packets and persist only a compact redacted summary."""
+    global _profile_submit_listener_started
+    if not _profile_submit_listener_started or page is None:
+        return []
+
+    def redact(value, *, raw_string=False):
+        if isinstance(value, dict):
+            result = {}
+            for key, item in value.items():
+                if any(part in str(key).lower() for part in ("password", "token", "secret", "cookie", "authorization")):
+                    result[key] = "<redacted>"
+                else:
+                    result[key] = redact(item)
+            return result
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        if isinstance(value, str):
+            if raw_string:
+                return f"<raw-body:{len(value)} chars>"
+            return value[:4000]
+        return value
+
+    packets = []
+    try:
+        for packet in page.listen.steps(count=20, timeout=max(0.2, float(timeout))):
+            try:
+                packets.append(
+                    {
+                        "url": str(packet.url),
+                        "method": str(packet.method),
+                        "resource_type": str(packet.resourceType),
+                        "status": getattr(packet.response, "status", None),
+                        "request": redact(
+                            packet.request.postData,
+                            raw_string=isinstance(packet.request.postData, str),
+                        ),
+                        "response": redact(
+                            packet.response.body,
+                            raw_string=isinstance(packet.response.body, str),
+                        ),
+                        "failure": str(packet.fail_info.errorText or ""),
+                    }
+                )
+            except Exception as exc:
+                packets.append({"packet_error": f"{type(exc).__name__}: {exc}"})
+    except Exception as exc:
+        packets.append({"listener_error": f"{type(exc).__name__}: {exc}"})
+    finally:
+        try:
+            page.listen.stop()
+        except Exception:
+            pass
+        _profile_submit_listener_started = False
+
+    if packets:
+        debug_dir = os.path.join(os.path.dirname(__file__), "debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        path = os.path.join(debug_dir, f"profile_submit_network_{ts}.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(packets, handle, ensure_ascii=False, indent=2, default=str)
+        print(f"[Debug] 已保存资料提交网络摘要: {path} packets={len(packets)}")
+    return packets
 
 
 def click_email_signup_button(timeout=10):
@@ -768,6 +952,7 @@ def fill_profile_and_submit(timeout=30):
     given_name, family_name, password = build_profile()
     deadline = time.time() + timeout
     turnstile_token = ""
+    submit_instrumented = False
 
     while time.time() < deadline:
         filled = page.run_js(
@@ -953,6 +1138,14 @@ return String(challengeInput.value || '').trim() === String(token || '').trim();
 
         time.sleep(1.2)
 
+        if not submit_instrumented:
+            save_debug_snapshot(
+                "before_profile_submit",
+                extra={"turnstile_state": turnstile_state, "turnstile_token_present": bool(turnstile_token)},
+            )
+            start_profile_submit_listener()
+            submit_instrumented = True
+
         try:
             submit_button = page.ele('tag:button@@text()=完成注册') or page.ele('tag:button@@text():Create Account') or page.ele('tag:button@@text():Sign up')
         except Exception:
@@ -993,6 +1186,33 @@ return challengeInput ? String(challengeInput.value || '').trim() : 'not-found';
 
         if clicked:
             print(f"[*] 已填写注册资料并点击完成注册: {given_name} {family_name} / {password}")
+            # Give the action/route request enough time to settle and preserve
+            # the decisive response before the caller starts polling cookies.
+            time.sleep(2)
+            packets = save_profile_submit_packets(timeout=2)
+            snapshot = save_debug_snapshot(
+                "after_profile_submit",
+                extra={
+                    "network": [
+                        {
+                            "url": item.get("url", ""),
+                            "status": item.get("status"),
+                            "failure": item.get("failure", ""),
+                        }
+                        for item in packets
+                        if isinstance(item, dict)
+                    ]
+                },
+            )
+            if not snapshot:
+                # A successful Next.js server action replaces the execution
+                # context before the new document is ready. Rebind once so the
+                # post-navigation success page is still captured.
+                time.sleep(1)
+                save_debug_snapshot(
+                    "after_profile_submit",
+                    extra={"network_count": len(packets), "snapshot_retry": True},
+                )
             return {
                 "given_name": given_name,
                 "family_name": family_name,
@@ -1074,6 +1294,7 @@ def wait_for_sso_cookie(timeout=30):
     # 必须在注册完成后再取 sso，优先抓取精确的 sso cookie。
     deadline = time.time() + timeout
     last_seen_names = set()
+    last_error = ""
 
     while time.time() < deadline:
         try:
@@ -1099,13 +1320,21 @@ def wait_for_sso_cookie(timeout=30):
                     return value
 
         except PageDisconnectedError:
+            last_error = "PageDisconnectedError"
             refresh_active_page()
-        except Exception:
-            pass
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
 
         time.sleep(1)
 
-    raise Exception(f"注册完成后未获取到 sso cookie，当前已见 cookie: {sorted(last_seen_names)}")
+    save_debug_snapshot(
+        "sso_cookie_timeout",
+        extra={"last_seen_cookie_names": sorted(last_seen_names), "last_error": last_error},
+    )
+    raise Exception(
+        f"注册完成后未获取到 sso cookie，当前已见 cookie: {sorted(last_seen_names)}"
+        + (f"，最后异常: {last_error}" if last_error else "")
+    )
 
 
 def append_sso_to_txt(sso_value, output_path=DEFAULT_SSO_FILE):
