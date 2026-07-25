@@ -15,10 +15,29 @@
 7. 轮询临时邮箱，拿到验证码。
 8. 提交验证码，进入资料填写页。
 9. 自动填写随机姓名和密码，完成注册。
-10. 注册成功后从浏览器 cookie 中提取 `sso`。
-11. 把 `sso` 先写入任务目录下的 `sso/task_<id>.txt`。
-12. 如果配置了 `api.endpoint`，再把 `sso` 推送到 `grok2api` 兼容接口。
-13. 控制台持续解析日志，显示当前轮次、成功数、失败数、最近邮箱和错误。
+10. 注册页的 `CreateUserAndSession` 完成后，从同一个浏览器 profile 提取 `sso`。
+11. 把 `sso` 写入任务目录下的 `sso/task_<id>.txt`，并立即生成/推送 Grok2API Web Auth。
+12. 在浏览器被回收之前，复用当前登录 Session 执行标准 xAI Device Authorization：
+    - `POST https://auth.x.ai/oauth2/device/code` 获取 `device_code` / `user_code`
+    - 当前注册浏览器打开 `verification_uri_complete`
+    - 依次确认 `Continue`、`Allow`
+    - `POST https://auth.x.ai/oauth2/token` 换取 `access_token` / `refresh_token`
+13. token 成功后一次性扇出三类产物：
+    - Grok2API：Web SSO Auth
+    - CLIProxyAPI（CPA）：`xai-<email>.json`
+    - Sub2API：`SUB2API-grok-<email>.json`
+14. 控制台持续解析日志，显示当前轮次、成功数、失败数、最近邮箱和错误。
+
+## SSO、Device Flow 与 CPA 的边界
+
+- `CreateUserAndSession`/登录负责生成 Web `sso`；它能用于 Grok Web/Grok2API。
+- Device Flow 由 `auth.x.ai` 签发 OAuth access/refresh token，使用公开 Grok CLI client：
+  - `client_id=b1a00492-073a-47ea-816f-4c329264a828`
+  - `scope=openid profile email offline_access grok-cli:access api:access`
+- CPA **不是 OAuth 签发方**。CPA 只读取并续期已经成功签发的 xAI OAuth 凭据。
+- 有效 SSO 不代表账号一定具备 Grok CLI/API OAuth 权限。若 token 端点返回
+  `invalid_grant: Access denied`，系统记录为 `oauth_entitlement_denied`，停止重复签发，
+  但不会把仍可登录的 Web/SSO 账号错误标成失效。
 
 ## 现阶段卡点通常在哪
 

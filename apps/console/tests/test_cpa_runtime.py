@@ -24,6 +24,7 @@ class CpaRuntimeTests(unittest.TestCase):
             "endpoint": "",
             "extra": {
                 "auth_dir": self.temp.name,
+                "sub_auth_dir": str(Path(self.temp.name) / "sub-auth"),
                 "base_url": "https://cli-chat-proxy.grok.com/v1",
                 "prevalidate_enabled": True,
                 "prevalidate_ttl_minutes": 60,
@@ -192,7 +193,7 @@ class CpaRuntimeTests(unittest.TestCase):
         self.assertEqual(extra["cpa"]["mint_method"], "device_flow")
         self.assertEqual(extra["cpa"]["probe"]["probe_kind"], "account_session")
 
-    def test_double_oauth_rejection_quarantines_account(self):
+    def test_double_oauth_rejection_marks_entitlement_without_invalidating_sso(self):
         account_id = self.add_account()
         session_probe = {
             "ok": True,
@@ -224,9 +225,9 @@ class CpaRuntimeTests(unittest.TestCase):
             (account_id,),
         )
         extra = json.loads(row["extra_json"])
-        self.assertEqual(row["validity_status"], "invalid")
+        self.assertEqual(row["validity_status"], "valid")
         self.assertIn("invalid_grant", row["last_error"])
-        self.assertEqual(extra["cpa"]["failure_kind"], "credential_invalid")
+        self.assertEqual(extra["cpa"]["failure_kind"], "oauth_entitlement_denied")
         self.assertFalse(extra["cpa"]["credential_ready"])
 
     def test_transient_reauthorization_failure_is_not_quarantined(self):
@@ -236,7 +237,72 @@ class CpaRuntimeTests(unittest.TestCase):
         )
         self.assertFalse(_permanent_credential_failure(error))
 
-    def test_initial_invalid_grant_is_quarantined(self):
+    def test_registered_session_token_fans_out_cpa_and_sub_auth(self):
+        account_id = self.add_account()
+        event = {
+            "attempt_id": "attempt-1",
+            "status": "success",
+            "access_token": "fresh-access",
+            "refresh_token": "fresh-refresh",
+            "expires_in": 21600,
+        }
+        record = {
+            "type": "xai",
+            "access_token": "fresh-access",
+            "refresh_token": "fresh-refresh",
+            "email": "prevalidate@example.com",
+            "sub": "principal",
+        }
+        probe = {
+            "ok": True,
+            "account_alive": True,
+            "probe_kind": "account_identity",
+        }
+        with (
+            patch.object(self.runtime, "config", return_value=self.config),
+            patch("api._cpa_runtime.token_to_cpa_record", return_value=record),
+            patch("api._cpa_runtime.probe_cpa_account", return_value=probe),
+            patch("api._cpa_runtime.write_cpa_record") as write_cpa,
+            patch("api._cpa_runtime.write_sub2api_record") as write_sub,
+        ):
+            write_cpa.return_value = Path("xai-prevalidate@example.com.json")
+            write_sub.return_value = Path("SUB2API-grok-prevalidate@example.com.json")
+            ok, error = self.runtime.import_registered_oauth_token(account_id, event)
+            second_ok, second_error = self.runtime.import_registered_oauth_token(account_id, event)
+
+        self.assertTrue(ok)
+        self.assertEqual(error, "")
+        self.assertTrue(second_ok)
+        self.assertEqual(second_error, "")
+        write_cpa.assert_called_once()
+        write_sub.assert_called_once()
+        row = _shared.fetch_one("SELECT extra_json FROM accounts WHERE id=?", (account_id,))
+        extra = json.loads(row["extra_json"])
+        self.assertEqual(extra["access_token"], "fresh-access")
+        self.assertEqual(extra["cpa"]["mint_method"], "registered_session_device_flow")
+        self.assertEqual(extra["cpa"]["registration_attempt_id"], "attempt-1")
+        self.assertTrue(extra["cpa"]["credential_ready"])
+
+    def test_registration_oauth_denial_preserves_live_account(self):
+        account_id = self.add_account()
+        self.runtime.record_registered_oauth_denied(
+            account_id,
+            {
+                "attempt_id": "denied-1",
+                "error": "OAuth entitlement denied: invalid_grant: Access denied",
+            },
+        )
+        row = _shared.fetch_one(
+            "SELECT validity_status, lifecycle_status, extra_json FROM accounts WHERE id=?",
+            (account_id,),
+        )
+        self.assertEqual(row["validity_status"], "valid")
+        self.assertEqual(row["lifecycle_status"], "registered")
+        cpa = json.loads(row["extra_json"])["cpa"]
+        self.assertEqual(cpa["status"], "denied")
+        self.assertEqual(cpa["failure_kind"], "oauth_entitlement_denied")
+
+    def test_initial_invalid_grant_is_a_terminal_oauth_failure(self):
         self.assertTrue(
             _permanent_credential_failure(
                 "OAuth token failed: invalid_grant: Access denied"
@@ -261,10 +327,10 @@ class CpaRuntimeTests(unittest.TestCase):
             "SELECT validity_status, extra_json FROM accounts WHERE id=?",
             (account_id,),
         )
-        self.assertEqual(row["validity_status"], "invalid")
+        self.assertEqual(row["validity_status"], "valid")
         self.assertEqual(
             json.loads(row["extra_json"])["cpa"]["failure_kind"],
-            "credential_invalid",
+            "oauth_entitlement_denied",
         )
 
     def test_scheduler_enqueues_stale_undelivered_account(self):
@@ -276,6 +342,22 @@ class CpaRuntimeTests(unittest.TestCase):
             self.runtime._schedule_prevalidation()
 
         enqueue.assert_called_once_with(account_id, force=False)
+
+    def test_scheduler_skips_oauth_entitlement_denied_account(self):
+        account_id = self.add_account()
+        self.runtime.record_registered_oauth_denied(
+            account_id,
+            {
+                "attempt_id": "denied-scheduler",
+                "error": "OAuth entitlement denied: invalid_grant: Access denied",
+            },
+        )
+        with (
+            patch.object(self.runtime, "config", return_value=self.config),
+            patch.object(self.runtime, "enqueue") as enqueue,
+        ):
+            self.runtime._schedule_prevalidation()
+        enqueue.assert_not_called()
 
     def test_forced_backfill_prioritizes_deliverable_inventory(self):
         historical_id = _shared.execute(
@@ -306,6 +388,7 @@ class CpaRuntimeTests(unittest.TestCase):
         self.assertTrue(config["extra"]["auto_mint"])
         self.assertTrue(config["extra"]["probe_required"])
         self.assertEqual(config["extra"]["auth_dir"], str(_shared.CPA_AUTH_DIR))
+        self.assertEqual(config["extra"]["sub_auth_dir"], str(_shared.SUB_AUTH_DIR))
 
     def test_runtime_uses_environment_proxy_when_saved_proxy_is_empty(self):
         row = _shared.fetch_one("SELECT value FROM settings WHERE key='exporter_cpa'")

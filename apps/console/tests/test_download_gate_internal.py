@@ -82,10 +82,12 @@ class DownloadGateInternalApiTests(unittest.TestCase):
                 self.assertEqual(manifest["keys"][result["key"]], result["bundle_id"])
                 zip_path = Path(tmp) / "zips" / f"{result['bundle_id']}.zip"
                 with zipfile.ZipFile(zip_path) as archive:
-                    packed = json.loads(archive.read("xai-user@example.com.json"))
+                    packed = json.loads(archive.read("CPA-xai-user@example.com.json"))
                     ordinary = json.loads(archive.read("notes.json"))
                 self.assertEqual(packed["email"], "user@example.com")
-                self.assertEqual(packed["sso"], "sso-value")
+                self.assertEqual(packed["access_token"], "access")
+                self.assertEqual(packed["refresh_token"], "refresh")
+                self.assertNotIn("sso", packed)
                 self.assertNotIn("schema", packed)
                 self.assertNotIn("account_state", packed)
                 self.assertEqual(ordinary, {"kind": "ordinary", "value": 1})

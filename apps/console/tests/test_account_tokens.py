@@ -94,7 +94,8 @@ class AccountTokenTests(unittest.TestCase):
                     "注册成功 | email=a@example.com | password=StrongPass! | given=Neo | family=Lin\n",
                     encoding="utf-8",
                 )
-                _shared._harvest_task_accounts(7, task_dir)
+                with patch("core.cpa_auth.write_grok2api_web_record"):
+                    _shared._harvest_task_accounts(7, task_dir)
                 row = _shared.fetch_one("SELECT password FROM accounts WHERE email = ?", ("a@example.com",))
                 self.assertIsNotNone(row)
                 self.assertEqual(row["password"], "StrongPass!")
@@ -133,7 +134,10 @@ class AccountTokenTests(unittest.TestCase):
                     message="pushed",
                     data={"api_version": 3},
                 )
-                with patch("exporters.grok2api.Grok2APIExporter.push", return_value=result) as push:
+                with (
+                    patch("exporters.grok2api.Grok2APIExporter.push", return_value=result) as push,
+                    patch("core.cpa_auth.write_grok2api_web_record"),
+                ):
                     _shared._harvest_task_accounts(8, task_dir)
                     _shared._harvest_task_accounts(8, task_dir)
                 self.assertEqual(push.call_count, 1)
@@ -143,6 +147,49 @@ class AccountTokenTests(unittest.TestCase):
                 )
                 status = json.loads(row["exporter_status_json"])
                 self.assertEqual(status["grok2api"]["status"], "pushed")
+            finally:
+                _shared.DB_PATH = old_db_path
+
+    def test_harvest_imports_registration_side_oauth_once(self):
+        old_db_path = _shared.DB_PATH
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _shared.DB_PATH = root / "console.db"
+            try:
+                _shared.init_db()
+                _shared.log_register_event(task_id=9, ok=True, email="oauth@example.com")
+                task_dir = root / "task_9"
+                (task_dir / "sso").mkdir(parents=True)
+                (task_dir / "sso" / "task_9.txt").write_text("oauth-sso\n", encoding="utf-8")
+                (task_dir / "sso" / "task_9.oauth.jsonl").write_text(
+                    json.dumps(
+                        {
+                            "attempt_id": "attempt-9",
+                            "email": "oauth@example.com",
+                            "status": "success",
+                            "access_token": "access",
+                            "refresh_token": "refresh",
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                (task_dir / "console.log").write_text("", encoding="utf-8")
+                with (
+                    patch("core.cpa_auth.write_grok2api_web_record"),
+                    patch("api._shared.push_account_to_grok2api"),
+                    patch(
+                        "api._cpa_runtime.cpa_mint_runtime.import_registered_oauth_token",
+                        return_value=(True, ""),
+                    ) as imported,
+                    patch("api._cpa_runtime.cpa_mint_runtime.enqueue") as enqueue,
+                ):
+                    _shared._harvest_task_accounts(9, task_dir)
+
+                imported.assert_called_once()
+                event = imported.call_args.args[1]
+                self.assertEqual(event["attempt_id"], "attempt-9")
+                enqueue.assert_not_called()
             finally:
                 _shared.DB_PATH = old_db_path
 

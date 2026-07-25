@@ -239,6 +239,32 @@ class TaskSupervisor:
                 )
                 task_config["hotmail_state_path"] = hotmail_config.get("state_path", "")
 
+        # Complete xAI device authorization before the registration browser is
+        # recycled.  This preserves the CreateUserAndSession browser/profile
+        # identity instead of reconstructing it later from only an SSO cookie.
+        try:
+            from ._cpa_runtime import cpa_mint_runtime
+
+            cpa_config = cpa_mint_runtime.config()
+            cpa_extra = cpa_config.get("extra") or {}
+            oauth_enabled = bool(cpa_config.get("enabled")) and bool(
+                cpa_extra.get("auto_mint", True)
+            )
+            task_config["post_register_oauth"] = {
+                "enabled": oauth_enabled,
+                "timeout": max(30, int(cpa_extra.get("timeout") or 90)),
+                "verify_tls": bool(cpa_extra.get("verify_tls", True)),
+                # Use the same egress identity as the registration page.
+                "proxy": str(
+                    task_config.get("browser_proxy")
+                    or task_config.get("proxy")
+                    or cpa_extra.get("proxy")
+                    or ""
+                ),
+            }
+        except Exception:
+            task_config["post_register_oauth"] = {"enabled": False}
+
         copy_source_to_task_dir(task_dir, task_config)
 
         output_path = task_dir / "sso" / f"task_{task_id}.txt"

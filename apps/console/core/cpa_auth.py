@@ -18,8 +18,7 @@ from curl_cffi import requests as curl_requests
 CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 OIDC_ISSUER = "https://auth.x.ai"
 SCOPES = (
-    "openid profile email offline_access grok-cli:access "
-    "api:access conversations:read conversations:write"
+    "openid profile email offline_access grok-cli:access api:access"
 )
 CPA_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 CPA_USERINFO_URL = f"{OIDC_ISSUER}/oauth2/userinfo"
@@ -475,6 +474,109 @@ def write_cpa_record(auth_dir: str, record: dict[str, Any]) -> Path:
         if os.path.exists(temp_name):
             os.unlink(temp_name)
     return target
+
+
+def token_to_sub2api_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Build a one-account Sub2API import document from a CPA xAI record."""
+    access_token = str(record.get("access_token") or "").strip()
+    refresh_token = str(record.get("refresh_token") or "").strip()
+    if not access_token or not refresh_token:
+        raise ValueError("Sub2API auth requires access_token and refresh_token")
+    email = str(record.get("email") or "").strip()
+    subject = str(record.get("sub") or "").strip()
+    credentials: dict[str, Any] = {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": str(record.get("token_type") or "Bearer"),
+        "client_id": CLIENT_ID,
+        "scope": SCOPES,
+        "base_url": str(record.get("base_url") or CPA_BASE_URL).rstrip("/"),
+    }
+    for source, target in (
+        ("expired", "expires_at"),
+        ("id_token", "id_token"),
+        ("email", "email"),
+        ("sub", "sub"),
+    ):
+        if record.get(source) not in (None, ""):
+            credentials[target] = record[source]
+    return {
+        "type": "sub2api-data",
+        "version": 1,
+        "exported_at": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "proxies": [],
+        "accounts": [
+            {
+                "name": email or subject or "Grok OAuth Account",
+                "platform": "grok",
+                "type": "oauth",
+                "credentials": credentials,
+                "concurrency": 1,
+                "priority": 0,
+                "auto_pause_on_expired": True,
+            }
+        ],
+    }
+
+
+def grok2api_web_auth_record(email: str, sso: str) -> dict[str, Any]:
+    """Build the v3 Grok2API web-account import shape."""
+    if not str(sso or "").strip():
+        raise ValueError("Grok2API auth requires sso")
+    return {
+        "version": 1,
+        "accounts": [
+            {
+                "name": str(email or "grok-web").strip() or "grok-web",
+                "sso_token": str(sso).strip(),
+                "tier": "auto",
+            }
+        ],
+    }
+
+
+def _safe_identity(value: str, fallback: str = "account") -> str:
+    safe = "".join(
+        char if char.isalnum() or char in "._-@" else "_"
+        for char in str(value or "").strip()
+    ).strip("._-")
+    return safe or fallback
+
+
+def _write_json_record(directory: str, filename: str, document: dict[str, Any]) -> Path:
+    target_dir = Path(directory).expanduser().resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / filename
+    fd, temp_name = tempfile.mkstemp(prefix=".auth-", suffix=".tmp", dir=str(target_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(document, ensure_ascii=False, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_name, 0o600)
+        os.replace(temp_name, target)
+        os.chmod(target, 0o600)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+    return target
+
+
+def write_sub2api_record(auth_dir: str, record: dict[str, Any]) -> Path:
+    identity = str(record.get("email") or record.get("sub") or "account")
+    return _write_json_record(
+        auth_dir,
+        f"SUB2API-grok-{_safe_identity(identity)}.json",
+        token_to_sub2api_record(record),
+    )
+
+
+def write_grok2api_web_record(auth_dir: str, email: str, sso: str) -> Path:
+    return _write_json_record(
+        auth_dir,
+        f"GROK2API-grok-{_safe_identity(email)}.json",
+        grok2api_web_auth_record(email, sso),
+    )
 
 
 def probe_cpa_account(

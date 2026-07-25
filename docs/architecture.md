@@ -31,8 +31,9 @@
 - 获取验证码
 - 提交注册资料
 - 抽取 `sso`
+- 在注册浏览器销毁前完成 xAI device-code OAuth
 - 写本地结果
-- 推送到 sink
+- 原子写入 Grok2API / CPA / Sub2API Auth，并推送到 sink
 
 ### 3. network-gateway
 
@@ -81,6 +82,8 @@
 1. `warp` 提供默认网络出口
 2. `console` 创建任务并写入任务级 `config.json`
 3. `register-runner` 独立执行注册流程
-4. 成功后将 `sso` 追加写入本地文件
-5. 同时把 `sso` 推送到内置 `grok2api`
-6. `console` 持续从日志解析实时状态并展示
+4. 成功后将 `sso` 追加写入本地文件并生成 Grok2API Web Auth
+5. 复用刚完成 `CreateUserAndSession` 的浏览器执行 device-flow
+6. OAuth 成功后生成 CPA 与 Sub2API Auth；无 OAuth 权限时只隔离 OAuth 交付资格
+7. 同时把 `sso` 推送到内置 `grok2api`
+8. `console` 持续从日志解析实时状态并展示

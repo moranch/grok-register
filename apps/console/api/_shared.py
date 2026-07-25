@@ -43,7 +43,11 @@ SOURCE_VENV_PYTHON = Path(
 MAX_CONCURRENT_TASKS = max(1, int(os.getenv("GROK_REGISTER_CONSOLE_MAX_CONCURRENT_TASKS", "1")))
 SUPERVISOR_INTERVAL = max(1.0, float(os.getenv("GROK_REGISTER_CONSOLE_POLL_INTERVAL", "2")))
 
-PROJECT_FILES = ("DrissionPage_example.py", "email_register.py")
+PROJECT_FILES = (
+    "DrissionPage_example.py",
+    "email_register.py",
+    "grok_oauth_device.py",
+)
 PROJECT_DIRS = ("turnstilePatch",)
 PROJECT_AUX_FILES = ((APP_DIR / "core" / "hotmail_pool.py", "hotmail_pool.py"),)
 
@@ -74,6 +78,15 @@ DOWNLOAD_GATE_PUBLIC_URL = os.getenv(
 ).rstrip("/")
 CPA_AUTH_DIR = Path(
     os.getenv("GROK_REGISTER_CPA_AUTH_DIR", str(REPO_ROOT / "runtime" / "cpa-auth"))
+).expanduser().resolve()
+SUB_AUTH_DIR = Path(
+    os.getenv("GROK_REGISTER_SUB_AUTH_DIR", str(REPO_ROOT / "runtime" / "sub-auth"))
+).expanduser().resolve()
+GROK2API_AUTH_DIR = Path(
+    os.getenv(
+        "GROK_REGISTER_GROK2API_AUTH_DIR",
+        str(REPO_ROOT / "runtime" / "grok2api-auth"),
+    )
 ).expanduser().resolve()
 
 
@@ -985,6 +998,7 @@ def init_db() -> None:
             "template": "",
             "extra": {
                 "auth_dir": str(CPA_AUTH_DIR),
+                "sub_auth_dir": str(SUB_AUTH_DIR),
                 "proxy": str(
                     os.getenv("GROK_REGISTER_CPA_PROXY")
                     or os.getenv("GROK_REGISTER_DEFAULT_PROXY")
@@ -2118,6 +2132,29 @@ def push_account_to_grok2api(account_id: int):
     return result
 
 
+def _task_oauth_events(task_id: int, task_dir: Path) -> dict[str, dict[str, Any]]:
+    """Return the latest registration-side OAuth event for each email."""
+    path = task_dir / "sso" / f"task_{task_id}.oauth.jsonl"
+    if not path.exists():
+        return {}
+    latest: dict[str, dict[str, Any]] = {}
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return {}
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(event, dict):
+            continue
+        email = str(event.get("email") or "").strip().lower()
+        if email:
+            latest[email] = event
+    return latest
+
+
 def _harvest_task_accounts(task_id: int, task_dir: Path, proxy_url: str = "") -> None:
     """从 sso 文件把账号入库。"""
     sso_file = task_dir / "sso" / f"task_{task_id}.txt"
@@ -2133,6 +2170,7 @@ def _harvest_task_accounts(task_id: int, task_dir: Path, proxy_url: str = "") ->
     )
     emails = [r["email"] for r in email_rows if r["email"]]
     sso_list = [s.strip() for s in content.splitlines() if s.strip()]
+    oauth_events = _task_oauth_events(task_id, task_dir)
     passwords: dict[str, str] = {}
     console_path = task_dir / "console.log"
     if console_path.exists():
@@ -2172,14 +2210,29 @@ def _harvest_task_accounts(task_id: int, task_dir: Path, proxy_url: str = "") ->
                 "WHERE email = ? AND sso = ?",
                 (password, email, sso),
             )
-        if existing is None:
-            saved = fetch_one(
-                "SELECT id FROM accounts WHERE email = ? AND sso = ?",
-                (email, sso),
-            )
-            if saved:
+        saved = fetch_one(
+            "SELECT id FROM accounts WHERE email = ? AND sso = ?",
+            (email, sso),
+        )
+        if saved:
+            account_id = int(saved["id"])
+            if existing is None:
                 try:
-                    push_result = push_account_to_grok2api(int(saved["id"]))
+                    from core.cpa_auth import write_grok2api_web_record
+
+                    write_grok2api_web_record(
+                        str(GROK2API_AUTH_DIR),
+                        email,
+                        sso,
+                    )
+                except Exception as artifact_exc:
+                    with console_path.open("a", encoding="utf-8") as log:
+                        log.write(
+                            f"[{now_iso()}] [Grok2API Auth failed] {email}: "
+                            f"{type(artifact_exc).__name__}: {artifact_exc}\n"
+                        )
+                try:
+                    push_result = push_account_to_grok2api(account_id)
                     if push_result is not None:
                         marker = "API push succeeded" if push_result.success else "API push failed"
                         with console_path.open("a", encoding="utf-8") as log:
@@ -2190,13 +2243,33 @@ def _harvest_task_accounts(task_id: int, task_dir: Path, proxy_url: str = "") ->
                             f"[{now_iso()}] [API push failed] {email}: "
                             f"{type(push_exc).__name__}: {push_exc}\n"
                         )
-                try:
-                    from ._cpa_runtime import cpa_mint_runtime
+            try:
+                from ._cpa_runtime import cpa_mint_runtime
 
-                    if cpa_mint_runtime.is_auto_enabled():
-                        cpa_mint_runtime.enqueue(int(saved["id"]))
-                except Exception:
-                    pass
+                event = oauth_events.get(str(email).strip().lower())
+                if event:
+                    event_status = str(event.get("status") or "").lower()
+                    if event_status == "success":
+                        ok, oauth_error = cpa_mint_runtime.import_registered_oauth_token(
+                            account_id,
+                            event,
+                        )
+                        if not ok:
+                            with console_path.open("a", encoding="utf-8") as log:
+                                log.write(
+                                    f"[{now_iso()}] [OAuth Auth import failed] {email}: "
+                                    f"{oauth_error}\n"
+                                )
+                    elif event_status == "denied":
+                        cpa_mint_runtime.record_registered_oauth_denied(account_id, event)
+                    elif event_status == "failed" and cpa_mint_runtime.is_auto_enabled():
+                        cpa_mint_runtime.enqueue(account_id)
+                    # pending deliberately suppresses the slower cookie-only
+                    # worker until the registration browser has finished.
+                elif existing is None and cpa_mint_runtime.is_auto_enabled():
+                    cpa_mint_runtime.enqueue(account_id)
+            except Exception:
+                pass
 
 
 def export_accounts(fmt: str = "json") -> tuple[str, str, str]:

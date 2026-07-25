@@ -1,6 +1,7 @@
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 import argparse
+import json
 import shutil
 import tempfile
 import datetime
@@ -1114,6 +1115,72 @@ def append_sso_to_txt(sso_value, output_path=DEFAULT_SSO_FILE):
     print(f"[*] 已追加写入 sso 到文件: {output_path}")
 
 
+def run_post_registration_oauth(email, output_path):
+    """Reuse the just-created browser session for xAI device authorization.
+
+    Registration remains successful when the account has no Grok CLI/API
+    entitlement. A JSONL sidecar lets Console persist and fan out a successful
+    token pair exactly once without printing secrets to the task log.
+    """
+    try:
+        config_path = os.path.join(os.path.dirname(__file__), "config.json")
+        with open(config_path, "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+        oauth_config = config.get("post_register_oauth") or {}
+    except Exception:
+        oauth_config = {}
+    if not bool(oauth_config.get("enabled", False)):
+        return {"status": "disabled"}
+
+    from grok_oauth_device import (
+        DeviceFlowEntitlementDenied,
+        append_oauth_event,
+        mint_in_registered_browser,
+    )
+
+    attempt_id = append_oauth_event(output_path, email=email, status="pending")
+    print(f"[*] [OAuth] continuing from registered browser session, attempt={attempt_id[:8]}")
+    try:
+        token = mint_in_registered_browser(
+            page,
+            proxy=str(oauth_config.get("proxy") or _browser_proxy or ""),
+            timeout=max(30, int(oauth_config.get("timeout") or 90)),
+            verify_tls=bool(oauth_config.get("verify_tls", True)),
+            log=lambda message: print(f"[*] [OAuth] {message}"),
+        )
+        append_oauth_event(
+            output_path,
+            email=email,
+            status="success",
+            attempt_id=attempt_id,
+            token=token,
+        )
+        print("[*] [OAuth] access/refresh token issued")
+        return {"status": "success", "attempt_id": attempt_id}
+    except DeviceFlowEntitlementDenied as exc:
+        append_oauth_event(
+            output_path,
+            email=email,
+            status="denied",
+            attempt_id=attempt_id,
+            error=str(exc),
+            failure_kind="oauth_entitlement_denied",
+        )
+        print(f"[Warn] [OAuth] account has no Grok CLI/API entitlement: {exc}")
+        return {"status": "denied", "attempt_id": attempt_id, "error": str(exc)}
+    except Exception as exc:
+        append_oauth_event(
+            output_path,
+            email=email,
+            status="failed",
+            attempt_id=attempt_id,
+            error=str(exc),
+            failure_kind="oauth_transient_failure",
+        )
+        print(f"[Warn] [OAuth] registered-session device flow failed: {exc}")
+        return {"status": "failed", "attempt_id": attempt_id, "error": str(exc)}
+
+
 def push_sso_to_api(new_tokens: list):
     # Console supervisor owns durable per-account delivery. Keeping the legacy
     # in-task sender enabled would call the removed grok2api 2.x endpoint and
@@ -1247,6 +1314,7 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
     profile = fill_profile_and_submit()
     sso_value = wait_for_sso_cookie()
     append_sso_to_txt(sso_value, output_path)
+    oauth_result = run_post_registration_oauth(email, output_path)
 
     if extract_numbers:
         extract_visible_numbers()
@@ -1254,6 +1322,7 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
     result = {
         "email": email,
         "sso": sso_value,
+        "oauth_status": oauth_result.get("status", "disabled"),
         **profile,
     }
 

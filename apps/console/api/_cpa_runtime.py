@@ -18,9 +18,10 @@ from core.cpa_auth import (
     token_to_cpa_record,
     upload_cpa_record,
     write_cpa_record,
+    write_sub2api_record,
 )
 
-from ._shared import execute_no_return, fetch_all, fetch_one, now_iso
+from ._shared import SUB_AUTH_DIR, execute_no_return, fetch_all, fetch_one, now_iso
 
 DEFAULT_CPA_WORKERS = 6
 MAX_CPA_WORKERS = 16
@@ -54,6 +55,14 @@ def _permanent_credential_failure(error: str) -> bool:
         and "refresh_token" not in lowered
     )
     return initial_grant_failed or (refresh_failed and sso_failed)
+
+
+def _oauth_failure_kind(error: str) -> str:
+    """Classify OAuth eligibility separately from the Web/SSO account state."""
+    lowered = str(error or "").lower()
+    if _permanent_credential_failure(lowered):
+        return "oauth_entitlement_denied"
+    return "oauth_transient_failure"
 
 
 class CpaMintRuntime:
@@ -111,7 +120,7 @@ class CpaMintRuntime:
         self._scheduler_thread.start()
 
     def _quarantine_known_permanent_failures(self) -> int:
-        """Remove already-proven unusable OAuth credentials from delivery stock."""
+        """Stop retrying denied OAuth grants without invalidating a live SSO account."""
         rows = fetch_all(
             """
             SELECT id, extra_json, last_error
@@ -131,13 +140,23 @@ class CpaMintRuntime:
                 continue
             cpa["status"] = "failed"
             cpa["credential_ready"] = False
-            cpa["failure_kind"] = "credential_invalid"
+            cpa["failure_kind"] = "oauth_entitlement_denied"
             extra["cpa"] = cpa
+            probe = cpa.get("probe") if isinstance(cpa.get("probe"), dict) else {}
+            session_alive = bool(
+                probe.get("probe_kind") == "account_session"
+                and probe.get("account_alive", probe.get("ok"))
+            )
             execute_no_return(
-                "UPDATE accounts SET extra_json=?, validity_status='invalid', "
+                "UPDATE accounts SET extra_json=?, "
+                "validity_status=CASE WHEN ? THEN 'valid' ELSE validity_status END, "
+                "lifecycle_status=CASE WHEN ? AND lifecycle_status='invalid' "
+                "THEN 'registered' ELSE lifecycle_status END, "
                 "last_checked_at=?, last_error=? WHERE id=?",
                 (
                     json.dumps(extra, ensure_ascii=False),
+                    session_alive,
+                    session_alive,
                     now_iso(),
                     error[:500],
                     int(row["id"]),
@@ -171,6 +190,10 @@ class CpaMintRuntime:
             ).strip()
             if default_proxy and not str(extra.get("proxy") or "").strip():
                 extra["proxy"] = default_proxy
+            if not str(extra.get("sub_auth_dir") or "").strip():
+                extra["sub_auth_dir"] = str(
+                    os.getenv("GROK_REGISTER_SUB_AUTH_DIR") or SUB_AUTH_DIR
+                )
             data["extra"] = extra
             return data
         except Exception:
@@ -357,6 +380,9 @@ class CpaMintRuntime:
               AND a.sso <> ''
               AND a.lifecycle_status NOT IN ('expired', 'invalid')
               AND a.validity_status <> 'invalid'
+              AND COALESCE(
+                  json_extract(a.extra_json, '$.cpa.failure_kind'), ''
+              ) NOT IN ('oauth_entitlement_denied', 'credential_invalid')
               AND NOT EXISTS (
                   SELECT 1 FROM account_delivery_consumptions c WHERE c.account_id=a.id
               )
@@ -528,6 +554,195 @@ class CpaMintRuntime:
             ),
         )
 
+    def record_registered_oauth_denied(
+        self,
+        account_id: int,
+        event: dict[str, Any],
+    ) -> bool:
+        """Persist OAuth ineligibility without corrupting the Web SSO lifecycle."""
+        row = fetch_one("SELECT extra_json, exporter_status_json FROM accounts WHERE id=?", (account_id,))
+        if not row:
+            return False
+        try:
+            extra = json.loads(row["extra_json"] or "{}")
+        except Exception:
+            extra = {}
+        cpa = extra.get("cpa") if isinstance(extra.get("cpa"), dict) else {}
+        attempt_id = str(event.get("attempt_id") or "")
+        if attempt_id and cpa.get("registration_attempt_id") == attempt_id:
+            return True
+        error = str(event.get("error") or "OAuth entitlement denied")[:500]
+        cpa.update(
+            {
+                "status": "denied",
+                "credential_ready": False,
+                "failure_kind": "oauth_entitlement_denied",
+                "error": error,
+                "registration_attempt_id": attempt_id,
+                "mint_method": "registered_session_device_flow",
+                "updated_at": now_iso(),
+            }
+        )
+        extra["cpa"] = cpa
+        try:
+            status = json.loads(row["exporter_status_json"] or "{}")
+        except Exception:
+            status = {}
+        status["cpa"] = {
+            "ok": False,
+            "status": "denied",
+            "message": error,
+            "last_pushed_at": now_iso(),
+        }
+        execute_no_return(
+            "UPDATE accounts SET extra_json=?, exporter_status_json=?, "
+            "last_checked_at=?, last_error=? WHERE id=?",
+            (
+                json.dumps(extra, ensure_ascii=False),
+                json.dumps(status, ensure_ascii=False),
+                now_iso(),
+                error,
+                account_id,
+            ),
+        )
+        return True
+
+    def import_registered_oauth_token(
+        self,
+        account_id: int,
+        event: dict[str, Any],
+    ) -> tuple[bool, str]:
+        """Fan a fresh registration-side token into CPA and Sub2API outputs."""
+        row = fetch_one("SELECT * FROM accounts WHERE id=?", (account_id,))
+        if not row:
+            return False, "account not found"
+        try:
+            extra = json.loads(row["extra_json"] or "{}")
+        except Exception:
+            extra = {}
+        cpa = extra.get("cpa") if isinstance(extra.get("cpa"), dict) else {}
+        attempt_id = str(event.get("attempt_id") or "")
+        if (
+            attempt_id
+            and cpa.get("registration_attempt_id") == attempt_id
+            and cpa.get("credential_ready") is True
+        ):
+            return True, ""
+
+        token = {
+            key: event.get(key)
+            for key in (
+                "access_token",
+                "refresh_token",
+                "id_token",
+                "token_type",
+                "expires_in",
+                "scope",
+            )
+            if event.get(key) not in (None, "")
+        }
+        if not token.get("access_token") or not token.get("refresh_token"):
+            return False, "registration OAuth event is missing access/refresh token"
+
+        config = self.config()
+        config_extra = config.get("extra") or {}
+        proxy = str(config_extra.get("proxy") or row["proxy_url"] or "")
+        verify_tls = bool(config_extra.get("verify_tls", True))
+        timeout = max(30, int(config_extra.get("timeout") or 90))
+        try:
+            record = token_to_cpa_record(
+                token,
+                str(row["email"] or ""),
+                base_url=str(config_extra.get("base_url") or "https://cli-chat-proxy.grok.com/v1"),
+            )
+            probe = probe_cpa_account(
+                record["access_token"],
+                proxy=proxy,
+                timeout=min(max(5, int(config_extra.get("identity_timeout", 12))), 30),
+                verify_tls=verify_tls,
+            )
+            if bool(config_extra.get("probe_required", True)) and not bool(
+                probe.get("account_alive", probe.get("ok"))
+            ):
+                raise RuntimeError(
+                    str(probe.get("error") or "OAuth identity validation failed")
+                )
+
+            filename = ""
+            sub_filename = ""
+            destinations: list[str] = []
+            auth_dir = str(config_extra.get("auth_dir") or "").strip()
+            if auth_dir:
+                filename = write_cpa_record(auth_dir, record).name
+                destinations.append("local")
+            sub_auth_dir = str(config_extra.get("sub_auth_dir") or "").strip()
+            if sub_auth_dir:
+                sub_filename = write_sub2api_record(sub_auth_dir, record).name
+                destinations.append("sub2api")
+            endpoint = str(config.get("endpoint") or config_extra.get("endpoint") or "").strip()
+            if endpoint:
+                filename = upload_cpa_record(
+                    endpoint,
+                    str(config_extra.get("management_key") or ""),
+                    record,
+                    timeout=min(timeout, 60),
+                    verify_tls=verify_tls,
+                )
+                destinations.append("remote")
+
+            for key in (
+                "access_token",
+                "refresh_token",
+                "id_token",
+                "token_type",
+                "expires_in",
+                "expired",
+                "sub",
+                "base_url",
+                "token_endpoint",
+                "redirect_uri",
+                "headers",
+            ):
+                if key in record:
+                    extra[key] = record[key]
+            extra["cpa"] = {
+                "status": "ready",
+                "credential_ready": True,
+                "failure_kind": "",
+                "filename": filename,
+                "sub_filename": sub_filename,
+                "destinations": destinations,
+                "registration_attempt_id": attempt_id,
+                "mint_method": "registered_session_device_flow",
+                "probe": probe,
+                "probe_checked_at": now_iso(),
+                "updated_at": now_iso(),
+            }
+            try:
+                status = json.loads(row["exporter_status_json"] or "{}")
+            except Exception:
+                status = {}
+            status["cpa"] = {
+                "ok": True,
+                "status": "pushed",
+                "message": "注册 Session OAuth 成功，CPA/SUB Auth 已生成",
+                "last_pushed_at": now_iso(),
+                "data": {"filename": filename, "sub_filename": sub_filename},
+            }
+            execute_no_return(
+                "UPDATE accounts SET extra_json=?, exporter_status_json=?, "
+                "validity_status='valid', last_checked_at=?, last_error='' WHERE id=?",
+                (
+                    json.dumps(extra, ensure_ascii=False),
+                    json.dumps(status, ensure_ascii=False),
+                    now_iso(),
+                    account_id,
+                ),
+            )
+            return True, ""
+        except Exception as exc:
+            return False, str(exc)[:500]
+
     def _mint_account(self, account_id: int, *, force: bool) -> tuple[bool, str]:
         row = fetch_one("SELECT * FROM accounts WHERE id = ?", (account_id,))
         if not row:
@@ -631,10 +846,15 @@ class CpaMintRuntime:
             # 只有自动验活通过后才落地/上传交付凭据。失败账号不生成 CPA，
             # DownloadGate 也不会从未验活库存派生 Sub2API/Cockpit 文件。
             filename = ""
+            sub_filename = ""
             destinations: list[str] = []
             if auth_dir:
                 filename = write_cpa_record(auth_dir, record).name
                 destinations.append("local")
+            sub_auth_dir = str(config_extra.get("sub_auth_dir") or "").strip()
+            if sub_auth_dir:
+                sub_filename = write_sub2api_record(sub_auth_dir, record).name
+                destinations.append("sub2api")
             if endpoint:
                 filename = upload_cpa_record(
                     endpoint,
@@ -655,6 +875,7 @@ class CpaMintRuntime:
             extra["cpa"] = {
                 "status": "ready" if probe_alive else "failed",
                 "filename": filename,
+                "sub_filename": sub_filename,
                 "destinations": destinations,
                 "mint_method": mint_method,
                 "credential_ready": probe_alive,
@@ -663,7 +884,17 @@ class CpaMintRuntime:
             }
             if probe is not None:
                 extra["cpa"]["probe_checked_at"] = now_iso()
-            status = {"cpa": {"status": "pushed", "message": "OAuth 补全成功", "last_pushed_at": now_iso()}}
+            try:
+                status = json.loads(row["exporter_status_json"] or "{}")
+            except Exception:
+                status = {}
+            status["cpa"] = {
+                "status": "pushed",
+                "ok": True,
+                "message": "OAuth 补全成功，CPA/SUB Auth 已生成",
+                "last_pushed_at": now_iso(),
+                "data": {"filename": filename, "sub_filename": sub_filename},
+            }
             execute_no_return(
                 "UPDATE accounts SET extra_json = ?, exporter_status_json = ?, "
                 "validity_status = CASE WHEN ? THEN 'invalid' WHEN ? THEN 'valid' ELSE validity_status END, "
@@ -683,15 +914,12 @@ class CpaMintRuntime:
             return True, ""
         except Exception as exc:
             error_text = str(exc)
-            permanent_failure = _permanent_credential_failure(error_text)
             failed_cpa = extra.get("cpa") if isinstance(extra.get("cpa"), dict) else {}
             failed_cpa.update(
                 {
                     "status": "failed",
                     "credential_ready": False,
-                    "failure_kind": (
-                        "credential_invalid" if permanent_failure else "renewal_failed"
-                    ),
+                    "failure_kind": _oauth_failure_kind(error_text),
                     "error": error_text[:500],
                     "updated_at": now_iso(),
                 }
@@ -704,12 +932,10 @@ class CpaMintRuntime:
             extra["cpa"] = failed_cpa
             execute_no_return(
                 "UPDATE accounts SET extra_json=?, exporter_status_json=?, "
-                "validity_status=CASE WHEN ? THEN 'invalid' ELSE validity_status END, "
                 "last_checked_at=?, last_error=? WHERE id=?",
                 (
                     json.dumps(extra, ensure_ascii=False),
                     json.dumps({"cpa": {"status": "failed", "message": error_text[:500], "last_pushed_at": now_iso()}}, ensure_ascii=False),
-                    permanent_failure,
                     now_iso(),
                     error_text[:500],
                     account_id,

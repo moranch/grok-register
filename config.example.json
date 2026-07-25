@@ -8,6 +8,12 @@
     "temp_mail_site_password": "",
     "proxy": "",
     "browser_proxy": "",
+    "post_register_oauth": {
+        "enabled": true,
+        "timeout": 90,
+        "verify_tls": true,
+        "proxy": ""
+    },
     "api": {
         "endpoint": "http://127.0.0.1:8000/v1/admin/tokens",
         "token": "",

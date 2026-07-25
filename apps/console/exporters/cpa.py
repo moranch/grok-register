@@ -10,6 +10,7 @@ from core.cpa_auth import (
     token_to_cpa_record,
     upload_cpa_record,
     write_cpa_record,
+    write_sub2api_record,
 )
 from core.registry import register_exporter
 
@@ -36,6 +37,12 @@ class CpaExporter(BaseExporter):
             "title": "本地 auth 目录",
             "description": "容器内路径，如 /workspace/runtime/cpa-auth",
             "default": "",
+        },
+        "sub_auth_dir": {
+            "type": "string",
+            "title": "Sub2API Auth 目录",
+            "description": "OAuth 成功后同步写入 SUB2API-grok-<email>.json",
+            "default": "/workspace/runtime/sub-auth",
         },
         "proxy": {"type": "string", "title": "Device Flow 代理", "default": ""},
         "base_url": {
@@ -126,6 +133,11 @@ class CpaExporter(BaseExporter):
                 path = write_cpa_record(auth_dir, record)
                 filename = path.name
                 destinations.append("local")
+            sub_auth_dir = str(extra.get("sub_auth_dir") or "").strip()
+            sub_filename = ""
+            if sub_auth_dir:
+                sub_filename = write_sub2api_record(sub_auth_dir, record).name
+                destinations.append("sub2api")
             endpoint = str(config.endpoint or extra.get("endpoint") or "").strip()
             if endpoint:
                 filename = upload_cpa_record(
@@ -142,6 +154,7 @@ class CpaExporter(BaseExporter):
                 "CPA 导出成功",
                 {
                     "filename": filename,
+                    "sub_filename": sub_filename,
                     "destinations": destinations,
                     "probe": probe,
                     "oauth": {
