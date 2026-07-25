@@ -95,6 +95,23 @@ class _Page:
         self.text = "Device Authorized"
 
 
+class _StickyCookiePage(_Page):
+    def __init__(self):
+        super().__init__()
+        self.cookie_clicks = 0
+
+    def eles(self, _selector, timeout=1):
+        buttons = [_Element("Accept All Cookies", self._cookie)]
+        if "Continue" in self.text:
+            buttons.append(_Element("Continue", self._consent))
+        elif "Authorize" in self.text:
+            buttons.append(_Element("Allow", self._done))
+        return buttons
+
+    def _cookie(self):
+        self.cookie_clicks += 1
+
+
 class RegistrationDeviceFlowTests(unittest.TestCase):
     def test_device_request_uses_public_grok_cli_scope(self):
         session = _Session(
@@ -123,6 +140,17 @@ class RegistrationDeviceFlowTests(unittest.TestCase):
             "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234",
             timeout=20,
         )
+        self.assertIn("/done", page.url)
+
+    def test_stale_cookie_button_is_only_clicked_once(self):
+        page = _StickyCookiePage()
+        with patch("grok_oauth_device.time.sleep"):
+            approve_in_registered_browser(
+                page,
+                "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234",
+                timeout=20,
+            )
+        self.assertEqual(page.cookie_clicks, 1)
         self.assertIn("/done", page.url)
 
     def test_access_denied_is_classified_as_entitlement(self):

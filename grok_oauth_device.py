@@ -262,6 +262,7 @@ def approve_in_registered_browser(
     page.get(verification_url)
     deadline = time.monotonic() + max(20, int(timeout))
     last_url = ""
+    cookie_consent_attempted = False
     while time.monotonic() < deadline:
         url = str(getattr(page, "url", "") or "")
         text = _page_text(page)
@@ -276,15 +277,21 @@ def approve_in_registered_browser(
         if "access denied" in lowered or "unable to access" in lowered or "you have been blocked" in lowered:
             raise DeviceFlowError("device browser was blocked before consent")
 
-        clicked = _click_button(
-            page,
-            (
-                "Allow all cookies",
-                "Accept all cookies",
-                "全部允许",
-                "接受所有 Cookie",
-            ),
-        )
+        clicked = ""
+        if not cookie_consent_attempted:
+            clicked = _click_button(
+                page,
+                (
+                    "Allow all cookies",
+                    "Accept all cookies",
+                    "全部允许",
+                    "接受所有 Cookie",
+                ),
+            )
+            if clicked:
+                # Some consent managers leave a stale/hidden button in the DOM.
+                # Retrying it forever prevents us from ever reaching Continue.
+                cookie_consent_attempted = True
         if not clicked:
             clicked = _click_button(page, ("Continue", "继续"))
         if not clicked:
