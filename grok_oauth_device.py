@@ -55,6 +55,32 @@ def _new_session(proxy: str = "", verify_tls: bool = True):
     return session
 
 
+def _new_standard_session(verify_tls: bool = True):
+    """Direct requests/OpenSSL fallback for curl_cffi TLS edge cases."""
+    import requests as standard_requests
+
+    session = standard_requests.Session()
+    session._grok_standard_transport = True
+    session._grok_verify_tls = bool(verify_tls)
+    session.headers.update(
+        {
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "grok-register/1.0",
+        }
+    )
+    return session
+
+
+def _post_form(session: Any, url: str, data: dict[str, str], timeout: int):
+    kwargs: dict[str, Any] = {"data": data, "timeout": timeout}
+    if getattr(session, "_grok_standard_transport", False):
+        kwargs["verify"] = bool(getattr(session, "_grok_verify_tls", True))
+    else:
+        kwargs["impersonate"] = "chrome"
+    return session.post(url, **kwargs)
+
+
 def _registered_cookie_header(page: Any) -> str:
     """Copy only the account-session cookies needed by the setup endpoints."""
     values: dict[str, str] = {}
@@ -176,11 +202,11 @@ def request_device_code(
     *,
     timeout: int = 20,
 ) -> dict[str, Any]:
-    response = session.post(
+    response = _post_form(
+        session,
         f"{OIDC_ISSUER}/oauth2/device/code",
-        data={"client_id": CLIENT_ID, "scope": SCOPE},
-        impersonate="chrome",
-        timeout=timeout,
+        {"client_id": CLIENT_ID, "scope": SCOPE},
+        timeout,
     )
     body = _payload(response)
     if int(response.status_code) >= 400:
@@ -288,15 +314,15 @@ def poll_device_token(
     # Consent is already complete, so poll immediately instead of adding an
     # unconditional first sleep to every registration.
     while time.monotonic() < deadline:
-        response = session.post(
+        response = _post_form(
+            session,
             f"{OIDC_ISSUER}/oauth2/token",
-            data={
+            {
                 "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                 "client_id": CLIENT_ID,
                 "device_code": str(device["device_code"]),
             },
-            impersonate="chrome",
-            timeout=20,
+            20,
         )
         body = _payload(response)
         if int(response.status_code) < 400:
@@ -393,7 +419,17 @@ def mint_in_registered_browser(
         # so a direct transport fallback is safe and avoids SOCKS DNS failures.
         logger(f"device endpoint proxy failed, retrying direct: {type(exc).__name__}")
         session = _new_session(proxy="", verify_tls=verify_tls)
-        device = request_device_code(session)
+        try:
+            device = request_device_code(session)
+        except DeviceFlowError:
+            raise
+        except Exception as direct_exc:
+            logger(
+                "device endpoint curl direct failed, retrying requests: "
+                f"{type(direct_exc).__name__}"
+            )
+            session = _new_standard_session(verify_tls=verify_tls)
+            device = request_device_code(session)
     user_code = str(device["user_code"])
     logger(f"device code issued user_code={user_code}")
     verification_url = str(
@@ -410,7 +446,17 @@ def mint_in_registered_browser(
             raise
         logger(f"token endpoint proxy failed, retrying direct: {type(exc).__name__}")
         direct_session = _new_session(proxy="", verify_tls=verify_tls)
-        token = poll_device_token(direct_session, device, timeout=timeout, log=logger)
+        try:
+            token = poll_device_token(direct_session, device, timeout=timeout, log=logger)
+        except (DeviceFlowError, TimeoutError):
+            raise
+        except Exception as direct_exc:
+            logger(
+                "token endpoint curl direct failed, retrying requests: "
+                f"{type(direct_exc).__name__}"
+            )
+            standard_session = _new_standard_session(verify_tls=verify_tls)
+            token = poll_device_token(standard_session, device, timeout=timeout, log=logger)
     token["user_code"] = user_code
     token["mint_method"] = "registered_session_device_flow"
     return token

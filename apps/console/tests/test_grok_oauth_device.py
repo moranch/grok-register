@@ -207,6 +207,39 @@ class RegistrationDeviceFlowTests(unittest.TestCase):
         poll.assert_called_once()
         self.assertIs(poll.call_args.args[0], direct_session)
 
+    def test_device_endpoint_falls_back_to_requests_after_direct_tls_error(self):
+        proxy_session = object()
+        direct_session = object()
+        standard_session = object()
+        device = {
+            "device_code": "device",
+            "user_code": "ABCD-1234",
+            "verification_uri": "https://accounts.x.ai/oauth2/device",
+        }
+        with (
+            patch("grok_oauth_device.prepare_registered_account"),
+            patch(
+                "grok_oauth_device._new_session",
+                side_effect=[proxy_session, direct_session],
+            ),
+            patch(
+                "grok_oauth_device._new_standard_session",
+                return_value=standard_session,
+            ),
+            patch(
+                "grok_oauth_device.request_device_code",
+                side_effect=[RuntimeError("SOCKS failure"), RuntimeError("TLS failure"), device],
+            ),
+            patch("grok_oauth_device.approve_in_registered_browser"),
+            patch(
+                "grok_oauth_device.poll_device_token",
+                return_value={"access_token": "access", "refresh_token": "refresh"},
+            ) as poll,
+        ):
+            result = mint_in_registered_browser(object(), proxy="socks5://warp:1080")
+        self.assertEqual(result["access_token"], "access")
+        self.assertIs(poll.call_args.args[0], standard_session)
+
     def test_oauth_sidecar_keeps_attempt_id_across_final_event(self):
         with tempfile.TemporaryDirectory() as tmp:
             sso_path = Path(tmp) / "task_1.txt"
