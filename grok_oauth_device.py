@@ -313,7 +313,20 @@ def poll_device_token(
 ) -> dict[str, Any]:
     logger = log or (lambda _: None)
     interval = max(1, int(device.get("interval") or 5))
-    denial_grace_attempts = 2
+    try:
+        denial_grace_attempts = min(
+            max(
+                0,
+                int(
+                    os.getenv(
+                        "GROK_REGISTER_OAUTH_DENIAL_GRACE_ATTEMPTS", "6"
+                    )
+                ),
+            ),
+            12,
+        )
+    except (TypeError, ValueError):
+        denial_grace_attempts = 6
     deadline = time.monotonic() + min(
         max(20, int(timeout)),
         max(20, int(device.get("expires_in") or timeout)),
@@ -356,7 +369,10 @@ def poll_device_token(
             # couple of times before classifying the account as ineligible.
             if denial_grace_attempts > 0 and time.monotonic() + interval < deadline:
                 denial_grace_attempts -= 1
-                logger("oauth poll: access-denied grace retry")
+                logger(
+                    "oauth poll: access-denied grace retry "
+                    f"remaining={denial_grace_attempts}"
+                )
                 time.sleep(interval)
                 continue
             raise DeviceFlowEntitlementDenied(

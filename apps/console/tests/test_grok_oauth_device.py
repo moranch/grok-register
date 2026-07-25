@@ -159,15 +159,8 @@ class RegistrationDeviceFlowTests(unittest.TestCase):
                 _Response(
                     400,
                     {"error": "invalid_grant", "error_description": "Access denied"},
-                ),
-                _Response(
-                    400,
-                    {"error": "invalid_grant", "error_description": "Access denied"},
-                ),
-                _Response(
-                    400,
-                    {"error": "invalid_grant", "error_description": "Access denied"},
-                ),
+                )
+                for _ in range(7)
             ]
         )
         with patch("grok_oauth_device.time.sleep"):
@@ -195,6 +188,30 @@ class RegistrationDeviceFlowTests(unittest.TestCase):
                 timeout=20,
             )
         self.assertEqual(token["refresh_token"], "refresh")
+
+    def test_access_denied_grace_attempts_are_configurable(self):
+        session = _Session(
+            [
+                _Response(
+                    400,
+                    {"error": "invalid_grant", "error_description": "Access denied"},
+                ),
+                _Response(200, {"access_token": "access", "refresh_token": "refresh"}),
+            ]
+        )
+        with (
+            patch.dict(
+                "os.environ",
+                {"GROK_REGISTER_OAUTH_DENIAL_GRACE_ATTEMPTS": "1"},
+            ),
+            patch("grok_oauth_device.time.sleep"),
+        ):
+            token = poll_device_token(
+                session,
+                {"device_code": "device", "expires_in": 30, "interval": 1},
+                timeout=20,
+            )
+        self.assertEqual(token["access_token"], "access")
 
     def test_registered_account_setup_accepts_tos_and_birth_date(self):
         session = _Session([_Response(200, {}), _Response(204, {})])
