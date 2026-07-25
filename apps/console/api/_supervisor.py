@@ -21,6 +21,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from ._browser_coordination import BROWSER_SESSION_LOCK, REGISTRATION_BROWSER_PENDING
 from ._shared import (
     MAX_CONCURRENT_TASKS,
     SUPERVISOR_INTERVAL,
@@ -298,17 +299,32 @@ class TaskSupervisor:
                 self._task_proxy[task_id] = fallback_proxy
         if picked_mailbox_id:
             self._task_mailbox[task_id] = picked_mailbox_id
-        process = subprocess.Popen(
-            command,
-            cwd=task_dir,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            text=True,
-            env=task_env,
-        )
+        # Historical CPA recovery also owns a Chromium instance.  Wait for it
+        # to finish and keep the shared browser lease for the complete
+        # registration subprocess lifetime, otherwise either side calling
+        # browser.quit() can invalidate the other DrissionPage CDP session.
+        REGISTRATION_BROWSER_PENDING.set()
+        BROWSER_SESSION_LOCK.acquire()
+        REGISTRATION_BROWSER_PENDING.clear()
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=task_dir,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                text=True,
+                env=task_env,
+            )
+        except Exception:
+            BROWSER_SESSION_LOCK.release()
+            log_handle.close()
+            raise
         self._processes[task_id] = ManagedProcess(
-            task_id=task_id, process=process, log_handle=log_handle
+            task_id=task_id,
+            process=process,
+            log_handle=log_handle,
+            browser_lock_held=True,
         )
         execute_no_return(
             """
@@ -389,6 +405,9 @@ class TaskSupervisor:
             managed = self._processes.pop(task_id, None)
             if managed and managed.log_handle:
                 managed.log_handle.close()
+            if managed and managed.browser_lock_held:
+                managed.browser_lock_held = False
+                BROWSER_SESSION_LOCK.release()
             mbox_id = self._task_mailbox.get(task_id, 0)
             if mbox_id:
                 finished_row = task_row(task_id)

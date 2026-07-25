@@ -21,6 +21,7 @@ from core.cpa_auth import (
     write_sub2api_record,
 )
 
+from ._browser_coordination import BROWSER_SESSION_LOCK, REGISTRATION_BROWSER_PENDING
 from ._shared import SUB_AUTH_DIR, execute_no_return, fetch_all, fetch_one, now_iso
 
 DEFAULT_CPA_WORKERS = 6
@@ -889,21 +890,25 @@ class CpaMintRuntime:
                                 "waiting_for_browser_fallback"
                             )
                             with CPA_BROWSER_FALLBACK_LOCK:
-                                if self._stop.is_set():
-                                    raise RuntimeError("CPA mint cancelled")
-                                token = mint_in_sso_browser(
-                                    sso=str(row["sso"] or extra.get("sso") or ""),
-                                    sso_rw=str(extra.get("sso_rw") or ""),
-                                    proxy=proxy,
-                                    timeout=self._browser_fallback_timeout(config_extra),
-                                    verify_tls=verify_tls,
-                                    headless=bool(
-                                        config_extra.get("browser_fallback_headless", False)
-                                    ),
-                                    log=lambda message: print(
-                                        f"[cpa-browser] account={account_id} {message}"
-                                    ),
-                                )
+                                while REGISTRATION_BROWSER_PENDING.is_set():
+                                    if self._stop.wait(0.2):
+                                        raise RuntimeError("CPA mint cancelled")
+                                with BROWSER_SESSION_LOCK:
+                                    if self._stop.is_set():
+                                        raise RuntimeError("CPA mint cancelled")
+                                    token = mint_in_sso_browser(
+                                        sso=str(row["sso"] or extra.get("sso") or ""),
+                                        sso_rw=str(extra.get("sso_rw") or ""),
+                                        proxy=proxy,
+                                        timeout=self._browser_fallback_timeout(config_extra),
+                                        verify_tls=verify_tls,
+                                        headless=bool(
+                                            config_extra.get("browser_fallback_headless", False)
+                                        ),
+                                        log=lambda message: print(
+                                            f"[cpa-browser] account={account_id} {message}"
+                                        ),
+                                    )
                             mint_method = str(
                                 token.get("mint_method")
                                 or "historical_sso_browser_device_flow"

@@ -2380,3 +2380,4 @@ class ManagedProcess:
     task_id: int
     process: subprocess.Popen[Any]
     log_handle: Any
+    browser_lock_held: bool = False
