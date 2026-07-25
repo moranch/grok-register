@@ -1015,6 +1015,9 @@ def init_db() -> None:
                 "prevalidate_ttl_minutes": 60,
                 "prevalidate_batch_size": 10,
                 "prevalidate_scan_seconds": 30,
+                "browser_fallback": True,
+                "browser_fallback_timeout": 120,
+                "browser_fallback_headless": False,
             },
         }
         conn.execute(

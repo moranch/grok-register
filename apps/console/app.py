@@ -21,8 +21,10 @@ from fastapi.staticfiles import StaticFiles
 
 # 确保 api/ 与 core/ / platforms/ / providers/ / exporters/ 都在 sys.path 上
 APP_DIR = Path(__file__).resolve().parent
-if str(APP_DIR) not in sys.path:
-    sys.path.insert(0, str(APP_DIR))
+REPO_ROOT = APP_DIR.parents[1]
+for import_root in (APP_DIR, REPO_ROOT):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
 
 from api._shared import WEBUI_DIR, init_db, seed_mailbox_from_defaults
 from api._supervisor import supervisor

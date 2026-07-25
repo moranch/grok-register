@@ -7,10 +7,13 @@ browser/profile/proxy identity.
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
 import random
+import shutil
 import struct
+import tempfile
 import time
 import uuid
 from datetime import date
@@ -98,6 +101,187 @@ def _registered_cookie_header(page: Any) -> str:
         if name in {"sso", "sso-rw", "cf_clearance"} and value:
             values[name] = value
     return "; ".join(f"{name}={value}" for name, value in values.items())
+
+
+def _inject_sso_browser_cookies(
+    page: Any,
+    browser: Any,
+    *,
+    sso: str,
+    sso_rw: str = "",
+) -> int:
+    """Install a persisted xAI session into a fresh Chromium profile."""
+    sso = str(sso or "").strip()
+    sso_rw = str(sso_rw or sso).strip()
+    if not sso:
+        raise ValueError("SSO is empty")
+    cookies = [
+        {
+            "name": name,
+            "value": value,
+            "domain": ".x.ai",
+            "path": "/",
+            "secure": True,
+            "httpOnly": True,
+        }
+        for name, value in (("sso", sso), ("sso-rw", sso_rw))
+        if value
+    ]
+    targets: list[Any] = []
+    for target in (page, getattr(page, "browser", None), browser):
+        if target is not None and all(target is not item for item in targets):
+            targets.append(target)
+
+    last_error: Exception | None = None
+    for target in targets:
+        setter = getattr(getattr(target, "set", None), "cookies", None)
+        if not callable(setter):
+            continue
+        try:
+            setter(cookies)
+            return len(cookies)
+        except Exception as exc:
+            last_error = exc
+            installed = 0
+            for cookie in cookies:
+                try:
+                    setter(cookie)
+                    installed += 1
+                except Exception as item_exc:
+                    last_error = item_exc
+            if installed == len(cookies):
+                return installed
+    if last_error:
+        raise RuntimeError(f"failed to inject SSO cookies: {last_error}") from last_error
+    raise RuntimeError("DrissionPage cookie setter is unavailable")
+
+
+def _find_chromium_path() -> str:
+    for candidate in (
+        shutil.which("chromium-browser"),
+        shutil.which("chromium"),
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+    ):
+        if candidate:
+            return str(candidate)
+    matches = glob.glob(
+        os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome")
+    )
+    return str(matches[0]) if matches else ""
+
+
+def _new_sso_oauth_browser(
+    *,
+    proxy: str = "",
+    headless: bool = False,
+) -> tuple[Any, Any, str]:
+    """Create an isolated browser used only by historical OAuth backfill."""
+    from DrissionPage import Chromium, ChromiumOptions
+
+    profile_dir = tempfile.mkdtemp(prefix="grok_cpa_oauth_")
+    options = ChromiumOptions()
+    options.auto_port()
+    options.set_user_data_path(profile_dir)
+    options.set_argument("--no-sandbox")
+    options.set_argument("--disable-gpu")
+    options.set_argument("--disable-dev-shm-usage")
+    options.set_argument("--disable-software-rasterizer")
+    if headless or not os.environ.get("DISPLAY"):
+        options.set_argument("--headless=new")
+    proxy = str(proxy or "").strip()
+    if proxy:
+        if proxy.lower().startswith("socks"):
+            options.set_argument("--proxy-server", proxy)
+        else:
+            options.set_proxy(proxy)
+    browser_path = _find_chromium_path()
+    if browser_path:
+        options.set_browser_path(browser_path)
+    extension_path = Path(__file__).resolve().parent / "turnstilePatch"
+    if extension_path.is_dir():
+        options.add_extension(str(extension_path))
+    options.set_timeouts(base=2)
+
+    browser = None
+    try:
+        browser = Chromium(options)
+        tabs = browser.get_tabs()
+        page = tabs[-1] if tabs else browser.new_tab()
+        return browser, page, profile_dir
+    except Exception:
+        if browser is not None:
+            try:
+                browser.quit()
+            except Exception:
+                pass
+        shutil.rmtree(profile_dir, ignore_errors=True)
+        raise
+
+
+def mint_in_sso_browser(
+    *,
+    sso: str,
+    sso_rw: str = "",
+    proxy: str = "",
+    timeout: int = 120,
+    verify_tls: bool = True,
+    headless: bool = False,
+    log: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Mint OAuth for a persisted live SSO using a clean browser fallback."""
+    logger = log or (lambda _: None)
+    browser = None
+    profile_dir = ""
+    try:
+        browser, page, profile_dir = _new_sso_oauth_browser(
+            proxy=proxy,
+            headless=headless,
+        )
+        installed = _inject_sso_browser_cookies(
+            page,
+            browser,
+            sso=sso,
+            sso_rw=sso_rw,
+        )
+        logger(f"historical browser cookies injected={installed}")
+        page.get("https://accounts.x.ai/")
+        current_url = str(getattr(page, "url", "") or "")
+        if "sign-in" in current_url or "sign-up" in current_url:
+            # Some Chromium builds apply domain cookies only after the first
+            # navigation creates the origin. Install once more before failing.
+            _inject_sso_browser_cookies(
+                page,
+                browser,
+                sso=sso,
+                sso_rw=sso_rw,
+            )
+            try:
+                page.refresh()
+            except Exception:
+                page.get("https://accounts.x.ai/")
+            current_url = str(getattr(page, "url", "") or "")
+        if "sign-in" in current_url or "sign-up" in current_url:
+            raise DeviceFlowError("persisted SSO was rejected by the browser session")
+        if "sso=" not in _registered_cookie_header(page):
+            raise DeviceFlowError("browser session did not retain the SSO cookie")
+        token = mint_in_registered_browser(
+            page,
+            proxy=proxy,
+            timeout=max(30, int(timeout)),
+            verify_tls=verify_tls,
+            log=logger,
+        )
+        token["mint_method"] = "historical_sso_browser_device_flow"
+        return token
+    finally:
+        if browser is not None:
+            try:
+                browser.quit()
+            except Exception:
+                pass
+        if profile_dir:
+            shutil.rmtree(profile_dir, ignore_errors=True)
 
 
 def _adult_birth_date() -> str:

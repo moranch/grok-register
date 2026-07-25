@@ -80,6 +80,21 @@ class CpaExporter(BaseExporter):
             "title": "后台扫描秒数",
             "default": 30,
         },
+        "browser_fallback": {
+            "type": "boolean",
+            "title": "协议补签失败后使用浏览器授权",
+            "default": True,
+        },
+        "browser_fallback_timeout": {
+            "type": "integer",
+            "title": "浏览器授权超时秒数",
+            "default": 120,
+        },
+        "browser_fallback_headless": {
+            "type": "boolean",
+            "title": "浏览器授权使用 Headless",
+            "default": False,
+        },
     }
 
     def push(self, account_data: Dict[str, Any], config: ExporterConfig) -> PushResult:

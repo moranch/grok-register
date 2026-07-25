@@ -10,7 +10,9 @@ from grok_oauth_device import (
     DeviceFlowEntitlementDenied,
     append_oauth_event,
     approve_in_registered_browser,
+    _inject_sso_browser_cookies,
     mint_in_registered_browser,
+    mint_in_sso_browser,
     poll_device_token,
     prepare_registered_account,
     request_device_code,
@@ -112,7 +114,75 @@ class _StickyCookiePage(_Page):
         self.cookie_clicks += 1
 
 
+class _CookieSetter:
+    def __init__(self, page):
+        self.page = page
+
+    def cookies(self, items):
+        values = items if isinstance(items, list) else [items]
+        self.page.cookie_items.extend(values)
+
+
+class _HistoricalPage(_Page):
+    def __init__(self):
+        super().__init__()
+        self.cookie_items = []
+        self.set = _CookieSetter(self)
+
+    def get(self, url):
+        self.url = url
+        self.text = "Account"
+
+    def cookies(self, **_kwargs):
+        return list(self.cookie_items)
+
+
+class _HistoricalBrowser:
+    def __init__(self):
+        self.quit_called = False
+
+    def quit(self):
+        self.quit_called = True
+
+
 class RegistrationDeviceFlowTests(unittest.TestCase):
+    def test_historical_browser_injects_sso_and_cleans_up(self):
+        page = _HistoricalPage()
+        browser = _HistoricalBrowser()
+        token = {"access_token": "access", "refresh_token": "refresh"}
+        with (
+            patch(
+                "grok_oauth_device._new_sso_oauth_browser",
+                return_value=(browser, page, "/tmp/test-profile"),
+            ),
+            patch(
+                "grok_oauth_device.mint_in_registered_browser",
+                return_value=token,
+            ) as mint,
+            patch("grok_oauth_device.shutil.rmtree") as remove_tree,
+        ):
+            result = mint_in_sso_browser(
+                sso="persisted-sso",
+                sso_rw="persisted-rw",
+                proxy="socks5://warp:1080",
+            )
+
+        self.assertEqual(result["access_token"], "access")
+        self.assertEqual(
+            result["mint_method"],
+            "historical_sso_browser_device_flow",
+        )
+        names = {item["name"]: item["value"] for item in page.cookie_items}
+        self.assertEqual(names["sso"], "persisted-sso")
+        self.assertEqual(names["sso-rw"], "persisted-rw")
+        mint.assert_called_once()
+        self.assertTrue(browser.quit_called)
+        remove_tree.assert_called_once_with("/tmp/test-profile", ignore_errors=True)
+
+    def test_cookie_injection_rejects_empty_sso(self):
+        with self.assertRaisesRegex(ValueError, "SSO is empty"):
+            _inject_sso_browser_cookies(_HistoricalPage(), object(), sso="")
+
     def test_device_request_uses_public_grok_cli_scope(self):
         session = _Session(
             [

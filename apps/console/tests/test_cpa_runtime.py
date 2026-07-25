@@ -30,6 +30,7 @@ class CpaRuntimeTests(unittest.TestCase):
                 "prevalidate_ttl_minutes": 60,
                 "prevalidate_batch_size": 10,
                 "prevalidate_scan_seconds": 30,
+                "browser_fallback": False,
             },
         }
 
@@ -192,6 +193,56 @@ class CpaRuntimeTests(unittest.TestCase):
         self.assertTrue(extra["cpa"]["credential_ready"])
         self.assertEqual(extra["cpa"]["mint_method"], "device_flow")
         self.assertEqual(extra["cpa"]["probe"]["probe_kind"], "account_session")
+
+    def test_protocol_denial_falls_back_to_historical_sso_browser(self):
+        account_id = self.add_account()
+        self.config["extra"]["browser_fallback"] = True
+        session_probe = {
+            "ok": True,
+            "account_alive": True,
+            "status": 200,
+            "probe_kind": "account_session",
+        }
+        browser_token = {
+            "access_token": "browser-access",
+            "refresh_token": "browser-refresh",
+            "expires_in": 21600,
+            "mint_method": "historical_sso_browser_device_flow",
+        }
+
+        with (
+            patch.object(self.runtime, "config", return_value=self.config),
+            patch(
+                "api._cpa_runtime.probe_grok_account_session",
+                return_value=session_probe,
+            ),
+            patch(
+                "api._cpa_runtime.refresh_cpa_token",
+                side_effect=RuntimeError("OAuth refresh failed: Access denied"),
+            ),
+            patch(
+                "api._cpa_runtime.exchange_sso_for_token",
+                side_effect=RuntimeError("OAuth token 获取失败: invalid_grant: Access denied"),
+            ),
+            patch(
+                "grok_oauth_device.mint_in_sso_browser",
+                return_value=browser_token,
+            ) as browser_mint,
+        ):
+            ok, error = self.runtime._mint_account(account_id, force=True)
+
+        self.assertTrue(ok)
+        self.assertEqual(error, "")
+        browser_mint.assert_called_once()
+        row = _shared.fetch_one("SELECT extra_json FROM accounts WHERE id=?", (account_id,))
+        extra = json.loads(row["extra_json"])
+        self.assertEqual(extra["access_token"], "browser-access")
+        self.assertEqual(extra["refresh_token"], "browser-refresh")
+        self.assertEqual(
+            extra["cpa"]["mint_method"],
+            "historical_sso_browser_device_flow",
+        )
+        self.assertTrue(extra["cpa"]["credential_ready"])
 
     def test_double_oauth_rejection_marks_entitlement_without_invalidating_sso(self):
         account_id = self.add_account()

@@ -26,6 +26,7 @@ from ._shared import SUB_AUTH_DIR, execute_no_return, fetch_all, fetch_one, now_
 DEFAULT_CPA_WORKERS = 6
 MAX_CPA_WORKERS = 16
 CPA_QUEUE_MAXSIZE = 5000
+CPA_BROWSER_FALLBACK_LOCK = threading.Lock()
 
 
 def _permanent_credential_failure(error: str) -> bool:
@@ -210,6 +211,25 @@ class CpaMintRuntime:
             return min(max(5, int(extra.get("prevalidate_ttl_minutes", 60))), 1440)
         except (TypeError, ValueError):
             return 60
+
+    @staticmethod
+    def _browser_fallback_enabled(config_extra: dict[str, Any]) -> bool:
+        value = config_extra.get("browser_fallback")
+        if value is None:
+            value = os.getenv("GROK_REGISTER_CPA_BROWSER_FALLBACK", "1")
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _browser_fallback_timeout(config_extra: dict[str, Any]) -> int:
+        value = config_extra.get("browser_fallback_timeout")
+        if value in (None, ""):
+            value = os.getenv("GROK_REGISTER_CPA_BROWSER_FALLBACK_TIMEOUT", "120")
+        try:
+            return min(max(30, int(value)), 300)
+        except (TypeError, ValueError):
+            return 120
 
     def enqueue(self, account_id: int, *, force: bool = False, job_id: str = "") -> bool:
         account_id = int(account_id)
@@ -853,12 +873,63 @@ class CpaMintRuntime:
                         cancel=self._stop.is_set,
                     )
                 except Exception as exc:
-                    if refresh_error:
+                    protocol_error = str(exc)[:500]
+                    browser_error = ""
+                    if (
+                        known_alive
+                        and str(row["sso"] or extra.get("sso") or "").strip()
+                        and self._browser_fallback_enabled(config_extra)
+                        and not self._stop.is_set()
+                    ):
+                        try:
+                            from grok_oauth_device import mint_in_sso_browser
+
+                            print(
+                                f"[cpa-browser] account={account_id} "
+                                "waiting_for_browser_fallback"
+                            )
+                            with CPA_BROWSER_FALLBACK_LOCK:
+                                if self._stop.is_set():
+                                    raise RuntimeError("CPA mint cancelled")
+                                token = mint_in_sso_browser(
+                                    sso=str(row["sso"] or extra.get("sso") or ""),
+                                    sso_rw=str(extra.get("sso_rw") or ""),
+                                    proxy=proxy,
+                                    timeout=self._browser_fallback_timeout(config_extra),
+                                    verify_tls=verify_tls,
+                                    headless=bool(
+                                        config_extra.get("browser_fallback_headless", False)
+                                    ),
+                                    log=lambda message: print(
+                                        f"[cpa-browser] account={account_id} {message}"
+                                    ),
+                                )
+                            mint_method = str(
+                                token.get("mint_method")
+                                or "historical_sso_browser_device_flow"
+                            )
+                            print(f"[cpa-browser] account={account_id} token_issued")
+                        except Exception as browser_exc:
+                            browser_error = str(browser_exc)[:500]
+                    if token is not None:
+                        pass
+                    elif refresh_error:
+                        suffix = (
+                            f"; SSO 浏览器授权失败: {browser_error}"
+                            if browser_error
+                            else ""
+                        )
                         raise RuntimeError(
                             f"refresh_token 续期失败: {refresh_error}; "
-                            f"SSO 重新授权失败: {exc}"
+                            f"SSO 协议重新授权失败: {protocol_error}{suffix}"
                         ) from exc
-                    raise
+                    elif browser_error:
+                        raise RuntimeError(
+                            f"SSO 协议重新授权失败: {protocol_error}; "
+                            f"SSO 浏览器授权失败: {browser_error}"
+                        ) from exc
+                    else:
+                        raise
             record = token_to_cpa_record(
                 token,
                 str(row["email"] or ""),
