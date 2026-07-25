@@ -33,13 +33,41 @@ if [ "$ENABLE_NOVNC" = "1" ]; then
     # 把 :99 变成持续输出的 VNC 源
     # -bg 让 x11vnc 以 daemon 方式自行 fork，避免作为 app.py 子进程退出时变僵尸
     echo "[entrypoint] starting x11vnc on :5900"
-    x11vnc -display :99 -forever -shared -nopw -quiet -rfbport 5900 -bg -o /tmp/x11vnc.log
+    x11vnc -display :99 -forever -shared -nopw -quiet -noxdamage \
+        -rfbport 5900 -bg -o /tmp/x11vnc.log
+
+    # Do not expose a WebSocket endpoint before x11vnc has completed its RFB
+    # startup.  A process can exist while its VNC socket is not yet ready,
+    # which leaves noVNC permanently showing "Connecting".
+    _vnc_ready=0
+    for _ in $(seq 1 20); do
+        if python - <<'PY'
+import socket
+
+try:
+    with socket.create_connection(("127.0.0.1", 5900), timeout=1) as sock:
+        sock.settimeout(1)
+        greeting = sock.recv(12)
+except OSError:
+    raise SystemExit(1)
+raise SystemExit(0 if greeting.startswith(b"RFB ") else 1)
+PY
+        then
+            _vnc_ready=1
+            break
+        fi
+        sleep 0.5
+    done
+
+    if [ "$_vnc_ready" != "1" ]; then
+        echo "[entrypoint] x11vnc failed to produce an RFB greeting; see /tmp/x11vnc.log"
+    fi
 
     # noVNC：把 VNC 流转成 WebSocket，让浏览器能看
     # Debian 12 里 novnc 装在 /usr/share/novnc
     if [ -d /usr/share/novnc ]; then
         echo "[entrypoint] starting noVNC on :6080 -> ws://:5900"
-        websockify --web=/usr/share/novnc 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
+        websockify --web=/usr/share/novnc 6080 127.0.0.1:5900 > /tmp/novnc.log 2>&1 &
     else
         echo "[entrypoint] /usr/share/novnc not found, skip noVNC"
     fi
