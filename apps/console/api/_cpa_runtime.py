@@ -27,6 +27,30 @@ MAX_CPA_WORKERS = 16
 CPA_QUEUE_MAXSIZE = 5000
 
 
+def _permanent_credential_failure(error: str) -> bool:
+    """Return true only when both renewal paths rejected the credential."""
+    lowered = str(error or "").lower()
+    transient_markers = (
+        "timed out",
+        "timeout",
+        "connection",
+        "network",
+        "proxy",
+        "temporarily",
+        "cancelled",
+        "canceled",
+    )
+    if any(marker in lowered for marker in transient_markers):
+        return False
+    refresh_failed = "refresh_token" in lowered and (
+        "access denied" in lowered or "invalid_grant" in lowered
+    )
+    sso_failed = "sso" in lowered and (
+        "invalid_grant" in lowered or "access denied" in lowered
+    )
+    return refresh_failed and sso_failed
+
+
 class CpaMintRuntime:
     def __init__(self) -> None:
         self._queue: queue.Queue[tuple[int, bool, str]] = queue.Queue(
@@ -56,6 +80,9 @@ class CpaMintRuntime:
     def start(self) -> None:
         if any(thread.is_alive() for thread in self._threads):
             return
+        quarantined = self._quarantine_known_permanent_failures()
+        if quarantined:
+            print(f"[cpa-prevalidate] quarantined_permanent={quarantined}")
         self._stop.clear()
         self._threads = [
             threading.Thread(
@@ -77,6 +104,42 @@ class CpaMintRuntime:
             daemon=True,
         )
         self._scheduler_thread.start()
+
+    def _quarantine_known_permanent_failures(self) -> int:
+        """Remove already-proven unusable OAuth credentials from delivery stock."""
+        rows = fetch_all(
+            """
+            SELECT id, extra_json, last_error
+            FROM accounts
+            WHERE platform='grok' AND validity_status <> 'invalid'
+            """
+        )
+        quarantined = 0
+        for row in rows:
+            try:
+                extra = json.loads(row["extra_json"] or "{}")
+            except Exception:
+                extra = {}
+            cpa = extra.get("cpa") if isinstance(extra.get("cpa"), dict) else {}
+            error = str(cpa.get("error") or cpa.get("probe_error") or row["last_error"] or "")
+            if not _permanent_credential_failure(error):
+                continue
+            cpa["status"] = "failed"
+            cpa["credential_ready"] = False
+            cpa["failure_kind"] = "credential_invalid"
+            extra["cpa"] = cpa
+            execute_no_return(
+                "UPDATE accounts SET extra_json=?, validity_status='invalid', "
+                "last_checked_at=?, last_error=? WHERE id=?",
+                (
+                    json.dumps(extra, ensure_ascii=False),
+                    now_iso(),
+                    error[:500],
+                    int(row["id"]),
+                ),
+            )
+            quarantined += 1
+        return quarantined
 
     def stop(self) -> None:
         self._stop.set()
@@ -417,6 +480,7 @@ class CpaMintRuntime:
         cpa.pop("error", None)
         cpa.pop("probe_error", None)
         cpa.pop("renewal_error", None)
+        cpa.pop("failure_kind", None)
         extra["cpa"] = cpa
         execute_no_return(
             "UPDATE accounts SET extra_json=?, validity_status='valid', "
@@ -613,12 +677,17 @@ class CpaMintRuntime:
             )
             return True, ""
         except Exception as exc:
+            error_text = str(exc)
+            permanent_failure = _permanent_credential_failure(error_text)
             failed_cpa = extra.get("cpa") if isinstance(extra.get("cpa"), dict) else {}
             failed_cpa.update(
                 {
                     "status": "failed",
                     "credential_ready": False,
-                    "error": str(exc)[:500],
+                    "failure_kind": (
+                        "credential_invalid" if permanent_failure else "renewal_failed"
+                    ),
+                    "error": error_text[:500],
                     "updated_at": now_iso(),
                 }
             )
@@ -629,14 +698,19 @@ class CpaMintRuntime:
                 failed_cpa["probe_error"] = last_probe_error[:500]
             extra["cpa"] = failed_cpa
             execute_no_return(
-                "UPDATE accounts SET extra_json = ?, exporter_status_json = ? WHERE id = ?",
+                "UPDATE accounts SET extra_json=?, exporter_status_json=?, "
+                "validity_status=CASE WHEN ? THEN 'invalid' ELSE validity_status END, "
+                "last_checked_at=?, last_error=? WHERE id=?",
                 (
                     json.dumps(extra, ensure_ascii=False),
-                    json.dumps({"cpa": {"status": "failed", "message": str(exc)[:500], "last_pushed_at": now_iso()}}, ensure_ascii=False),
+                    json.dumps({"cpa": {"status": "failed", "message": error_text[:500], "last_pushed_at": now_iso()}}, ensure_ascii=False),
+                    permanent_failure,
+                    now_iso(),
+                    error_text[:500],
                     account_id,
                 ),
             )
-            return False, f"account_id={account_id}: {exc}"
+            return False, f"account_id={account_id}: {error_text}"
 
 
 cpa_mint_runtime = CpaMintRuntime()

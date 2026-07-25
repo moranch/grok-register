@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from api import _shared
-from api._cpa_runtime import CpaMintRuntime
+from api._cpa_runtime import CpaMintRuntime, _permanent_credential_failure
 
 
 class CpaRuntimeTests(unittest.TestCase):
@@ -191,6 +191,74 @@ class CpaRuntimeTests(unittest.TestCase):
         self.assertTrue(extra["cpa"]["credential_ready"])
         self.assertEqual(extra["cpa"]["mint_method"], "device_flow")
         self.assertEqual(extra["cpa"]["probe"]["probe_kind"], "account_session")
+
+    def test_double_oauth_rejection_quarantines_account(self):
+        account_id = self.add_account()
+        session_probe = {
+            "ok": True,
+            "account_alive": True,
+            "status": 200,
+            "probe_kind": "account_session",
+        }
+        with (
+            patch.object(self.runtime, "config", return_value=self.config),
+            patch(
+                "api._cpa_runtime.probe_grok_account_session",
+                return_value=session_probe,
+            ),
+            patch(
+                "api._cpa_runtime.refresh_cpa_token",
+                side_effect=RuntimeError("OAuth refresh failed: Access denied"),
+            ),
+            patch(
+                "api._cpa_runtime.exchange_sso_for_token",
+                side_effect=RuntimeError("OAuth token failed: invalid_grant"),
+            ),
+        ):
+            ok, error = self.runtime._mint_account(account_id, force=True)
+
+        self.assertFalse(ok)
+        self.assertTrue(_permanent_credential_failure(error))
+        row = _shared.fetch_one(
+            "SELECT validity_status, last_error, extra_json FROM accounts WHERE id=?",
+            (account_id,),
+        )
+        extra = json.loads(row["extra_json"])
+        self.assertEqual(row["validity_status"], "invalid")
+        self.assertIn("invalid_grant", row["last_error"])
+        self.assertEqual(extra["cpa"]["failure_kind"], "credential_invalid")
+        self.assertFalse(extra["cpa"]["credential_ready"])
+
+    def test_transient_reauthorization_failure_is_not_quarantined(self):
+        error = (
+            "refresh_token failed: OAuth refresh failed: Access denied; "
+            "SSO reauthorization failed: connection timed out"
+        )
+        self.assertFalse(_permanent_credential_failure(error))
+
+    def test_startup_quarantines_persisted_double_rejection(self):
+        account_id = self.add_account()
+        row = _shared.fetch_one("SELECT extra_json FROM accounts WHERE id=?", (account_id,))
+        extra = json.loads(row["extra_json"])
+        extra["cpa"]["error"] = (
+            "refresh_token failed: OAuth refresh failed: Access denied; "
+            "SSO reauthorization failed: invalid_grant"
+        )
+        _shared.execute_no_return(
+            "UPDATE accounts SET extra_json=? WHERE id=?",
+            (json.dumps(extra), account_id),
+        )
+
+        self.assertEqual(self.runtime._quarantine_known_permanent_failures(), 1)
+        row = _shared.fetch_one(
+            "SELECT validity_status, extra_json FROM accounts WHERE id=?",
+            (account_id,),
+        )
+        self.assertEqual(row["validity_status"], "invalid")
+        self.assertEqual(
+            json.loads(row["extra_json"])["cpa"]["failure_kind"],
+            "credential_invalid",
+        )
 
     def test_scheduler_enqueues_stale_undelivered_account(self):
         account_id = self.add_account()

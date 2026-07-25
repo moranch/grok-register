@@ -408,8 +408,9 @@ class DeliveryRuntimeTests(unittest.TestCase):
     def test_expired_probe_result_cannot_mark_lease_ready(self):
         expired_id = self.add_account("expired-probe@example.com", "expired-probe-sub")
         fresh_id = self.add_account("fresh-probe@example.com", "fresh-probe-sub")
-        self.set_prevalidation(expired_id, _shared.now_iso())
-        self.set_prevalidation(fresh_id, _shared.now_iso())
+        recent = _shared.now_iso()
+        self.set_prevalidation(expired_id, recent)
+        self.set_prevalidation(fresh_id, recent)
         probed: list[int] = []
 
         def probe(account_id, _required_model):
