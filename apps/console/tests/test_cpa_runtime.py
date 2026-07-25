@@ -236,6 +236,13 @@ class CpaRuntimeTests(unittest.TestCase):
         )
         self.assertFalse(_permanent_credential_failure(error))
 
+    def test_initial_invalid_grant_is_quarantined(self):
+        self.assertTrue(
+            _permanent_credential_failure(
+                "OAuth token failed: invalid_grant: Access denied"
+            )
+        )
+
     def test_startup_quarantines_persisted_double_rejection(self):
         account_id = self.add_account()
         row = _shared.fetch_one("SELECT extra_json FROM accounts WHERE id=?", (account_id,))

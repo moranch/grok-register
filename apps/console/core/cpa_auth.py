@@ -241,12 +241,16 @@ def exchange_sso_for_token(
             if transient_errors < 8:
                 continue
         error = str(payload.get("error") or "")
+        error_description = str(payload.get("error_description") or "").strip()
         if error == "authorization_pending":
             continue
         if error == "slow_down":
             interval += 5
             continue
-        raise RuntimeError(f"OAuth token 获取失败: {error or response.status_code}")
+        detail = error or str(response.status_code)
+        if error_description:
+            detail = f"{detail}: {error_description}"
+        raise RuntimeError(f"OAuth token 获取失败: {detail}")
     raise TimeoutError("OAuth token 获取超时")
 
 

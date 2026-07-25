@@ -48,7 +48,12 @@ def _permanent_credential_failure(error: str) -> bool:
     sso_failed = "sso" in lowered and (
         "invalid_grant" in lowered or "access denied" in lowered
     )
-    return refresh_failed and sso_failed
+    initial_grant_failed = (
+        "oauth token" in lowered
+        and "invalid_grant" in lowered
+        and "refresh_token" not in lowered
+    )
+    return initial_grant_failed or (refresh_failed and sso_failed)
 
 
 class CpaMintRuntime:
