@@ -482,6 +482,86 @@ def _click_button(page: Any, labels: tuple[str, ...]) -> str:
     return ""
 
 
+def _prime_allow_action(page: Any) -> bool:
+    """Set the OAuth consent form action before its Allow button is clicked.
+
+    The current xAI consent page submits ``input[name=action]``.  A synthetic
+    button click can leave that input empty, which the server rejects as
+    ``Invalid action`` even though the visible button says Allow.
+    """
+    try:
+        return bool(
+            page.run_js(
+                r"""
+const allowLabels = new Set(['allow', 'authorize', 'approve', '允许', '授权', '同意']);
+const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
+const button = buttons.find((node) => {
+  const text = (node.innerText || node.value || node.textContent || '').trim().toLowerCase();
+  return allowLabels.has(text);
+});
+const forms = Array.from(document.querySelectorAll('form'));
+const form = (button && button.form) || forms.find((candidate) => {
+  const text = (candidate.innerText || '').toLowerCase();
+  return text.includes('grok build') || text.includes('允许') || text.includes('authorize');
+});
+if (!form) return false;
+let action = form.querySelector('input[name="action"]');
+if (!action) {
+  action = document.createElement('input');
+  action.type = 'hidden';
+  action.name = 'action';
+  form.appendChild(action);
+}
+action.value = 'allow';
+action.setAttribute('value', 'allow');
+action.dispatchEvent(new Event('input', {bubbles: true}));
+action.dispatchEvent(new Event('change', {bubbles: true}));
+return true;
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def _submit_allow_form(page: Any) -> bool:
+    """Last-resort consent submission that preserves ``action=allow``."""
+    try:
+        return bool(
+            page.run_js(
+                r"""
+const allowLabels = new Set(['allow', 'authorize', 'approve', '允许', '授权', '同意']);
+const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
+const button = buttons.find((node) => {
+  const text = (node.innerText || node.value || node.textContent || '').trim().toLowerCase();
+  return allowLabels.has(text);
+});
+const forms = Array.from(document.querySelectorAll('form'));
+const form = (button && button.form) || forms.find((candidate) => {
+  const text = (candidate.innerText || '').toLowerCase();
+  return text.includes('grok build') || text.includes('允许') || text.includes('authorize');
+});
+if (!form) return false;
+let action = form.querySelector('input[name="action"]');
+if (!action) {
+  action = document.createElement('input');
+  action.type = 'hidden';
+  action.name = 'action';
+  form.appendChild(action);
+}
+action.value = 'allow';
+action.setAttribute('value', 'allow');
+if (button && typeof form.requestSubmit === 'function') form.requestSubmit(button);
+else if (button) button.click();
+else form.submit();
+return true;
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
 def approve_in_registered_browser(
     page: Any,
     verification_url: str,
@@ -507,6 +587,12 @@ def approve_in_registered_browser(
             return
         if "access denied" in lowered or "unable to access" in lowered or "you have been blocked" in lowered:
             raise DeviceFlowError("device browser was blocked before consent")
+        if "invalid action" in lowered:
+            logger("device browser invalid action; reopening device authorization")
+            page.get(verification_url)
+            cookie_consent_attempted = False
+            time.sleep(0.8)
+            continue
 
         clicked = ""
         if not cookie_consent_attempted:
@@ -525,8 +611,19 @@ def approve_in_registered_browser(
                 cookie_consent_attempted = True
         if not clicked:
             clicked = _click_button(page, ("Continue", "继续"))
-        if not clicked:
-            clicked = _click_button(page, ("Allow", "允许", "Authorize", "授权"))
+        consent_page = (
+            "/oauth2/device/consent" in url
+            or "authorize grok build" in lowered
+            or "授权 grok build" in lowered
+        )
+        if not clicked and consent_page:
+            _prime_allow_action(page)
+            clicked = _click_button(
+                page,
+                ("Allow", "允许", "Authorize", "授权", "Approve", "同意"),
+            )
+            if not clicked and _submit_allow_form(page):
+                clicked = "action=allow"
         if clicked:
             logger(f"device browser clicked={clicked}")
             time.sleep(0.8)

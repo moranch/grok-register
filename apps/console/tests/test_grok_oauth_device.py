@@ -97,6 +97,38 @@ class _Page:
         self.text = "Device Authorized"
 
 
+class _ActionPage(_Page):
+    def __init__(self):
+        super().__init__()
+        self.action_primed = False
+
+    def run_js(self, script):
+        if 'input[name="action"]' in script and "action.value = 'allow'" in script:
+            self.action_primed = True
+            return True
+        return False
+
+    def _done(self):
+        if not self.action_primed:
+            self.text = "Invalid action"
+            return
+        super()._done()
+
+
+class _InvalidActionPage(_Page):
+    def __init__(self):
+        super().__init__()
+        self.opens = 0
+
+    def get(self, url):
+        self.opens += 1
+        self.url = url
+        if self.opens == 1:
+            self.text = "Invalid action"
+        else:
+            self.text = "Enter the code shown in your terminal. Continue"
+
+
 class _StickyCookiePage(_Page):
     def __init__(self):
         super().__init__()
@@ -210,6 +242,28 @@ class RegistrationDeviceFlowTests(unittest.TestCase):
             "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234",
             timeout=20,
         )
+        self.assertIn("/done", page.url)
+
+    def test_consent_primes_hidden_allow_action_before_click(self):
+        page = _ActionPage()
+        with patch("grok_oauth_device.time.sleep"):
+            approve_in_registered_browser(
+                page,
+                "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234",
+                timeout=20,
+            )
+        self.assertTrue(page.action_primed)
+        self.assertIn("/done", page.url)
+
+    def test_invalid_action_reopens_device_authorization(self):
+        page = _InvalidActionPage()
+        with patch("grok_oauth_device.time.sleep"):
+            approve_in_registered_browser(
+                page,
+                "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234",
+                timeout=20,
+            )
+        self.assertGreaterEqual(page.opens, 2)
         self.assertIn("/done", page.url)
 
     def test_stale_cookie_button_is_only_clicked_once(self):
