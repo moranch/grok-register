@@ -3,7 +3,9 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from email.message import EmailMessage
 from pathlib import Path
+from unittest.mock import patch
 
 CONSOLE_DIR = Path(__file__).resolve().parents[1]
 if str(CONSOLE_DIR) not in sys.path:
@@ -91,6 +93,59 @@ class HotmailPoolTests(unittest.TestCase):
             self.assertEqual(pool.verification_status(alias)["item"]["status"], "reserved")
             pool.release(alias, consumed=False)
             self.assertEqual(pool.verification_status(alias)["item"]["status"], "released")
+
+    def test_scan_host_finds_xai_code_in_outlook_junk_folder(self):
+        message = EmailMessage()
+        message["From"] = "SpaceXAI <noreply@x.ai>"
+        message["To"] = "user@outlook.com"
+        message["Subject"] = "SpaceXAI confirmation code: ABC-123"
+        message.set_content("Your verification code is ABC-123")
+
+        class FakeImap:
+            selected = ""
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def authenticate(self, *_args, **_kwargs):
+                return "OK", []
+
+            def list(self):
+                return "OK", [
+                    b'(\\HasNoChildren) "/" INBOX',
+                    b'(\\HasNoChildren \\Junk) "/" "Junk Email"',
+                ]
+
+            def select(self, mailbox, readonly=False):
+                self.selected = mailbox
+                return "OK", [b"1"]
+
+            def search(self, *_args):
+                if self.selected == '"Junk Email"':
+                    return "OK", [b"7"]
+                return "OK", [b""]
+
+            def fetch(self, *_args):
+                return "OK", [(b"7 (RFC822)", message.as_bytes())]
+
+            def close(self):
+                return "OK", []
+
+            def logout(self):
+                return "BYE", []
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mail.txt"
+            path.write_text("user@outlook.com----p----c----r\n", encoding="utf-8")
+            pool = HotmailPool(path)
+            with patch("core.hotmail_pool.imaplib.IMAP4_SSL", FakeImap):
+                code = pool._scan_host(
+                    {"email": "user@outlook.com"},
+                    "user@outlook.com",
+                    "access-token",
+                    "outlook.office365.com",
+                )
+            self.assertEqual(code, "ABC-123")
 
 
 if __name__ == "__main__":

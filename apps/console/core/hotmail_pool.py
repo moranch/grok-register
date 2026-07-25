@@ -474,55 +474,101 @@ class HotmailPool:
     def _imap_auth(account: dict[str, str], access_token: str) -> bytes:
         return f"user={account['email']}\x01auth=Bearer {access_token}\x01\x01".encode()
 
+    @staticmethod
+    def _imap_scan_folders(client: imaplib.IMAP4_SSL) -> list[tuple[str, str]]:
+        """Return INBOX plus any server-advertised Junk/Spam folders.
+
+        Outlook normally advertises its junk folder with the ``\\Junk``
+        special-use flag.  Keep the raw mailbox token returned by LIST so a
+        folder containing spaces remains correctly quoted when passed back to
+        SELECT.
+        """
+        folders: list[tuple[str, str]] = [("INBOX", "INBOX")]
+        try:
+            status, rows = client.list()
+        except Exception:
+            return folders
+        if status != "OK" or not rows:
+            return folders
+        for raw in rows:
+            if not raw:
+                continue
+            text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+            match = re.match(
+                r'^\((?P<flags>[^)]*)\)\s+(?:NIL|"(?:\\.|[^"])*")\s+(?P<mailbox>.+)$',
+                text.strip(),
+            )
+            if not match:
+                continue
+            flags = match.group("flags").lower()
+            mailbox = match.group("mailbox").strip()
+            label = mailbox.strip('"').replace(r'\"', '"')
+            if "\\junk" not in flags and label.lower() not in {
+                "junk",
+                "junk email",
+                "junk e-mail",
+                "spam",
+            }:
+                continue
+            if all(existing[1].lower() != mailbox.lower() for existing in folders):
+                folders.append((label, mailbox))
+        return folders
+
     def _scan_host(self, account: dict[str, str], alias: str, access_token: str, host: str) -> str:
         client = imaplib.IMAP4_SSL(host, 993, timeout=45)
         client.authenticate("XOAUTH2", lambda _: self._imap_auth(account, access_token))
         try:
-            client.select("INBOX")
-            status, data = client.search(None, "ALL")
-            if status != "OK" or not data or not data[0]:
-                return ""
             cutoff = time.time() - self.recent_seconds
-            for message_id in reversed(data[0].split()[-self.imap_last_n :]):
-                _, message_data = client.fetch(message_id, "(RFC822)")
-                if not message_data or not isinstance(message_data[0], tuple):
+            for folder_label, mailbox in self._imap_scan_folders(client):
+                status, _ = client.select(mailbox, readonly=True)
+                if status != "OK":
                     continue
-                message = email.message_from_bytes(message_data[0][1])
-                date_value = message.get("Date")
-                if date_value:
-                    try:
-                        sent_at = parsedate_to_datetime(date_value)
-                        if sent_at.tzinfo is None:
-                            sent_at = sent_at.replace(tzinfo=timezone.utc)
-                        if sent_at.timestamp() < cutoff:
-                            continue
-                    except Exception:
-                        pass
-                subject = _decode_header(message.get("Subject", ""))
-                sender = _decode_header(message.get("From", ""))
-                recipients = " ".join(
-                    _decode_header(message.get(name, ""))
-                    for name in (
-                        "To",
-                        "Cc",
-                        "Delivered-To",
-                        "X-Original-To",
-                        "Original-Recipient",
-                        "Envelope-To",
-                    )
-                ).lower()
-                if self.require_recipient_match and alias.lower() not in recipients:
+                status, data = client.search(None, "ALL")
+                if status != "OK" or not data or not data[0]:
                     continue
-                body = _message_body(message)
-                combined = f"{subject}\n{sender}\n{recipients}\n{body}"
-                if not any(
-                    word in combined.lower()
-                    for word in ("x.ai", "xai", "grok", "verification", "code", "验证码")
-                ):
-                    continue
-                code = extract_verification_code(combined, subject)
-                if code:
-                    return code
+                for message_id in reversed(data[0].split()[-self.imap_last_n :]):
+                    _, message_data = client.fetch(message_id, "(RFC822)")
+                    if not message_data or not isinstance(message_data[0], tuple):
+                        continue
+                    message = email.message_from_bytes(message_data[0][1])
+                    date_value = message.get("Date")
+                    if date_value:
+                        try:
+                            sent_at = parsedate_to_datetime(date_value)
+                            if sent_at.tzinfo is None:
+                                sent_at = sent_at.replace(tzinfo=timezone.utc)
+                            if sent_at.timestamp() < cutoff:
+                                continue
+                        except Exception:
+                            pass
+                    subject = _decode_header(message.get("Subject", ""))
+                    sender = _decode_header(message.get("From", ""))
+                    recipients = " ".join(
+                        _decode_header(message.get(name, ""))
+                        for name in (
+                            "To",
+                            "Cc",
+                            "Delivered-To",
+                            "X-Original-To",
+                            "Original-Recipient",
+                            "Envelope-To",
+                            "X-Envelope-To",
+                            "X-MS-Exchange-Organization-OriginalEnvelopeRecipients",
+                        )
+                    ).lower()
+                    if self.require_recipient_match and alias.lower() not in recipients:
+                        continue
+                    body = _message_body(message)
+                    combined = f"{subject}\n{sender}\n{recipients}\n{body}"
+                    if not any(
+                        word in combined.lower()
+                        for word in ("x.ai", "xai", "grok", "verification", "code", "验证码")
+                    ):
+                        continue
+                    code = extract_verification_code(combined, subject)
+                    if code:
+                        self.log(f"[Hotmail] 已从 {folder_label} 获取验证码: {alias}")
+                        return code
             return ""
         finally:
             try:
@@ -546,6 +592,7 @@ class HotmailPool:
             timeout_seconds=int(timeout),
             last_error="",
         )
+        self.log(f"[Hotmail] 开始轮询验证码: {alias}，超时={int(timeout)}s")
         try:
             while time.time() < deadline:
                 if self.stop_event and self.stop_event.is_set():
@@ -574,6 +621,10 @@ class HotmailPool:
                             errors.append(f"{host}: {exc}")
                     if errors and len(errors) >= len(self.imap_hosts):
                         raise RuntimeError("; ".join(errors))
+                    self.log(
+                        f"[Hotmail] 第 {attempts} 次轮询未发现验证码: {alias}，"
+                        f"{self.poll_interval:g}s 后重试"
+                    )
                 except Exception as exc:
                     access_token = ""
                     self._set_verification(alias, status="waiting", attempts=attempts, last_error=str(exc)[:300])
