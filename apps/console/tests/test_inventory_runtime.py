@@ -131,11 +131,13 @@ class AutoReplenishRuntimeTests(unittest.TestCase):
             ok: bool = True,
             alive: bool | None = None,
             probe_kind: str = "account_identity",
+            credential_ready: bool = True,
         ):
             return {
                 "access_token": "access-token",
                 "refresh_token": "refresh-token",
                 "cpa": {
+                    "credential_ready": credential_ready,
                     "probe_checked_at": checked_at,
                     "probe": {
                         "ok": ok,
@@ -158,12 +160,20 @@ class AutoReplenishRuntimeTests(unittest.TestCase):
                 probe_kind="account_session",
             ),
         )
+        self.add_account(
+            6,
+            extra=cpa_probe(
+                checked_at=recent,
+                probe_kind="account_session",
+                credential_ready=False,
+            ),
+        )
 
         snapshot = _delivery_runtime.delivery_stock_snapshot()
 
-        self.assertEqual(snapshot["candidate_stock"], 5)
+        self.assertEqual(snapshot["candidate_stock"], 6)
         self.assertEqual(snapshot["verified_stock"], 3)
-        self.assertEqual(snapshot["unverified_stock"], 2)
+        self.assertEqual(snapshot["unverified_stock"], 3)
         self.assertEqual(snapshot["replenishment_metric"], "candidate_stock")
 
     def test_stock_99_queues_one_task_for_100_and_deduplicates(self):

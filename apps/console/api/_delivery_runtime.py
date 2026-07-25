@@ -402,6 +402,14 @@ def _probe_account(account_id: int, required_model: str) -> dict[str, Any]:
             cached_extra = {}
         cached_cpa = cached_extra.get("cpa") if isinstance(cached_extra.get("cpa"), dict) else {}
         cached_probe = cached_cpa.get("probe") if isinstance(cached_cpa.get("probe"), dict) else {}
+        cached_probe_kind = str(cached_probe.get("probe_kind") or "")
+        cached_credentials_ready = bool(
+            cached_probe_kind in {"account_identity", "account_response"}
+            or (
+                cached_probe_kind == "account_session"
+                and cached_cpa.get("credential_ready") is True
+            )
+        )
         checked_text = str(cached_cpa.get("probe_checked_at") or cached_cpa.get("updated_at") or "")
         try:
             checked_at = datetime.fromisoformat(checked_text.replace("Z", "+00:00")).replace(tzinfo=None)
@@ -411,8 +419,7 @@ def _probe_account(account_id: int, required_model: str) -> dict[str, Any]:
         if (
             checked_at is not None
             and checked_at >= datetime.now() - timedelta(minutes=cache_ttl_minutes)
-            and cached_probe.get("probe_kind")
-            in {"account_identity", "account_response", "account_session"}
+            and cached_credentials_ready
             and cached_alive
         ):
             result = dict(cached_probe)
@@ -505,6 +512,14 @@ def delivery_stock_snapshot(
                 continue
             cpa = extra.get("cpa") if isinstance(extra.get("cpa"), dict) else {}
             probe = cpa.get("probe") if isinstance(cpa.get("probe"), dict) else {}
+            probe_kind = str(probe.get("probe_kind") or "")
+            credentials_ready = bool(
+                probe_kind in {"account_identity", "account_response"}
+                or (
+                    probe_kind == "account_session"
+                    and cpa.get("credential_ready") is True
+                )
+            )
             checked_text = str(cpa.get("probe_checked_at") or cpa.get("updated_at") or "")
             try:
                 checked_at = datetime.fromisoformat(checked_text.replace("Z", "+00:00")).replace(
@@ -515,8 +530,7 @@ def delivery_stock_snapshot(
             recent_account_probe = (
                 cutoff is not None
                 and checked_at >= cutoff
-                and probe.get("probe_kind")
-                in {"account_identity", "account_response", "account_session"}
+                and credentials_ready
             )
             if recent_account_probe and bool(probe.get("account_alive", probe.get("ok"))):
                 verified_stock += 1
@@ -657,9 +671,19 @@ def reserve(
                                   json_extract(a.extra_json, '$.cpa.probe.ok'),
                                   0
                               ) = 1
-                              AND COALESCE(
-                                  json_extract(a.extra_json, '$.cpa.probe.probe_kind'), ''
-                              ) IN ('account_identity', 'account_response', 'account_session')
+                              AND (
+                                  COALESCE(
+                                      json_extract(a.extra_json, '$.cpa.probe.probe_kind'), ''
+                                  ) IN ('account_identity', 'account_response')
+                                  OR (
+                                      COALESCE(
+                                          json_extract(a.extra_json, '$.cpa.probe.probe_kind'), ''
+                                      ) = 'account_session'
+                                      AND COALESCE(
+                                          json_extract(a.extra_json, '$.cpa.credential_ready'), 0
+                                      ) = 1
+                                  )
+                              )
                               AND COALESCE(
                                   json_extract(a.extra_json, '$.cpa.probe_checked_at'),
                                   json_extract(a.extra_json, '$.cpa.updated_at'),
@@ -692,9 +716,19 @@ def reserve(
                                      json_extract(a.extra_json, '$.cpa.probe.ok'),
                                      0
                                  ) = 1
-                                 AND COALESCE(
-                                     json_extract(a.extra_json, '$.cpa.probe.probe_kind'), ''
-                                 ) IN ('account_identity', 'account_response', 'account_session')
+                                 AND (
+                                     COALESCE(
+                                         json_extract(a.extra_json, '$.cpa.probe.probe_kind'), ''
+                                     ) IN ('account_identity', 'account_response')
+                                     OR (
+                                         COALESCE(
+                                             json_extract(a.extra_json, '$.cpa.probe.probe_kind'), ''
+                                         ) = 'account_session'
+                                         AND COALESCE(
+                                             json_extract(a.extra_json, '$.cpa.credential_ready'), 0
+                                         ) = 1
+                                     )
+                                 )
                                  AND COALESCE(
                                      json_extract(a.extra_json, '$.cpa.probe_checked_at'),
                                      json_extract(a.extra_json, '$.cpa.updated_at'),

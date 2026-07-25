@@ -144,13 +144,18 @@ class CpaRuntimeTests(unittest.TestCase):
         self.assertTrue(extra["cpa"]["probe"]["account_alive"])
         self.assertEqual(extra["cpa"]["probe"]["probe_kind"], "account_session")
 
-    def test_refresh_failure_keeps_live_sso_without_device_flow(self):
+    def test_refresh_failure_reissues_credentials_with_device_flow(self):
         account_id = self.add_account()
         session_probe = {
             "ok": True,
             "account_alive": True,
             "status": 200,
             "probe_kind": "account_session",
+        }
+        device_token = {
+            "access_token": "device-access",
+            "refresh_token": "device-refresh",
+            "expires_in": 21600,
         }
 
         with (
@@ -167,21 +172,25 @@ class CpaRuntimeTests(unittest.TestCase):
                 "api._cpa_runtime.refresh_cpa_token",
                 side_effect=RuntimeError("invalid_grant"),
             ) as refresh,
-            patch("api._cpa_runtime.exchange_sso_for_token") as device_flow,
+            patch(
+                "api._cpa_runtime.exchange_sso_for_token",
+                return_value=device_token,
+            ) as device_flow,
         ):
             ok, error = self.runtime._mint_account(account_id, force=True)
 
         self.assertTrue(ok)
         self.assertEqual(error, "")
         refresh.assert_called_once()
-        device_flow.assert_not_called()
+        device_flow.assert_called_once()
         row = _shared.fetch_one("SELECT extra_json FROM accounts WHERE id=?", (account_id,))
         extra = json.loads(row["extra_json"])
-        self.assertEqual(extra["access_token"], "existing-access")
-        self.assertEqual(extra["refresh_token"], "existing-refresh")
+        self.assertEqual(extra["access_token"], "device-access")
+        self.assertEqual(extra["refresh_token"], "device-refresh")
         self.assertEqual(extra["cpa"]["status"], "ready")
+        self.assertTrue(extra["cpa"]["credential_ready"])
+        self.assertEqual(extra["cpa"]["mint_method"], "device_flow")
         self.assertEqual(extra["cpa"]["probe"]["probe_kind"], "account_session")
-        self.assertIn("invalid_grant", extra["cpa"]["renewal_error"])
 
     def test_scheduler_enqueues_stale_undelivered_account(self):
         account_id = self.add_account()

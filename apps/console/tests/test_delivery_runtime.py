@@ -127,6 +127,38 @@ class DeliveryRuntimeTests(unittest.TestCase):
         self.assertEqual(int(lease["account_id"]), account_id)
         self.assertTrue(probe["cache_hit"])
 
+    def test_sso_session_requires_fresh_delivery_credentials(self):
+        account_id = self.add_account("session@example.com", "session-sub")
+        row = _shared.fetch_one("SELECT extra_json FROM accounts WHERE id=?", (account_id,))
+        extra = json.loads(row["extra_json"] or "{}")
+        extra["cpa"] = {
+            "credential_ready": False,
+            "probe_checked_at": _shared.now_iso(),
+            "probe": {
+                "ok": True,
+                "account_alive": True,
+                "probe_kind": "account_session",
+            },
+        }
+        _shared.execute_no_return(
+            "UPDATE accounts SET extra_json=? WHERE id=?",
+            (json.dumps(extra), account_id),
+        )
+
+        with self.assertRaisesRegex(
+            _delivery_runtime.DeliveryUnavailable,
+            "no recently verified account",
+        ):
+            _delivery_runtime.reserve("SESSION-NOT-READY")
+
+        extra["cpa"]["credential_ready"] = True
+        _shared.execute_no_return(
+            "UPDATE accounts SET extra_json=? WHERE id=?",
+            (json.dumps(extra), account_id),
+        )
+        reservation = _delivery_runtime.reserve("SESSION-READY")
+        self.assertEqual(reservation["state"], "ready")
+
     def test_recent_prevalidation_is_prioritized(self):
         stale_id = self.add_account("stale@example.com", "stale-sub")
         recent_id = self.add_account("recent@example.com", "recent-sub")

@@ -291,6 +291,14 @@ class CpaMintRuntime:
                           ''
                       ) < ?
                   )
+                  OR (
+                      COALESCE(json_extract(a.extra_json, '$.cpa.credential_ready'), 0) <> 1
+                      AND COALESCE(
+                          json_extract(a.extra_json, '$.cpa.updated_at'),
+                          json_extract(a.extra_json, '$.cpa.probe_checked_at'),
+                          ''
+                      ) < ?
+                  )
               )
             ORDER BY COALESCE(
                          json_extract(a.extra_json, '$.cpa.probe_checked_at'),
@@ -300,7 +308,7 @@ class CpaMintRuntime:
                      a.id ASC
             LIMIT ?
             """,
-            (cutoff, retry_cutoff, batch_size),
+            (cutoff, retry_cutoff, retry_cutoff, batch_size),
         )
         for row in rows:
             self.enqueue(int(row["id"]), force=False)
@@ -369,18 +377,14 @@ class CpaMintRuntime:
         account_id: int,
         extra: dict[str, Any],
         probe: dict[str, Any],
-        *,
-        renewal_error: str = "",
     ) -> None:
         checked_at = now_iso()
         cpa = extra.get("cpa") if isinstance(extra.get("cpa"), dict) else {}
         cpa.update({"status": "ready", "probe": probe, "probe_checked_at": checked_at})
+        cpa["credential_ready"] = True
         cpa.pop("error", None)
         cpa.pop("probe_error", None)
-        if renewal_error:
-            cpa["renewal_error"] = renewal_error[:500]
-        else:
-            cpa.pop("renewal_error", None)
+        cpa.pop("renewal_error", None)
         extra["cpa"] = cpa
         execute_no_return(
             "UPDATE accounts SET extra_json=?, validity_status='valid', "
@@ -400,6 +404,7 @@ class CpaMintRuntime:
         cpa.update(
             {
                 "status": "failed",
+                "credential_ready": False,
                 "probe": probe,
                 "probe_checked_at": checked_at,
                 "probe_error": error[:500],
@@ -441,9 +446,10 @@ class CpaMintRuntime:
             )
             if probe_ok:
                 known_alive = True
-                self._store_probe_success(account_id, extra, last_probe)
-                if not force and last_probe.get("probe_kind") == "account_identity":
-                    return True, ""
+                if last_probe.get("probe_kind") == "account_identity":
+                    self._store_probe_success(account_id, extra, last_probe)
+                    if not force:
+                        return True, ""
             elif (
                 not force
                 and last_probe
@@ -485,16 +491,6 @@ class CpaMintRuntime:
                     refresh_error = str(exc)[:500]
 
             if token is None:
-                if known_alive and saved_refresh_token:
-                    # SSO/账号页已经证明账号存活。续期失败只记录附加错误，
-                    # 不再执行最长 90 秒的 device flow，也不把活账号踢出库存。
-                    self._store_probe_success(
-                        account_id,
-                        extra,
-                        last_probe,
-                        renewal_error=refresh_error or "OAuth refresh failed",
-                    )
-                    return True, ""
                 try:
                     token = exchange_sso_for_token(
                         str(row["sso"] or extra.get("sso") or ""),
@@ -560,6 +556,7 @@ class CpaMintRuntime:
                 "filename": filename,
                 "destinations": destinations,
                 "mint_method": mint_method,
+                "credential_ready": probe_alive,
                 "probe": probe,
                 "updated_at": now_iso(),
             }
@@ -585,7 +582,14 @@ class CpaMintRuntime:
             return True, ""
         except Exception as exc:
             failed_cpa = extra.get("cpa") if isinstance(extra.get("cpa"), dict) else {}
-            failed_cpa.update({"status": "failed", "error": str(exc)[:500], "updated_at": now_iso()})
+            failed_cpa.update(
+                {
+                    "status": "failed",
+                    "credential_ready": False,
+                    "error": str(exc)[:500],
+                    "updated_at": now_iso(),
+                }
+            )
             if last_probe:
                 failed_cpa["probe"] = last_probe
                 failed_cpa["probe_checked_at"] = now_iso()
