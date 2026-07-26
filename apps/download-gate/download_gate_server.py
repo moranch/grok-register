@@ -46,7 +46,7 @@ ADMIN_PATH = normalize_admin_path(os.environ.get("DOWNLOAD_GATE_ADMIN_PATH", "/d
 INTERNAL_API_TOKEN = os.environ.get("DOWNLOAD_GATE_INTERNAL_TOKEN", "").strip()
 CONSOLE_URL = os.environ.get("DOWNLOAD_GATE_CONSOLE_URL", "").strip().rstrip("/")
 CONSOLE_TIMEOUT_SECONDS = max(int(os.environ.get("DOWNLOAD_GATE_CONSOLE_TIMEOUT", "120") or 120), 5)
-APP_VERSION = "2026.07.26.06"
+APP_VERSION = "2026.07.26.07"
 CLAIM_TTL_SECONDS = 24 * 60 * 60
 BATCH_DOWNLOAD_TTL_SECONDS = 10 * 60
 MAX_BATCH_KEYS = 20
@@ -2277,7 +2277,7 @@ def page_shell(
     }}
     body{{min-height:100vh;background:radial-gradient(circle at top left,rgba(189,75,29,.08),transparent 34vw),linear-gradient(180deg,#fffdfa 0%,var(--paper) 58%,#f3eee7 100%);color:var(--ink);font-family:Inter,"PingFang SC","Microsoft YaHei",Arial,sans-serif;-webkit-font-smoothing:antialiased}}
     .wrap{{width:min(860px,100%);margin:0 auto;padding:52px 22px 54px}}
-    body.admin-page .wrap{{width:min(1160px,100%);padding-top:28px}}
+    body.admin-page .wrap{{width:min(1360px,100%);padding-top:28px}}
     body.user-page .wrap{{width:min(820px,100%)}}
     header{{margin-bottom:30px}}
     body.admin-page header{{display:grid;grid-template-columns:1fr auto;align-items:start;gap:12px;margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid var(--rule)}}
@@ -2476,11 +2476,16 @@ def page_shell(
     .admin-tab{{min-height:36px;border-radius:6px 6px 0 0;background:transparent;color:var(--muted);border:1px solid transparent;border-bottom:0;padding:0 14px;font-size:.82rem}}
     .admin-tab.active,.admin-tab:hover{{background:#fff;color:var(--ink);border-color:var(--rule)}}
     .admin-tab-panel[hidden]{{display:none}}
-    .accounts-toolbar{{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap;margin-top:16px}}
-    .accounts-toolbar label{{display:grid;gap:5px;margin:0;color:var(--muted);font-size:.74rem}}
-    .accounts-toolbar select{{min-width:150px;min-height:38px;border:1px solid var(--rule);border-radius:6px;background:#fff;color:var(--ink);padding:8px 10px;font-size:.82rem}}
-    .accounts-toolbar .model-input{{width:180px;min-height:38px;padding:8px 10px;font-size:.82rem}}
-    .accounts-toolbar .pagination{{margin-left:auto}}
+    .accounts-toolbar{{display:grid;gap:10px;margin-top:16px}}
+    .accounts-query-row{{display:grid;grid-template-columns:minmax(260px,1fr) 170px 180px auto;align-items:end;gap:10px}}
+    .accounts-query-row label{{display:grid;gap:5px;min-width:0;margin:0;color:var(--muted);font-size:.74rem}}
+    .accounts-query-row input,.accounts-query-row select{{width:100%;min-width:0}}
+    .accounts-query-row select{{min-height:38px;border:1px solid var(--rule);border-radius:6px;background:#fff;color:var(--ink);padding:8px 10px;font-size:.82rem}}
+    .accounts-query-row .model-input{{min-height:38px;padding:8px 10px;font-size:.82rem}}
+    .accounts-query-actions{{display:flex;align-items:center;gap:8px;white-space:nowrap}}
+    .accounts-list-meta{{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:38px;padding-top:2px}}
+    .accounts-list-meta .pagination{{margin-left:0;flex:none;flex-wrap:nowrap}}
+    .accounts-list-meta .pagination .table-count{{white-space:nowrap}}
     .accounts-feedback{{margin-top:12px}}
     .accounts-feedback:empty{{display:none}}
     .accounts-table table{{min-width:1280px}}
@@ -2498,11 +2503,12 @@ def page_shell(
     .account-error.none{{color:var(--muted)}}
     .model-test-cell{{display:grid;gap:7px;min-width:180px}}
     .model-test-cell button{{justify-self:start;min-height:30px;padding:0 10px;font-size:.72rem}}
-    .account-migration-panel{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px;padding:12px 14px;border:1px solid var(--rule);background:#fff}}
-    .account-migration-copy{{display:grid;gap:3px;min-width:220px;margin-right:auto}}
+    .account-migration-panel{{display:grid;grid-template-columns:minmax(280px,1fr) auto;align-items:center;gap:14px;margin-top:12px;padding:12px 14px;border:1px solid var(--rule);background:#fff}}
+    .account-migration-copy{{display:grid;gap:3px;min-width:0}}
     .account-migration-copy strong{{font-size:.84rem}}
     .account-migration-copy span{{color:var(--muted);font-size:.72rem;line-height:1.4}}
-    .account-migration-panel input[type=file]{{max-width:290px;font-size:.76rem}}
+    .account-migration-actions{{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}}
+    .account-migration-actions input[type=file]{{width:260px;max-width:100%;font-size:.76rem}}
     .table-tools{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:16px}}
     .search-input{{width:min(360px,100%);min-height:38px;padding:9px 11px;font-size:.84rem}}
     .segmented{{display:inline-flex;border:1px solid var(--rule);border-radius:6px;background:#fff;overflow:hidden}}
@@ -2550,8 +2556,9 @@ def page_shell(
     footer{{display:flex;justify-content:space-between;gap:14px;margin-top:42px;padding-top:20px;border-top:1px solid var(--rule);color:var(--muted);font-size:.74rem}}
     .online{{display:inline-flex;align-items:center;gap:7px}}
     .online::before{{content:"";width:6px;height:6px;border-radius:50%;background:#22c55e}}
+    @media(max-width:900px){{.accounts-query-row{{grid-template-columns:repeat(2,minmax(0,1fr))}}.accounts-search-field,.accounts-query-actions{{grid-column:1/-1}}.account-migration-panel{{grid-template-columns:1fr}}.account-migration-actions{{justify-content:flex-start}}}}
     @media(max-width:820px){{.admin-summary{{grid-template-columns:repeat(2,minmax(0,1fr))}}.key-entry{{grid-template-columns:1fr}}.service-strip{{grid-template-columns:1fr}}}}
-    @media(max-width:640px){{body{{overflow-x:hidden}}body.admin-page header{{display:block}}body.admin-page header nav{{justify-content:flex-start;margin-top:12px}}body.login-page .wrap{{padding-inline:16px}}body.login-page header{{display:grid;gap:10px}}body.pickup-page .wrap{{padding-top:36px}}.pickup-lead,.lookup-card,.announcement-card,.login-panel{{width:100%;max-width:calc(100vw - 36px)}}.lookup-card,.login-panel{{padding:20px 18px}}.lookup-title{{display:grid;grid-template-columns:1fr;gap:6px}}.lookup-title small{{justify-self:start}}.pickup-lead{{font-size:.92rem}}.login-foot{{display:grid;gap:8px}}.grid,.radio-grid{{grid-template-columns:1fr}}.copyrow{{grid-template-columns:1fr}}.result-row,.claim-row{{grid-template-columns:1fr}}.result-actions,.claim-actions{{justify-content:flex-start}}.wrap{{padding-inline:18px}}footer{{flex-direction:column}}.admin-summary{{grid-template-columns:1fr}}.segmented{{width:100%;display:grid;grid-template-columns:repeat(2,1fr)}}.search-input{{width:100%}}}}
+    @media(max-width:640px){{body{{overflow-x:hidden}}body.admin-page header{{display:block}}body.admin-page header nav{{justify-content:flex-start;margin-top:12px}}body.login-page .wrap{{padding-inline:16px}}body.login-page header{{display:grid;gap:10px}}body.pickup-page .wrap{{padding-top:36px}}.pickup-lead,.lookup-card,.announcement-card,.login-panel{{width:100%;max-width:calc(100vw - 36px)}}.lookup-card,.login-panel{{padding:20px 18px}}.lookup-title{{display:grid;grid-template-columns:1fr;gap:6px}}.lookup-title small{{justify-self:start}}.pickup-lead{{font-size:.92rem}}.login-foot{{display:grid;gap:8px}}.grid,.radio-grid{{grid-template-columns:1fr}}.copyrow{{grid-template-columns:1fr}}.result-row,.claim-row{{grid-template-columns:1fr}}.result-actions,.claim-actions{{justify-content:flex-start}}.wrap{{padding-inline:18px}}footer{{flex-direction:column}}.admin-summary{{grid-template-columns:1fr}}.segmented{{width:100%;display:grid;grid-template-columns:repeat(2,1fr)}}.search-input{{width:100%}}.accounts-query-row{{grid-template-columns:1fr}}.accounts-search-field,.accounts-query-actions{{grid-column:auto}}.accounts-query-actions{{display:grid;grid-template-columns:1fr 1fr}}.accounts-query-actions button{{width:100%}}.accounts-list-meta{{display:grid;grid-template-columns:1fr;align-items:start}}.accounts-list-meta .pagination{{display:grid;grid-template-columns:auto 1fr auto;width:100%;gap:8px}}.accounts-list-meta .pagination select{{grid-column:1/-1;width:100%}}.account-migration-actions{{display:grid;grid-template-columns:1fr}}.account-migration-actions input,.account-migration-actions button{{width:100%;min-width:0;max-width:none}}}}
     @media(max-width:640px){{.replenish-toggle-row{{align-items:flex-start}}.inventory-metrics{{grid-template-columns:1fr}}}}
   </style>
   {extra_style}
@@ -4512,47 +4519,54 @@ def admin_page(
   <div class="stat"><span class="k">当前占用</span><span id="accountsSummaryLeased" class="v">-</span></div>
 </section>
 <div class="accounts-toolbar">
-  <label>搜索账号
-    <input id="accountsSearch" class="search-input" placeholder="邮箱或账号 ID" autocomplete="off">
-  </label>
-  <label>状态筛选
-    <select id="accountsStatusFilter">
-      <option value="all">全部状态</option>
-      <option value="ready">可交付</option>
-      <option value="unverified">未验活</option>
-      <option value="invalid">已失效</option>
-      <option value="delivered">已交付</option>
-      <option value="leased">当前占用</option>
-    </select>
-  </label>
-  <label>手动测试模型
-    <input id="accountsModelInput" class="model-input" value="grok-4.5" maxlength="100" autocomplete="off">
-  </label>
-  <button id="accountsExportTop" class="secondary compact" type="button">导出当前筛选</button>
-  <button id="accountsRefresh" class="secondary compact" type="button">刷新列表</button>
-  <span id="accountsCount" class="table-count">尚未加载</span>
-  <div class="pagination" aria-label="账户列表分页">
-    <button id="accountsPrevPage" class="secondary compact" type="button">上一页</button>
-    <span id="accountsPageInfo" class="table-count">第 1/1 页</span>
-    <button id="accountsNextPage" class="secondary compact" type="button">下一页</button>
-    <select id="accountsPageSize" aria-label="账户列表每页条数">
-      <option value="10">10 / 页</option>
-      <option value="25" selected>25 / 页</option>
-      <option value="50">50 / 页</option>
-      <option value="100">100 / 页</option>
-      <option value="200">200 / 页</option>
-    </select>
+  <div class="accounts-query-row">
+    <label class="accounts-search-field">搜索账号
+      <input id="accountsSearch" class="search-input" placeholder="邮箱或账号 ID" autocomplete="off">
+    </label>
+    <label>状态筛选
+      <select id="accountsStatusFilter">
+        <option value="all">全部状态</option>
+        <option value="ready">可交付</option>
+        <option value="unverified">未验活</option>
+        <option value="invalid">已失效</option>
+        <option value="delivered">已交付</option>
+        <option value="leased">当前占用</option>
+      </select>
+    </label>
+    <label>手动测试模型
+      <input id="accountsModelInput" class="model-input" value="grok-4.5" maxlength="100" autocomplete="off">
+    </label>
+    <div class="accounts-query-actions">
+      <button id="accountsExport" class="secondary compact" type="button">导出当前筛选</button>
+      <button id="accountsRefresh" class="secondary compact" type="button">刷新列表</button>
+    </div>
+  </div>
+  <div class="accounts-list-meta">
+    <span id="accountsCount" class="table-count">尚未加载</span>
+    <div class="pagination" aria-label="账户列表分页">
+      <button id="accountsPrevPage" class="secondary compact" type="button">上一页</button>
+      <span id="accountsPageInfo" class="table-count">第 1/1 页</span>
+      <button id="accountsNextPage" class="secondary compact" type="button">下一页</button>
+      <select id="accountsPageSize" aria-label="账户列表每页条数">
+        <option value="10">10 / 页</option>
+        <option value="25" selected>25 / 页</option>
+        <option value="50">50 / 页</option>
+        <option value="100">100 / 页</option>
+        <option value="200">200 / 页</option>
+      </select>
+    </div>
   </div>
 </div>
 <div class="account-migration-panel">
   <div class="account-migration-copy">
-    <strong>账号迁移导入 / 导出</strong>
-    <span>导出当前搜索与状态筛选结果；导入会自动按账号主体、SSO、邮箱去重，并在写入前备份数据库。</span>
+    <strong>账号迁移导入</strong>
+    <span>选择其他实例导出的账号 JSON；系统会按账号主体、SSO、邮箱去重，并在写入前备份数据库。</span>
   </div>
-  <button id="accountsExport" class="secondary compact" type="button">导出当前筛选</button>
-  <input id="accountsImportFile" type="file" accept=".json,application/json">
-  <button id="accountsImportPreview" class="secondary compact" type="button">预检导入</button>
-  <button id="accountsImport" class="compact" type="button">确认导入</button>
+  <div class="account-migration-actions">
+    <input id="accountsImportFile" type="file" accept=".json,application/json">
+    <button id="accountsImportPreview" class="secondary compact" type="button">预检导入</button>
+    <button id="accountsImport" class="compact" type="button">确认导入</button>
+  </div>
 </div>
 <div id="accountsFeedback" class="accounts-feedback" role="status" aria-live="polite"></div>
 <div class="admin-table accounts-table"><table>
@@ -4663,7 +4677,6 @@ const accountsNextPage = document.querySelector('#accountsNextPage');
 const accountsPageInfo = document.querySelector('#accountsPageInfo');
 const accountsPageSize = document.querySelector('#accountsPageSize');
 const accountsModelInput = document.querySelector('#accountsModelInput');
-const accountsExportTop = document.querySelector('#accountsExportTop');
 const accountsExport = document.querySelector('#accountsExport');
 const accountsImportFile = document.querySelector('#accountsImportFile');
 const accountsImportPreview = document.querySelector('#accountsImportPreview');
@@ -4827,9 +4840,7 @@ function exportFilteredAccounts() {{
   anchor.remove();
   if(accountsFeedback) accountsFeedback.innerHTML = '<div class="note warn">正在生成账号迁移包。文件包含敏感凭据，请妥善保存。</div>';
 }}
-[accountsExportTop, accountsExport].filter(Boolean).forEach((button) => {{
-  button.addEventListener('click', exportFilteredAccounts);
-}});
+if(accountsExport) accountsExport.addEventListener('click', exportFilteredAccounts);
 async function selectedAccountMigration(){{
   const file = accountsImportFile && accountsImportFile.files ? accountsImportFile.files[0] : null;
   if(!file) throw new Error('请先选择账号迁移 JSON 文件');
