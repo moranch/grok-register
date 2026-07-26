@@ -60,6 +60,15 @@ class InternalDeliveryCommit(BaseModel):
     bundle_id: str = Field("", max_length=200)
 
 
+class InternalAccountModelTest(BaseModel):
+    model: str = Field(
+        "grok-4.5",
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$",
+    )
+
+
 class Sub2ApiImportRequest(BaseModel):
     account_ids: list[int] = Field(default_factory=list)
     group_id: int = Field(0, ge=0)
@@ -304,6 +313,38 @@ def _internal_account_list(
                     NULLIF(account_last_error, ''),
                     ''
                 ) AS last_error,
+                COALESCE(
+                    json_extract(safe_extra, '$.cpa.manual_model_test.model'),
+                    ''
+                ) AS model_test_model,
+                CASE
+                    WHEN json_extract(safe_extra, '$.cpa.manual_model_test.ok') = 1
+                    THEN 1 ELSE 0
+                END AS model_test_ok,
+                COALESCE(
+                    json_extract(safe_extra, '$.cpa.manual_model_test.status'),
+                    0
+                ) AS model_test_status,
+                COALESCE(
+                    json_extract(safe_extra, '$.cpa.manual_model_test.checked_at'),
+                    ''
+                ) AS model_test_checked_at,
+                COALESCE(
+                    json_extract(safe_extra, '$.cpa.manual_model_test.latency_ms'),
+                    0
+                ) AS model_test_latency_ms,
+                COALESCE(
+                    json_extract(safe_extra, '$.cpa.manual_model_test.transport'),
+                    ''
+                ) AS model_test_transport,
+                COALESCE(
+                    json_extract(safe_extra, '$.cpa.manual_model_test.failure_kind'),
+                    ''
+                ) AS model_test_failure_kind,
+                COALESCE(
+                    json_extract(safe_extra, '$.cpa.manual_model_test.error'),
+                    ''
+                ) AS model_test_error,
                 CASE
                     WHEN TRIM(COALESCE(json_extract(safe_extra, '$.access_token'), '')) <> ''
                      AND TRIM(COALESCE(json_extract(safe_extra, '$.refresh_token'), '')) <> ''
@@ -425,6 +466,14 @@ def _internal_account_list(
             probe_kind,
             failure_kind,
             last_error,
+            model_test_model,
+            model_test_ok,
+            model_test_status,
+            model_test_checked_at,
+            model_test_latency_ms,
+            model_test_transport,
+            model_test_failure_kind,
+            model_test_error,
             delivered,
             leased,
             recently_verified,
@@ -439,6 +488,7 @@ def _internal_account_list(
     boolean_fields = {
         "credential_ready",
         "account_alive",
+        "model_test_ok",
         "delivered",
         "leased",
         "recently_verified",
@@ -467,6 +517,88 @@ def _internal_account_list(
             "platform": platform or "all",
         },
     }
+
+
+def _internal_account_model_test(account_id: int, model: str) -> dict[str, Any]:
+    row = fetch_one(
+        "SELECT id, platform, email, proxy_url, extra_json FROM accounts WHERE id=?",
+        (account_id,),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="account not found")
+    if str(row["platform"] or "grok").strip().lower() != "grok":
+        raise HTTPException(status_code=409, detail="model test only supports grok accounts")
+    try:
+        extra = json.loads(row["extra_json"] or "{}")
+    except (TypeError, ValueError):
+        extra = {}
+    if not isinstance(extra, dict):
+        extra = {}
+
+    try:
+        from ._cpa_runtime import cpa_mint_runtime
+
+        runtime_config = cpa_mint_runtime.config()
+    except Exception:
+        runtime_config = {}
+    config_extra = (
+        runtime_config.get("extra")
+        if isinstance(runtime_config.get("extra"), dict)
+        else {}
+    )
+    try:
+        timeout = min(max(5, int(config_extra.get("model_probe_timeout", 30))), 60)
+    except (TypeError, ValueError):
+        timeout = 30
+    from core.cpa_auth import CPA_BASE_URL, probe_cpa_model
+
+    result = probe_cpa_model(
+        str(extra.get("access_token") or ""),
+        model=model,
+        base_url=str(config_extra.get("base_url") or extra.get("base_url") or CPA_BASE_URL),
+        proxy=str(config_extra.get("proxy") or row["proxy_url"] or ""),
+        timeout=timeout,
+        verify_tls=bool(config_extra.get("verify_tls", True)),
+    )
+    checked_at = now_iso()
+    stored = {
+        "ok": bool(result.get("ok")),
+        "model_available": bool(result.get("model_available")),
+        "model": str(result.get("model") or model)[:100],
+        "status": int(result.get("status") or 0),
+        "latency_ms": max(0, int(result.get("latency_ms") or 0)),
+        "probe_kind": "model_response",
+        "transport": str(result.get("transport") or "")[:40],
+        "failure_kind": str(result.get("failure_kind") or "")[:120],
+        "refresh_recommended": bool(result.get("refresh_recommended")),
+        "error": str(result.get("error") or "")[:500],
+        "checked_at": checked_at,
+    }
+    # Merge the isolated result into the latest JSON value atomically.  Token
+    # refresh and background account-liveness probes may finish while the model
+    # request is in flight; replacing the whole document would lose their data.
+    execute_no_return(
+        """
+        UPDATE accounts
+        SET extra_json=json_set(
+            CASE
+                WHEN json_valid(extra_json)
+                 AND json_type(extra_json, '$.cpa') = 'object'
+                THEN extra_json
+                ELSE json_set(
+                    CASE WHEN json_valid(extra_json) THEN extra_json ELSE '{}' END,
+                    '$.cpa',
+                    json('{}')
+                )
+            END,
+            '$.cpa.manual_model_test',
+            json(?)
+        )
+        WHERE id=?
+        """,
+        (json.dumps(stored, ensure_ascii=False), account_id),
+    )
+    return {"account_id": account_id, **stored}
 
 
 @router.get("/api/accounts")
@@ -501,6 +633,23 @@ def api_internal_accounts(
         page=page,
         page_size=page_size,
     )
+
+
+@router.post("/api/internal/accounts/{account_id}/model-test")
+def api_internal_account_model_test(
+    request: Request,
+    account_id: int,
+    payload: InternalAccountModelTest,
+) -> dict[str, Any]:
+    try:
+        _delivery_runtime.check_internal_bearer(request.headers.get("Authorization", ""))
+    except Exception as exc:
+        _raise_delivery_error(exc)
+        raise
+    return {
+        "ok": True,
+        "test": _internal_account_model_test(account_id, payload.model),
+    }
 
 
 @router.get("/api/accounts/summary")

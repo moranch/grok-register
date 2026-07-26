@@ -18,6 +18,7 @@ from core.cpa_auth import (
     exchange_sso_for_token,
     probe_grok_account_session,
     probe_cpa_account,
+    probe_cpa_model,
     refresh_cpa_token,
     token_to_cpa_record,
 )
@@ -356,6 +357,86 @@ class ExporterTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertFalse(result["account_alive"])
             self.assertFalse(result["delivery_eligible"])
+
+    def test_manual_model_probe_uses_responses_endpoint_without_leaking_token(self):
+        response = Mock(status_code=200, text="data: {\"type\":\"response.output_text.delta\"}")
+        client = Mock()
+        client.post.return_value = response
+        client_context = Mock()
+        client_context.__enter__ = Mock(return_value=client)
+        client_context.__exit__ = Mock(return_value=False)
+
+        with patch("core.cpa_auth.httpx.Client", return_value=client_context):
+            result = probe_cpa_model(
+                "model-access-secret",
+                model="grok-4.5",
+                base_url="https://cli-chat-proxy.grok.com/v1",
+                timeout=10,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["model_available"])
+        self.assertNotIn("model-access-secret", str(result))
+        args, kwargs = client.post.call_args
+        self.assertEqual(args[0], "https://cli-chat-proxy.grok.com/v1/responses")
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer model-access-secret")
+        self.assertEqual(kwargs["json"]["model"], "grok-4.5")
+        self.assertEqual(kwargs["json"]["max_output_tokens"], 8)
+        self.assertTrue(kwargs["json"]["stream"])
+
+    def test_manual_model_probe_classifies_quota_without_account_liveness(self):
+        response = Mock(
+            status_code=403,
+            text=(
+                '{"code":"personal-team-blocked:spending-limit",'
+                '"error":"You have run out of credits"}'
+            ),
+        )
+        client = Mock()
+        client.post.return_value = response
+        client_context = Mock()
+        client_context.__enter__ = Mock(return_value=client)
+        client_context.__exit__ = Mock(return_value=False)
+
+        with patch("core.cpa_auth.httpx.Client", return_value=client_context):
+            result = probe_cpa_model("access", model="grok-4.5")
+
+        self.assertFalse(result["model_available"])
+        self.assertEqual(result["failure_kind"], "quota_exhausted")
+        self.assertNotIn("account_alive", result)
+        self.assertNotIn("delivery_eligible", result)
+
+    def test_manual_model_probe_falls_back_to_direct_when_proxy_is_unavailable(self):
+        proxy_session = Mock()
+        proxy_session.request.side_effect = RuntimeError("socks connection failed")
+        direct_response = Mock(status_code=200, text="data: output")
+        direct_client = Mock()
+        direct_client.post.return_value = direct_response
+        direct_context = Mock()
+        direct_context.__enter__ = Mock(return_value=direct_client)
+        direct_context.__exit__ = Mock(return_value=False)
+
+        with (
+            patch("core.cpa_auth._model_proxy_bypass_until", 0.0),
+            patch(
+                "core.cpa_auth.curl_requests.Session",
+                return_value=proxy_session,
+            ),
+            patch("core.cpa_auth.httpx.Client", return_value=direct_context),
+        ):
+            result = probe_cpa_model(
+                "access",
+                model="grok-4.5",
+                proxy="socks5://warp:1080",
+            )
+
+        self.assertTrue(result["model_available"])
+        self.assertEqual(result["transport"], "direct_fallback")
+        self.assertEqual(
+            proxy_session.proxies,
+            {"http": "socks5://warp:1080", "https": "socks5://warp:1080"},
+        )
+        direct_client.post.assert_called_once()
 
 
 if __name__ == "__main__":

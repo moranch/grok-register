@@ -160,6 +160,13 @@ class InternalAccountInventoryTests(unittest.TestCase):
                     page_size=50,
                 )
             self.assertEqual(denied.exception.status_code, 401)
+            with self.assertRaises(HTTPException) as model_denied:
+                accounts_api.api_internal_account_model_test(
+                    _request("Bearer wrong"),
+                    1,
+                    accounts_api.InternalAccountModelTest(model="grok-4.5"),
+                )
+            self.assertEqual(model_denied.exception.status_code, 401)
 
         with patch.object(_shared, "DOWNLOAD_GATE_INTERNAL_TOKEN", ""):
             with self.assertRaises(HTTPException) as unavailable:
@@ -298,6 +305,85 @@ class InternalAccountInventoryTests(unittest.TestCase):
             {item["email"] for item in inventory["items"] if item["recently_verified"]},
             {"response@example.com", "session-ready@example.com"},
         )
+
+    def test_manual_model_test_is_persisted_separately_from_delivery_probe(self):
+        account_id = self._add_account(
+            "model@example.com",
+            extra={
+                "access_token": "model-access-secret",
+                "refresh_token": "refresh-secret",
+                "base_url": "https://cli-chat-proxy.grok.com/v1",
+                "cpa": {
+                    "status": "ready",
+                    "credential_ready": True,
+                    "probe_checked_at": "2026-07-26 01:02:03",
+                    "probe": {
+                        "account_alive": True,
+                        "probe_kind": "account_identity",
+                    },
+                },
+            },
+        )
+        probe_result = {
+            "ok": False,
+            "model_available": False,
+            "model": "grok-4.5",
+            "status": 403,
+            "latency_ms": 123,
+            "probe_kind": "model_response",
+            "failure_kind": "quota_exhausted",
+            "refresh_recommended": False,
+            "error": "credits exhausted",
+        }
+
+        def probe_while_background_refreshes(*args, **kwargs):
+            current = _shared.fetch_one(
+                "SELECT extra_json FROM accounts WHERE id=?", (account_id,)
+            )
+            refreshed = json.loads(current["extra_json"])
+            refreshed["refresh_token"] = "rotated-during-model-test"
+            refreshed["cpa"]["probe_checked_at"] = "2026-07-26 02:03:04"
+            _shared.execute_no_return(
+                "UPDATE accounts SET extra_json=? WHERE id=?",
+                (json.dumps(refreshed), account_id),
+            )
+            return probe_result
+
+        with (
+            patch.object(_shared, "DOWNLOAD_GATE_INTERNAL_TOKEN", "internal-secret"),
+            patch(
+                "core.cpa_auth.probe_cpa_model",
+                side_effect=probe_while_background_refreshes,
+            ) as probe,
+        ):
+            result = accounts_api.api_internal_account_model_test(
+                _request("Bearer internal-secret"),
+                account_id,
+                accounts_api.InternalAccountModelTest(model="grok-4.5"),
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["test"]["model_available"])
+        probe.assert_called_once()
+        self.assertEqual(probe.call_args.args[0], "model-access-secret")
+
+        row = _shared.fetch_one("SELECT extra_json FROM accounts WHERE id=?", (account_id,))
+        extra = json.loads(row["extra_json"])
+        self.assertEqual(extra["cpa"]["probe"]["probe_kind"], "account_identity")
+        self.assertEqual(extra["cpa"]["probe_checked_at"], "2026-07-26 02:03:04")
+        self.assertEqual(extra["refresh_token"], "rotated-during-model-test")
+        self.assertEqual(
+            extra["cpa"]["manual_model_test"]["failure_kind"],
+            "quota_exhausted",
+        )
+
+        item = accounts_api._internal_account_list(search=str(account_id))["items"][0]
+        self.assertEqual(item["model_test_model"], "grok-4.5")
+        self.assertFalse(item["model_test_ok"])
+        self.assertEqual(item["model_test_status"], 403)
+        self.assertEqual(item["model_test_latency_ms"], 123)
+        self.assertEqual(item["model_test_failure_kind"], "quota_exhausted")
+        self.assertNotIn("model-access-secret", json.dumps(item))
 
 
 if __name__ == "__main__":

@@ -46,7 +46,7 @@ ADMIN_PATH = normalize_admin_path(os.environ.get("DOWNLOAD_GATE_ADMIN_PATH", "/d
 INTERNAL_API_TOKEN = os.environ.get("DOWNLOAD_GATE_INTERNAL_TOKEN", "").strip()
 CONSOLE_URL = os.environ.get("DOWNLOAD_GATE_CONSOLE_URL", "").strip().rstrip("/")
 CONSOLE_TIMEOUT_SECONDS = max(int(os.environ.get("DOWNLOAD_GATE_CONSOLE_TIMEOUT", "120") or 120), 5)
-APP_VERSION = "2026.07.26.02"
+APP_VERSION = "2026.07.26.03"
 CLAIM_TTL_SECONDS = 24 * 60 * 60
 BATCH_DOWNLOAD_TTL_SECONDS = 10 * 60
 MAX_BATCH_KEYS = 20
@@ -108,6 +108,14 @@ ACCOUNT_LIST_FIELDS = (
     "leased",
     "recently_verified",
     "inventory_status",
+    "model_test_model",
+    "model_test_ok",
+    "model_test_status",
+    "model_test_checked_at",
+    "model_test_latency_ms",
+    "model_test_transport",
+    "model_test_failure_kind",
+    "model_test_error",
 )
 
 
@@ -1192,6 +1200,7 @@ def sanitize_account_list_response(payload: dict, requested: dict[str, str | int
         "delivered",
         "leased",
         "recently_verified",
+        "model_test_ok",
     }
     for raw in raw_items:
         if not isinstance(raw, dict):
@@ -1210,6 +1219,10 @@ def sanitize_account_list_response(payload: dict, requested: dict[str, str | int
         item["email"] = str(item.get("email") or "")[:320]
         item["last_error"] = str(item.get("last_error") or "")[:1200]
         item["failure_kind"] = str(item.get("failure_kind") or "")[:120]
+        item["model_test_error"] = str(item.get("model_test_error") or "")[:500]
+        item["model_test_failure_kind"] = str(
+            item.get("model_test_failure_kind") or ""
+        )[:120]
         items.append(item)
 
     summary_source = payload.get("summary")
@@ -1246,6 +1259,38 @@ def load_admin_accounts(query: dict) -> dict:
     path = f"/api/internal/accounts?{urlencode(forwarded)}"
     payload = console_json_get(path, timeout_seconds=15)
     return sanitize_account_list_response(payload, requested)
+
+
+def run_admin_account_model_test(account_id: int, model: str) -> dict:
+    account_id = int(account_id)
+    selected_model = str(model or "grok-4.5").strip()
+    if account_id <= 0:
+        raise ValueError("invalid account id")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}", selected_model):
+        raise ValueError("invalid model")
+    payload = console_json_post(
+        f"/api/internal/accounts/{account_id}/model-test",
+        {"model": selected_model},
+        timeout_seconds=65,
+    )
+    raw = payload.get("test")
+    if not payload.get("ok") or not isinstance(raw, dict):
+        raise RuntimeError("Console model-test response is invalid")
+    result = {
+        "account_id": _account_count(raw.get("account_id"), account_id),
+        "ok": _account_bool(raw.get("ok")),
+        "model_available": _account_bool(raw.get("model_available")),
+        "model": str(raw.get("model") or selected_model)[:100],
+        "status": _account_count(raw.get("status")),
+        "latency_ms": _account_count(raw.get("latency_ms")),
+        "probe_kind": "model_response",
+        "transport": str(raw.get("transport") or "")[:40],
+        "failure_kind": str(raw.get("failure_kind") or "")[:120],
+        "refresh_recommended": _account_bool(raw.get("refresh_recommended")),
+        "error": str(raw.get("error") or "")[:500],
+        "checked_at": str(raw.get("checked_at") or "")[:40],
+    }
+    return {"ok": True, "test": result}
 
 
 def console_auto_replenish_request(*, method: str = "GET", payload: dict | None = None) -> dict:
@@ -2378,6 +2423,7 @@ def page_shell(
     .accounts-toolbar{{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap;margin-top:16px}}
     .accounts-toolbar label{{display:grid;gap:5px;margin:0;color:var(--muted);font-size:.74rem}}
     .accounts-toolbar select{{min-width:150px;min-height:38px;border:1px solid var(--rule);border-radius:6px;background:#fff;color:var(--ink);padding:8px 10px;font-size:.82rem}}
+    .accounts-toolbar .model-input{{width:180px;min-height:38px;padding:8px 10px;font-size:.82rem}}
     .accounts-toolbar .pagination{{margin-left:auto}}
     .accounts-feedback{{margin-top:12px}}
     .accounts-feedback:empty{{display:none}}
@@ -2394,6 +2440,8 @@ def page_shell(
     .account-detail{{display:block;margin-top:6px;color:var(--muted);font-size:.74rem;line-height:1.45;overflow-wrap:anywhere}}
     .account-error{{max-width:340px;color:var(--bad);font-size:.76rem;line-height:1.45;overflow-wrap:anywhere}}
     .account-error.none{{color:var(--muted)}}
+    .model-test-cell{{display:grid;gap:7px;min-width:180px}}
+    .model-test-cell button{{justify-self:start;min-height:30px;padding:0 10px;font-size:.72rem}}
     .table-tools{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:16px}}
     .search-input{{width:min(360px,100%);min-height:38px;padding:9px 11px;font-size:.84rem}}
     .segmented{{display:inline-flex;border:1px solid var(--rule);border-radius:6px;background:#fff;overflow:hidden}}
@@ -4416,6 +4464,9 @@ def admin_page(
       <option value="leased">当前占用</option>
     </select>
   </label>
+  <label>手动测试模型
+    <input id="accountsModelInput" class="model-input" value="grok-4.5" maxlength="100" autocomplete="off">
+  </label>
   <button id="accountsRefresh" class="secondary compact" type="button">刷新列表</button>
   <span id="accountsCount" class="table-count">尚未加载</span>
   <div class="pagination" aria-label="账户列表分页">
@@ -4433,8 +4484,8 @@ def admin_page(
 </div>
 <div id="accountsFeedback" class="accounts-feedback" role="status" aria-live="polite"></div>
 <div class="admin-table accounts-table"><table>
-  <thead><tr><th style="width:19%">账号</th><th style="width:10%">库存状态</th><th style="width:11%">CPA 凭据</th><th style="width:10%">账号存活</th><th style="width:14%">最近验活</th><th style="width:13%">注册时间</th><th style="width:23%">失败原因</th></tr></thead>
-  <tbody id="accountsRows"><tr><td colspan="7">打开账户列表后加载数据</td></tr></tbody>
+  <thead><tr><th style="width:16%">账号</th><th style="width:9%">库存状态</th><th style="width:9%">CPA 凭据</th><th style="width:8%">账号存活</th><th style="width:11%">最近验活</th><th style="width:11%">注册时间</th><th style="width:18%">模型测试</th><th style="width:18%">失败原因</th></tr></thead>
+  <tbody id="accountsRows"><tr><td colspan="8">打开账户列表后加载数据</td></tr></tbody>
 </table></div>
 </section>
 <section class="admin-tab-panel" data-admin-panel="list" hidden>
@@ -4539,6 +4590,7 @@ const accountsPrevPage = document.querySelector('#accountsPrevPage');
 const accountsNextPage = document.querySelector('#accountsNextPage');
 const accountsPageInfo = document.querySelector('#accountsPageInfo');
 const accountsPageSize = document.querySelector('#accountsPageSize');
+const accountsModelInput = document.querySelector('#accountsModelInput');
 const accountsSummaryFields = {{
   total: document.querySelector('#accountsSummaryTotal'),
   ready: document.querySelector('#accountsSummaryReady'),
@@ -4573,7 +4625,7 @@ function accountBadge(kind, label){{
 function renderAccountRows(items){{
   if(!accountsRows) return;
   if(!items.length){{
-    accountsRows.innerHTML = '<tr><td colspan="7">没有符合条件的账号</td></tr>';
+    accountsRows.innerHTML = '<tr><td colspan="8">没有符合条件的账号</td></tr>';
     return;
   }}
   accountsRows.innerHTML = items.map((item) => {{
@@ -4588,6 +4640,17 @@ function renderAccountRows(items){{
     const stateDetail = [item.status, item.lifecycle_status, item.validity_status, item.plan_state].filter(Boolean).join(' · ') || '-';
     const failure = [item.failure_kind, item.last_error].filter(Boolean).join(' · ');
     const failureClass = failure ? 'account-error' : 'account-error none';
+    const modelTested = !!item.model_test_checked_at;
+    const modelKind = !modelTested ? 'neutral' : (item.model_test_ok ? 'ready' : (['quota_exhausted','rate_limited'].includes(String(item.model_test_failure_kind || '')) ? 'unverified' : 'invalid'));
+    const modelLabel = !modelTested ? '尚未测试' : (item.model_test_ok ? '模型可用' : '测试未通过');
+    const modelDetail = modelTested ? [
+      item.model_test_model || '-',
+      Number(item.model_test_status) ? 'HTTP '+Number(item.model_test_status) : '',
+      Number(item.model_test_latency_ms) ? Number(item.model_test_latency_ms)+' ms' : '',
+      item.model_test_transport || '',
+      item.model_test_checked_at || '',
+    ].filter(Boolean).join(' · ') : '手动操作，不影响取件验活库存';
+    const modelError = [item.model_test_failure_kind, item.model_test_error].filter(Boolean).join(' · ');
     return '<tr>'+
       '<td><span class="account-email">'+adminEsc(item.email || '-')+'</span><span class="account-id">ID '+adminEsc(item.id || '-')+'</span></td>'+
       '<td>'+accountBadge(state[0], state[1])+'<span class="account-detail">'+adminEsc(stateDetail)+'</span></td>'+
@@ -4595,6 +4658,7 @@ function renderAccountRows(items){{
       '<td>'+accountBadge(aliveKind, aliveLabel)+'</td>'+
       '<td>'+adminEsc(checkedAt)+'</td>'+
       '<td>'+adminEsc(item.created_at || '-')+'</td>'+
+      '<td><div class="model-test-cell">'+accountBadge(modelKind, modelLabel)+'<span class="account-detail">'+adminEsc(modelDetail)+'</span>'+(modelError ? '<span class="account-error">'+adminEsc(modelError)+'</span>' : '')+'<button class="secondary compact" type="button" data-account-model-test="'+adminEsc(item.id || '')+'">模型测试</button></div></td>'+
       '<td><div class="'+failureClass+'">'+adminEsc(failure || '无错误记录')+'</div></td>'+
     '</tr>';
   }}).join('');
@@ -4642,7 +4706,7 @@ async function loadAccounts(force=false){{
     if(accountsFeedback) accountsFeedback.innerHTML = '';
     accountsLoaded = true;
   }}catch(error){{
-    if(accountsRows) accountsRows.innerHTML = '<tr><td colspan="7">账户列表暂不可用，请稍后刷新</td></tr>';
+    if(accountsRows) accountsRows.innerHTML = '<tr><td colspan="8">账户列表暂不可用，请稍后刷新</td></tr>';
     if(accountsCount) accountsCount.textContent = '加载失败';
     if(accountsFeedback) accountsFeedback.innerHTML = '<div class="note err">账户列表暂不可用：'+adminEsc(error && error.message ? error.message : error)+'</div>';
     if(accountsPrevPage) accountsPrevPage.disabled = true;
@@ -4672,6 +4736,41 @@ if(accountsNextPage) accountsNextPage.addEventListener('click', () => {{
   if(accountsPage < accountsPages){{accountsPage += 1; loadAccounts(true);}}
 }});
 if(accountsPageSize) accountsPageSize.addEventListener('change', () => {{accountsPage = 1; loadAccounts(true);}});
+if(accountsRows) accountsRows.addEventListener('click', async (event) => {{
+  const button = event.target.closest('[data-account-model-test]');
+  if(!button || button.disabled) return;
+  const accountId = String(button.dataset.accountModelTest || '').trim();
+  const model = String(accountsModelInput ? accountsModelInput.value : 'grok-4.5').trim();
+  if(!/^[A-Za-z0-9][A-Za-z0-9._:/-]{{0,99}}$/.test(model)){{
+    if(accountsFeedback) accountsFeedback.innerHTML = '<div class="note err">模型名称格式不正确。</div>';
+    return;
+  }}
+  const oldText = button.textContent;
+  button.disabled = true;
+  button.textContent = '测试中...';
+  if(accountsFeedback) accountsFeedback.innerHTML = '<div class="note warn">正在测试账号 ID '+adminEsc(accountId)+' 的 '+adminEsc(model)+'，此操作不会改变取件库存判定...</div>';
+  try{{
+    const response = await fetch('{ADMIN_PATH}/api/accounts/'+encodeURIComponent(accountId)+'/model-test', {{
+      method: 'POST',
+      headers: {{'Accept':'application/json','Content-Type':'application/json'}},
+      body: JSON.stringify({{model}}),
+    }});
+    const data = await response.json().catch(() => ({{error:'服务端返回了无效 JSON'}}));
+    if(!response.ok || !data.ok || !data.test) throw new Error(data.error || `HTTP ${{response.status}}`);
+    const test = data.test;
+    await loadAccounts(true);
+    const kind = test.model_available ? 'ok' : 'warn';
+    const text = test.model_available
+      ? '模型测试通过：'+String(test.model || model)+' · HTTP '+String(test.status || 200)+' · '+String(test.latency_ms || 0)+' ms'
+      : '模型测试未通过：'+String(test.failure_kind || test.error || 'unknown');
+    if(accountsFeedback) accountsFeedback.innerHTML = '<div class="note '+kind+'">'+adminEsc(text)+'</div>';
+  }}catch(error){{
+    if(accountsFeedback) accountsFeedback.innerHTML = '<div class="note err">模型测试失败：'+adminEsc(error && error.message ? error.message : error)+'</div>';
+  }}finally{{
+    button.disabled = false;
+    button.textContent = oldText;
+  }}
+}});
 const adminSearch = document.querySelector('#adminSearch');
 const adminCount = document.querySelector('#adminCount');
 const adminRows = Array.from(document.querySelectorAll('#adminRows tr[data-status]'));
@@ -5461,9 +5560,61 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
             extra_headers={"Cache-Control": "no-store, max-age=0"},
         )
 
+    def handle_admin_account_model_test(self, account_id: int) -> None:
+        try:
+            body = json.loads(self.read_body().decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            self.send_json(
+                {"ok": False, "error": f"请求 JSON 无效：{exc}"},
+                HTTPStatus.BAD_REQUEST,
+                {"Cache-Control": "no-store, max-age=0"},
+            )
+            return
+        if not isinstance(body, dict):
+            self.send_json(
+                {"ok": False, "error": "请求 JSON 必须是对象"},
+                HTTPStatus.BAD_REQUEST,
+                {"Cache-Control": "no-store, max-age=0"},
+            )
+            return
+        try:
+            payload = run_admin_account_model_test(
+                account_id,
+                str(body.get("model") or "grok-4.5"),
+            )
+        except ValueError as exc:
+            self.send_json(
+                {"ok": False, "error": str(exc)},
+                HTTPStatus.BAD_REQUEST,
+                {"Cache-Control": "no-store, max-age=0"},
+            )
+            return
+        except Exception as exc:
+            message = str(exc).strip()[:500] or "Console 暂时不可用"
+            self.send_json(
+                {"ok": False, "error": f"模型测试失败：{message}"},
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"Cache-Control": "no-store, max-age=0"},
+            )
+            return
+        self.send_json(
+            payload,
+            extra_headers={"Cache-Control": "no-store, max-age=0"},
+        )
+
     def do_POST(self) -> None:
         path = urlparse(self.path).path
-        if path in {"/api/claim", "/api/claim-batch", f"{ADMIN_PATH}/auto-replenish"}:
+        is_account_model_test = bool(
+            re.fullmatch(
+                re.escape(ADMIN_PATH) + r"/api/accounts/[1-9][0-9]*/model-test",
+                path,
+            )
+        )
+        if (
+            path
+            in {"/api/claim", "/api/claim-batch", f"{ADMIN_PATH}/auto-replenish"}
+            or is_account_model_test
+        ):
             self._do_POST()
             return
         with MANIFEST_LOCK:
@@ -5476,6 +5627,20 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == f"{ADMIN_PATH}/login":
             self.handle_login()
+            return
+        account_model_test = re.fullmatch(
+            re.escape(ADMIN_PATH) + r"/api/accounts/([1-9][0-9]*)/model-test",
+            parsed.path,
+        )
+        if account_model_test:
+            if not is_admin(self):
+                self.send_json(
+                    {"ok": False, "error": "请先登录。"},
+                    HTTPStatus.UNAUTHORIZED,
+                    {"Cache-Control": "no-store, max-age=0"},
+                )
+                return
+            self.handle_admin_account_model_test(int(account_model_test.group(1)))
             return
         if parsed.path == f"{ADMIN_PATH}/announcement":
             if not is_admin(self):

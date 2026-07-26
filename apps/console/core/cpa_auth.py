@@ -34,6 +34,8 @@ CPA_HEADERS = {
 IDENTITY_PROXY_BYPASS_SECONDS = 300
 _identity_proxy_bypass_until = 0.0
 _identity_proxy_bypass_lock = threading.Lock()
+_model_proxy_bypass_until = 0.0
+_model_proxy_bypass_lock = threading.Lock()
 
 
 def _proxies(proxy: str) -> dict[str, str] | None:
@@ -732,6 +734,174 @@ def probe_cpa_account(
             "failure_kind": "transient",
             "refresh_recommended": False,
             "error": str(exc),
+        }
+
+
+def probe_cpa_model(
+    access_token: str,
+    *,
+    model: str = "grok-4.5",
+    base_url: str = CPA_BASE_URL,
+    proxy: str = "",
+    timeout: int = 30,
+    verify_tls: bool = True,
+) -> dict[str, Any]:
+    """Run one explicit model probe without changing account-delivery liveness.
+
+    This mirrors grokcli-2api's manual model-health request: the OAuth token is
+    sent to the CPA-compatible ``/responses`` endpoint with a tiny streaming
+    prompt.  The caller may persist the returned, credential-free summary, but
+    must not use it to decide whether the underlying account is alive.
+    """
+    token = str(access_token or "").strip()
+    selected_model = str(model or "grok-4.5").strip() or "grok-4.5"
+    endpoint = str(base_url or CPA_BASE_URL).strip().rstrip("/") + "/responses"
+    started = time.monotonic()
+    if not token:
+        return {
+            "ok": False,
+            "model_available": False,
+            "model": selected_model,
+            "status": 0,
+            "latency_ms": 0,
+            "probe_kind": "model_response",
+            "transport": "none",
+            "failure_kind": "credential_missing",
+            "refresh_recommended": False,
+            "error": "access_token is empty",
+        }
+
+    payload = {
+        "model": selected_model,
+        "stream": True,
+        "store": False,
+        "include": ["reasoning.encrypted_content"],
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "ping"}],
+            }
+        ],
+        "tools": [{"type": "x_search"}],
+        "max_output_tokens": 8,
+        "reasoning": {"effort": "low", "summary": "auto"},
+        "instructions": "",
+        "parallel_tool_calls": True,
+    }
+    headers = {
+        **CPA_HEADERS,
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "Connection": "Keep-Alive",
+    }
+
+    def request_model(proxy_url: str):
+        if proxy_url:
+            session = curl_requests.Session()
+            session.proxies = _proxies(proxy_url) or {}
+            session.verify = verify_tls
+            return _request_with_retry(
+                session,
+                "POST",
+                endpoint,
+                attempts=1,
+                headers=headers,
+                json=payload,
+                impersonate="chrome",
+                timeout=timeout,
+            )
+        # curl_cffi can report an OpenSSL "invalid library" handshake error
+        # against cli-chat-proxy on some Linux images even though the same host
+        # is reachable.  httpx provides a separate, deterministic direct path.
+        with httpx.Client(timeout=timeout, verify=verify_tls) as client:
+            return client.post(endpoint, headers=headers, json=payload)
+
+    global _model_proxy_bypass_until
+    with _model_proxy_bypass_lock:
+        bypass_proxy = bool(proxy) and time.monotonic() < _model_proxy_bypass_until
+    transport = "direct_bypass" if bypass_proxy else ("proxy" if proxy else "direct")
+    try:
+        try:
+            response = request_model("" if bypass_proxy else proxy)
+        except Exception as proxy_error:
+            if not proxy or bypass_proxy:
+                raise
+            with _model_proxy_bypass_lock:
+                _model_proxy_bypass_until = (
+                    time.monotonic() + IDENTITY_PROXY_BYPASS_SECONDS
+                )
+            try:
+                response = request_model("")
+                transport = "direct_fallback"
+            except Exception as direct_error:
+                transport = "proxy_and_direct_failed"
+                raise RuntimeError(
+                    f"proxy model test failed: {proxy_error}; "
+                    f"direct model test failed: {direct_error}"
+                ) from direct_error
+        status = int(response.status_code)
+        summary = str(getattr(response, "text", "") or "").replace("\n", " ").strip()
+        lowered = summary.lower()
+        available = 200 <= status < 300 and bool(summary)
+        if available:
+            failure_kind = ""
+            error = ""
+        elif 200 <= status < 300:
+            failure_kind = "empty_output"
+            error = "empty model output"
+        elif status == 401:
+            failure_kind = "token_expired"
+            error = summary[:500] or "HTTP 401"
+        elif "personal-team-blocked:spending-limit" in lowered or any(
+            marker in lowered
+            for marker in ("run out of credits", "need a grok subscription")
+        ):
+            failure_kind = "quota_exhausted"
+            error = summary[:500] or f"HTTP {status}"
+        elif status == 403 and (
+            "permission-denied" in lowered
+            or "chat endpoint is denied" in lowered
+        ):
+            failure_kind = "model_denied"
+            error = summary[:500] or "HTTP 403"
+        elif status == 403:
+            failure_kind = "forbidden"
+            error = summary[:500] or "HTTP 403"
+        elif status == 429:
+            failure_kind = "rate_limited"
+            error = summary[:500] or "HTTP 429"
+        elif status >= 500:
+            failure_kind = "transient"
+            error = summary[:500] or f"HTTP {status}"
+        else:
+            failure_kind = "rejected"
+            error = summary[:500] or f"HTTP {status}"
+        return {
+            "ok": available,
+            "model_available": available,
+            "model": selected_model,
+            "status": status,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "probe_kind": "model_response",
+            "transport": transport,
+            "failure_kind": failure_kind,
+            "refresh_recommended": status == 401,
+            "error": error,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "model_available": False,
+            "model": selected_model,
+            "status": 0,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "probe_kind": "model_response",
+            "transport": transport,
+            "failure_kind": "transient",
+            "refresh_recommended": False,
+            "error": str(exc)[:500],
         }
 
 

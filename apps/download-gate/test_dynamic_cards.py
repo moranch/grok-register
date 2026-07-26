@@ -331,6 +331,13 @@ class DynamicCardTests(unittest.TestCase):
                     "last_error": "",
                     "delivered": False,
                     "leased": False,
+                    "model_test_model": "grok-4.5",
+                    "model_test_ok": False,
+                    "model_test_status": 403,
+                    "model_test_checked_at": "2026-07-26 03:04:05",
+                    "model_test_latency_ms": 123,
+                    "model_test_failure_kind": "quota_exhausted",
+                    "model_test_error": "credits exhausted",
                     "password": "must-not-leak",
                     "sso": "must-not-leak",
                     "access_token": "must-not-leak",
@@ -372,10 +379,67 @@ class DynamicCardTests(unittest.TestCase):
         self.assertIn("page_size=50", requested_path)
         self.assertEqual(result["summary"]["ready"], 5)
         self.assertEqual(result["items"][0]["email"], "safe@example.com")
+        self.assertEqual(result["items"][0]["model_test_model"], "grok-4.5")
+        self.assertFalse(result["items"][0]["model_test_ok"])
+        self.assertEqual(result["items"][0]["model_test_status"], 403)
         serialized = json.dumps(result)
         for secret_field in ("password", "sso", "access_token", "refresh_token", "extra_json"):
             self.assertNotIn(secret_field, serialized)
         self.assertNotIn("must-not-leak", serialized)
+
+    def test_admin_model_test_proxy_is_explicit_and_credential_free(self):
+        console_payload = {
+            "ok": True,
+            "test": {
+                "account_id": 42,
+                "ok": False,
+                "model_available": False,
+                "model": "grok-4.5",
+                "status": 403,
+                "latency_ms": 321,
+                "probe_kind": "model_response",
+                "failure_kind": "model_denied",
+                "refresh_recommended": False,
+                "error": "permission denied",
+                "checked_at": "2026-07-26 04:05:06",
+                "access_token": "must-not-leak",
+                "sso": "must-not-leak",
+            },
+        }
+
+        with patch.object(gate, "console_json_post", return_value=console_payload) as post:
+            result = gate.run_admin_account_model_test(42, "grok-4.5")
+
+        post.assert_called_once_with(
+            "/api/internal/accounts/42/model-test",
+            {"model": "grok-4.5"},
+            timeout_seconds=65,
+        )
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["test"]["model_available"])
+        self.assertEqual(result["test"]["failure_kind"], "model_denied")
+        serialized = json.dumps(result)
+        self.assertNotIn("access_token", serialized)
+        self.assertNotIn("sso", serialized)
+        self.assertNotIn("must-not-leak", serialized)
+
+    def test_admin_model_test_handler_returns_console_result(self):
+        handler = SimpleNamespace(
+            read_body=lambda: json.dumps({"model": "grok-4.5"}).encode(),
+            send_json=Mock(),
+        )
+        expected = {
+            "ok": True,
+            "test": {"account_id": 42, "model_available": True},
+        }
+        with patch.object(gate, "run_admin_account_model_test", return_value=expected) as run:
+            gate.DownloadGateHandler.handle_admin_account_model_test(handler, 42)
+
+        run.assert_called_once_with(42, "grok-4.5")
+        handler.send_json.assert_called_once_with(
+            expected,
+            extra_headers={"Cache-Control": "no-store, max-age=0"},
+        )
 
     def test_admin_page_contains_account_list_search_filters_and_pagination(self):
         handler = SimpleNamespace(headers={"Host": "127.0.0.1:18787"}, server=SimpleNamespace(server_port=18787))
@@ -395,6 +459,10 @@ class DynamicCardTests(unittest.TestCase):
         self.assertIn('id="accountsPrevPage"', page)
         self.assertIn('id="accountsNextPage"', page)
         self.assertIn('id="accountsPageSize"', page)
+        self.assertIn('id="accountsModelInput"', page)
+        self.assertIn("data-account-model-test", page)
+        self.assertIn("模型测试", page)
+        self.assertIn("不会改变取件库存判定", page)
         self.assertIn(f"{gate.ADMIN_PATH}/api/accounts?", page)
         self.assertIn("CPA 凭据", page)
         self.assertIn("账号存活", page)
