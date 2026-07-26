@@ -46,7 +46,7 @@ ADMIN_PATH = normalize_admin_path(os.environ.get("DOWNLOAD_GATE_ADMIN_PATH", "/d
 INTERNAL_API_TOKEN = os.environ.get("DOWNLOAD_GATE_INTERNAL_TOKEN", "").strip()
 CONSOLE_URL = os.environ.get("DOWNLOAD_GATE_CONSOLE_URL", "").strip().rstrip("/")
 CONSOLE_TIMEOUT_SECONDS = max(int(os.environ.get("DOWNLOAD_GATE_CONSOLE_TIMEOUT", "120") or 120), 5)
-APP_VERSION = "2026.07.26.04"
+APP_VERSION = "2026.07.26.05"
 CLAIM_TTL_SECONDS = 24 * 60 * 60
 BATCH_DOWNLOAD_TTL_SECONDS = 10 * 60
 MAX_BATCH_KEYS = 20
@@ -4528,7 +4528,6 @@ def admin_page(
   <label>手动测试模型
     <input id="accountsModelInput" class="model-input" value="grok-4.5" maxlength="100" autocomplete="off">
   </label>
-  <button id="accountsExport" class="secondary compact" type="button">导出当前筛选</button>
   <button id="accountsRefresh" class="secondary compact" type="button">刷新列表</button>
   <span id="accountsCount" class="table-count">尚未加载</span>
   <div class="pagination" aria-label="账户列表分页">
@@ -4546,9 +4545,10 @@ def admin_page(
 </div>
 <div class="account-migration-panel">
   <div class="account-migration-copy">
-    <strong>账号迁移导入</strong>
-    <span>导出包包含密码、SSO 和 OAuth Token；导入会自动按账号主体、SSO、邮箱去重，并在写入前备份数据库。</span>
+    <strong>账号迁移导入 / 导出</strong>
+    <span>导出当前搜索与状态筛选结果；导入会自动按账号主体、SSO、邮箱去重，并在写入前备份数据库。</span>
   </div>
+  <button id="accountsExport" class="secondary compact" type="button">导出当前筛选</button>
   <input id="accountsImportFile" type="file" accept=".json,application/json">
   <button id="accountsImportPreview" class="secondary compact" type="button">预检导入</button>
   <button id="accountsImport" class="compact" type="button">确认导入</button>
