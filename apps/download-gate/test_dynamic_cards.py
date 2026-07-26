@@ -8,7 +8,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 MODULE_PATH = Path(__file__).with_name("download_gate_server.py")
@@ -309,6 +309,113 @@ class DynamicCardTests(unittest.TestCase):
         self.assertIn("暂无近期验活库存，新卡暂不可领取", page)
         self.assertNotIn("兑换时将现场尝试验活", page)
         self.assertEqual(page.count("activeButton.textContent = '正在分配'"), 1)
+
+    def test_admin_account_proxy_forwards_filters_and_enforces_allowlist(self):
+        console_payload = {
+            "items": [
+                {
+                    "id": 42,
+                    "platform": "grok",
+                    "email": "safe@example.com",
+                    "status": "active",
+                    "lifecycle_status": "active",
+                    "validity_status": "valid",
+                    "plan_state": "free",
+                    "created_at": "2026-07-26 01:02:03",
+                    "last_checked_at": "2026-07-26 02:02:03",
+                    "cpa_status": "ready",
+                    "credential_ready": True,
+                    "account_alive": True,
+                    "probe_checked_at": "2026-07-26 02:02:03",
+                    "failure_kind": "",
+                    "last_error": "",
+                    "delivered": False,
+                    "leased": False,
+                    "password": "must-not-leak",
+                    "sso": "must-not-leak",
+                    "access_token": "must-not-leak",
+                    "refresh_token": "must-not-leak",
+                    "extra_json": {"credentials": {"access_token": "must-not-leak"}},
+                }
+            ],
+            "page": 2,
+            "page_size": 50,
+            "total": 81,
+            "pages": 2,
+            "summary": {
+                "total": 81,
+                "ready": 5,
+                "unverified": 60,
+                "invalid": 10,
+                "delivered": 6,
+                "leased": 1,
+                "access_token": "must-not-leak",
+            },
+            "access_token": "must-not-leak",
+        }
+        query = {
+            "platform": ["grok"],
+            "q": ["safe@example.com"],
+            "status": ["ready"],
+            "page": ["2"],
+            "page_size": ["50"],
+        }
+
+        with patch.object(gate, "console_json_get", return_value=console_payload) as get:
+            result = gate.load_admin_accounts(query)
+
+        requested_path = get.call_args.args[0]
+        self.assertTrue(requested_path.startswith("/api/internal/accounts?"))
+        self.assertIn("search=safe%40example.com", requested_path)
+        self.assertIn("status=ready", requested_path)
+        self.assertIn("page=2", requested_path)
+        self.assertIn("page_size=50", requested_path)
+        self.assertEqual(result["summary"]["ready"], 5)
+        self.assertEqual(result["items"][0]["email"], "safe@example.com")
+        serialized = json.dumps(result)
+        for secret_field in ("password", "sso", "access_token", "refresh_token", "extra_json"):
+            self.assertNotIn(secret_field, serialized)
+        self.assertNotIn("must-not-leak", serialized)
+
+    def test_admin_page_contains_account_list_search_filters_and_pagination(self):
+        handler = SimpleNamespace(headers={"Host": "127.0.0.1:18787"}, server=SimpleNamespace(server_port=18787))
+        status = {
+            "config": {"enabled": False, "threshold": 100, "replenish_count": 100},
+            "candidate_stock": 0,
+            "verified_stock": 0,
+            "unverified_stock": 0,
+        }
+        with patch.object(gate, "load_auto_replenish_status", return_value=(status, "")):
+            page = gate.admin_page(handler).decode("utf-8")
+
+        self.assertIn('data-admin-tab="accounts"', page)
+        self.assertIn('data-admin-panel="accounts"', page)
+        self.assertIn('id="accountsSearch"', page)
+        self.assertIn('id="accountsStatusFilter"', page)
+        self.assertIn('id="accountsPrevPage"', page)
+        self.assertIn('id="accountsNextPage"', page)
+        self.assertIn('id="accountsPageSize"', page)
+        self.assertIn(f"{gate.ADMIN_PATH}/api/accounts?", page)
+        self.assertIn("CPA 凭据", page)
+        self.assertIn("账号存活", page)
+        self.assertIn("最近验活", page)
+        self.assertIn("失败原因", page)
+        self.assertIn("注册时间", page)
+        self.assertIn("账户列表暂不可用", page)
+
+    def test_admin_account_endpoint_returns_friendly_503_when_console_is_unavailable(self):
+        handler = SimpleNamespace(send_json=Mock())
+        parsed = gate.urlparse(f"{gate.ADMIN_PATH}/api/accounts?status=ready")
+
+        with patch.object(gate, "load_admin_accounts", side_effect=RuntimeError("connection refused")):
+            gate.DownloadGateHandler.handle_admin_accounts(handler, parsed)
+
+        payload, status, headers = handler.send_json.call_args.args
+        self.assertFalse(payload["ok"])
+        self.assertIn("无法加载 Console 账户列表", payload["error"])
+        self.assertIn("connection refused", payload["error"])
+        self.assertEqual(status, gate.HTTPStatus.SERVICE_UNAVAILABLE)
+        self.assertEqual(headers["Cache-Control"], "no-store, max-age=0")
 
     def test_card_status_labels_are_localized(self):
         self.assertEqual(

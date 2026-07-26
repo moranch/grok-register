@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import quote
 
@@ -36,6 +36,7 @@ from ._shared import (
     check_auth,
     execute_no_return,
     export_accounts,
+    fetch_all,
     fetch_one,
     now_iso,
 )
@@ -154,12 +155,352 @@ def _manual_delivery_response(
     }
 
 
+_INTERNAL_ACCOUNT_INVENTORY_STATES = {
+    "all",
+    "ready",
+    "unverified",
+    "invalid",
+    "delivered",
+    "leased",
+    "active",
+    "inactive",
+}
+
+
+def _internal_account_like_pattern(value: str) -> str:
+    """Return a literal LIKE pattern instead of treating user input as wildcards."""
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _internal_account_list(
+    *,
+    search: str = "",
+    status: str = "all",
+    platform: str = "grok",
+    page: int = 1,
+    page_size: int = 50,
+) -> dict[str, Any]:
+    """Build the credential-free account inventory consumed by DownloadGate.
+
+    The SQL deliberately projects only display/status fields.  Raw ``sso``,
+    ``password``, token values and ``extra_json`` never leave SQLite.
+    """
+    search = str(search or "").strip().lower()
+    status = str(status or "all").strip().lower()
+    platform = str(platform or "grok").strip().lower()
+    if status not in _INTERNAL_ACCOUNT_INVENTORY_STATES:
+        raise HTTPException(status_code=422, detail="invalid account inventory status")
+    if platform == "all":
+        platform = ""
+    elif not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", platform):
+        raise HTTPException(status_code=422, detail="invalid account platform")
+    page = max(1, int(page))
+    page_size = max(1, min(int(page_size), 200))
+
+    # Keep historical DownloadGate packages reconciled exactly like the delivery
+    # stock calculation before classifying an account as available.
+    _delivery_runtime.import_download_gate_history()
+
+    try:
+        ttl_minutes = max(1, int(_delivery_runtime._delivery_prevalidation_ttl_minutes()))
+    except Exception:
+        ttl_minutes = 60
+    verification_cutoff = (datetime.now() - timedelta(minutes=ttl_minutes)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    pattern = _internal_account_like_pattern(search) if search else ""
+    base_params: tuple[Any, ...] = (
+        platform,
+        platform,
+        search,
+        pattern,
+        pattern,
+        verification_cutoff,
+        verification_cutoff,
+    )
+    cte = """
+        WITH account_source AS (
+            SELECT
+                a.id,
+                COALESCE(a.email, '') AS email,
+                COALESCE(a.status, '') AS status,
+                COALESCE(a.platform, 'grok') AS platform,
+                COALESCE(a.lifecycle_status, 'registered') AS lifecycle_status,
+                COALESCE(a.validity_status, 'unknown') AS validity_status,
+                COALESCE(a.plan_state, 'unknown') AS plan_state,
+                COALESCE(a.created_at, '') AS created_at,
+                COALESCE(a.last_checked_at, '') AS last_checked_at,
+                COALESCE(a.last_error, '') AS account_last_error,
+                CASE
+                    WHEN COALESCE(a.platform, 'grok') = 'grok'
+                    THEN COALESCE(a.sso, '') <> ''
+                    ELSE COALESCE(a.sso, '') <> '' OR COALESCE(a.password, '') <> ''
+                END AS identity_ready,
+                CASE
+                    WHEN json_valid(a.extra_json) THEN a.extra_json
+                    ELSE '{}'
+                END AS safe_extra,
+                EXISTS (
+                    SELECT 1
+                    FROM account_delivery_consumptions consumption
+                    WHERE consumption.account_id = a.id
+                ) AS delivered,
+                EXISTS (
+                    SELECT 1
+                    FROM account_delivery_leases lease
+                    WHERE lease.account_id = a.id
+                      AND lease.state IN ('probing', 'ready', 'packing')
+                ) AS leased
+            FROM accounts a
+            WHERE (? = '' OR a.platform = ?)
+              AND (
+                    ? = ''
+                    OR CAST(a.id AS TEXT) LIKE ? ESCAPE '\\'
+                    OR LOWER(a.email) LIKE ? ESCAPE '\\'
+              )
+        ),
+        projected AS (
+            SELECT
+                id,
+                email,
+                status,
+                platform,
+                lifecycle_status,
+                validity_status,
+                plan_state,
+                created_at,
+                last_checked_at,
+                COALESCE(json_extract(safe_extra, '$.cpa.status'), '') AS cpa_status,
+                CASE
+                    WHEN json_extract(safe_extra, '$.cpa.credential_ready') = 1 THEN 1
+                    ELSE 0
+                END AS credential_ready,
+                CASE
+                    WHEN COALESCE(
+                        json_extract(safe_extra, '$.cpa.probe.account_alive'),
+                        json_extract(safe_extra, '$.cpa.probe.ok')
+                    ) = 1 THEN 1
+                    ELSE 0
+                END AS account_alive,
+                COALESCE(
+                    json_extract(safe_extra, '$.cpa.probe_checked_at'),
+                    json_extract(safe_extra, '$.cpa.updated_at'),
+                    ''
+                ) AS probe_checked_at,
+                COALESCE(
+                    json_extract(safe_extra, '$.cpa.probe.probe_kind'),
+                    ''
+                ) AS probe_kind,
+                COALESCE(
+                    NULLIF(json_extract(safe_extra, '$.cpa.failure_kind'), ''),
+                    NULLIF(json_extract(safe_extra, '$.cpa.probe.failure_kind'), ''),
+                    ''
+                ) AS failure_kind,
+                COALESCE(
+                    NULLIF(json_extract(safe_extra, '$.cpa.error'), ''),
+                    NULLIF(json_extract(safe_extra, '$.cpa.probe_error'), ''),
+                    NULLIF(json_extract(safe_extra, '$.cpa.probe.error'), ''),
+                    NULLIF(account_last_error, ''),
+                    ''
+                ) AS last_error,
+                CASE
+                    WHEN TRIM(COALESCE(json_extract(safe_extra, '$.access_token'), '')) <> ''
+                     AND TRIM(COALESCE(json_extract(safe_extra, '$.refresh_token'), '')) <> ''
+                    THEN 1 ELSE 0
+                END AS token_pair_ready,
+                CASE
+                    WHEN COALESCE(
+                        json_extract(safe_extra, '$.cpa.probe.probe_kind'), ''
+                    ) IN ('account_identity', 'account_response')
+                    THEN 1
+                    WHEN COALESCE(
+                        json_extract(safe_extra, '$.cpa.probe.probe_kind'), ''
+                    ) = 'account_session'
+                     AND json_extract(safe_extra, '$.cpa.credential_ready') = 1
+                    THEN 1
+                    ELSE 0
+                END AS account_probe_ready,
+                identity_ready,
+                delivered,
+                leased,
+                CASE
+                    WHEN status <> 'active'
+                      OR lifecycle_status IN ('expired', 'invalid')
+                      OR validity_status = 'invalid'
+                    THEN 1 ELSE 0
+                END AS invalid_account
+            FROM account_source
+        ),
+        classified AS (
+            SELECT
+                *,
+                CASE
+                    WHEN platform = 'grok'
+                     AND token_pair_ready = 1
+                     AND account_probe_ready = 1
+                     AND account_alive = 1
+                     AND datetime(SUBSTR(REPLACE(probe_checked_at, 'T', ' '), 1, 19))
+                         >= datetime(?)
+                    THEN 1 ELSE 0
+                END AS recently_verified,
+                CASE
+                    WHEN delivered = 1 THEN 'delivered'
+                    WHEN leased = 1 THEN 'leased'
+                    WHEN invalid_account = 1 THEN 'invalid'
+                    WHEN identity_ready = 0 THEN 'unverified'
+                    WHEN platform <> 'grok' THEN 'ready'
+                    WHEN token_pair_ready = 1
+                     AND account_probe_ready = 1
+                     AND account_alive = 1
+                     AND datetime(SUBSTR(REPLACE(probe_checked_at, 'T', ' '), 1, 19))
+                         >= datetime(?)
+                    THEN 'ready'
+                    ELSE 'unverified'
+                END AS inventory_status
+            FROM projected
+        )
+    """
+    if status in {"ready", "unverified", "invalid", "delivered", "leased"}:
+        filter_sql = "inventory_status = ?"
+        filter_params: tuple[Any, ...] = (status,)
+    elif status == "active":
+        filter_sql = "status = 'active'"
+        filter_params = ()
+    elif status == "inactive":
+        filter_sql = "status <> 'active'"
+        filter_params = ()
+    else:
+        filter_sql = "1 = 1"
+        filter_params = ()
+
+    summary_row = fetch_one(
+        cte
+        + """
+        SELECT
+            COUNT(*) AS total,
+            COALESCE(SUM(inventory_status = 'ready'), 0) AS ready,
+            COALESCE(SUM(inventory_status = 'unverified'), 0) AS unverified,
+            COALESCE(SUM(inventory_status = 'invalid'), 0) AS invalid,
+            COALESCE(SUM(inventory_status = 'delivered'), 0) AS delivered,
+            COALESCE(SUM(inventory_status = 'leased'), 0) AS leased,
+            COALESCE(SUM(status = 'active'), 0) AS active,
+            COALESCE(SUM(status <> 'active'), 0) AS inactive
+        FROM classified
+        """,
+        base_params,
+    )
+    summary_values = {
+        key: int(summary_row[key] if summary_row else 0)
+        for key in (
+            "total",
+            "ready",
+            "unverified",
+            "invalid",
+            "delivered",
+            "leased",
+            "active",
+            "inactive",
+        )
+    }
+    filtered_total = summary_values["total" if status == "all" else status]
+    offset = (page - 1) * page_size
+    rows = fetch_all(
+        cte
+        + f"""
+        SELECT
+            id,
+            email,
+            status,
+            platform,
+            lifecycle_status,
+            validity_status,
+            plan_state,
+            created_at,
+            last_checked_at,
+            cpa_status,
+            credential_ready,
+            account_alive,
+            probe_checked_at,
+            probe_kind,
+            failure_kind,
+            last_error,
+            delivered,
+            leased,
+            recently_verified,
+            inventory_status
+        FROM classified
+        WHERE {filter_sql}
+        ORDER BY id DESC
+        LIMIT ? OFFSET ?
+        """,
+        base_params + filter_params + (page_size, offset),
+    )
+    boolean_fields = {
+        "credential_ready",
+        "account_alive",
+        "delivered",
+        "leased",
+        "recently_verified",
+    }
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        item = {key: row[key] for key in row.keys()}
+        for key in boolean_fields:
+            item[key] = bool(item[key])
+        items.append(item)
+    summary = {
+        key: summary_values[key]
+        for key in ("total", "ready", "unverified", "invalid", "delivered", "leased")
+    }
+    return {
+        "items": items,
+        "summary": summary,
+        "total": filtered_total,
+        "page": page,
+        "page_size": page_size,
+        "pages": (filtered_total + page_size - 1) // page_size,
+        "verification_ttl_minutes": ttl_minutes,
+        "filters": {
+            "search": search,
+            "status": status,
+            "platform": platform or "all",
+        },
+    }
+
+
 @router.get("/api/accounts")
 def api_accounts(
     request: Request, limit: int = Query(500, ge=1, le=5000)
 ) -> dict[str, Any]:
     check_auth(request)
     return {"items": account_list(limit)}
+
+
+@router.get("/api/internal/accounts")
+def api_internal_accounts(
+    request: Request,
+    search: str = Query("", max_length=320),
+    status: str = Query(
+        "all",
+        pattern="^(all|ready|unverified|invalid|delivered|leased|active|inactive)$",
+    ),
+    platform: str = Query("grok", max_length=64),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+) -> dict[str, Any]:
+    try:
+        _delivery_runtime.check_internal_bearer(request.headers.get("Authorization", ""))
+    except Exception as exc:
+        _raise_delivery_error(exc)
+        raise
+    return _internal_account_list(
+        search=search,
+        status=status,
+        platform=platform,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.get("/api/accounts/summary")

@@ -23,7 +23,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -46,7 +46,7 @@ ADMIN_PATH = normalize_admin_path(os.environ.get("DOWNLOAD_GATE_ADMIN_PATH", "/d
 INTERNAL_API_TOKEN = os.environ.get("DOWNLOAD_GATE_INTERNAL_TOKEN", "").strip()
 CONSOLE_URL = os.environ.get("DOWNLOAD_GATE_CONSOLE_URL", "").strip().rstrip("/")
 CONSOLE_TIMEOUT_SECONDS = max(int(os.environ.get("DOWNLOAD_GATE_CONSOLE_TIMEOUT", "120") or 120), 5)
-APP_VERSION = "2026.07.26.01"
+APP_VERSION = "2026.07.26.02"
 CLAIM_TTL_SECONDS = 24 * 60 * 60
 BATCH_DOWNLOAD_TTL_SECONDS = 10 * 60
 MAX_BATCH_KEYS = 20
@@ -86,6 +86,29 @@ SUB2API_DATA_TYPE = "sub2api-data"
 SUB2API_DATA_VERSION = 1
 GROKCLI2API_VARIANT = "grokcli2api"
 GROKCLI2API_VARIANT_ALIASES = {"grokcli", "grokcli2api", "grokcli-2api"}
+ACCOUNT_LIST_STATUSES = {"all", "ready", "unverified", "invalid", "delivered", "leased"}
+ACCOUNT_LIST_FIELDS = (
+    "id",
+    "platform",
+    "email",
+    "status",
+    "lifecycle_status",
+    "validity_status",
+    "plan_state",
+    "created_at",
+    "last_checked_at",
+    "cpa_status",
+    "credential_ready",
+    "account_alive",
+    "probe_checked_at",
+    "probe_kind",
+    "failure_kind",
+    "last_error",
+    "delivered",
+    "leased",
+    "recently_verified",
+    "inventory_status",
+)
 
 
 def normalize_card_platform(value: str | None) -> str:
@@ -1104,6 +1127,125 @@ def console_json_post(path: str, payload: dict, *, timeout_seconds: int | None =
 
 def console_json_get(path: str, *, timeout_seconds: int | None = None) -> dict:
     return console_json_request(path, timeout_seconds=timeout_seconds)
+
+
+def _query_value(query: dict, name: str, default: str = "") -> str:
+    value = query.get(name, [default])
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else default
+    return str(value if value is not None else default)
+
+
+def _bounded_query_int(
+    query: dict,
+    name: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        value = int(_query_value(query, name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return min(max(value, minimum), maximum)
+
+
+def account_list_query(query: dict) -> dict[str, str | int]:
+    """Normalize the small, non-sensitive account-list query forwarded to Console."""
+    platform = _query_value(query, "platform", "grok").strip().lower()
+    if platform not in CARD_PLATFORMS:
+        platform = "grok"
+    status = _query_value(query, "status", "all").strip().lower()
+    if status not in ACCOUNT_LIST_STATUSES:
+        status = "all"
+    return {
+        "platform": platform,
+        "q": _query_value(query, "q").strip()[:160],
+        "status": status,
+        "page": _bounded_query_int(query, "page", 1, 1, 1_000_000),
+        "page_size": _bounded_query_int(query, "page_size", 25, 10, 200),
+    }
+
+
+def _account_bool(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _account_count(value: object, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return max(0, default)
+
+
+def sanitize_account_list_response(payload: dict, requested: dict[str, str | int]) -> dict:
+    """Enforce a second allow-list boundary before Console data reaches the browser."""
+    raw_items = payload.get("items")
+    if not isinstance(raw_items, list):
+        raise RuntimeError("Console 账户列表响应缺少 items")
+    items: list[dict] = []
+    boolean_fields = {
+        "credential_ready",
+        "account_alive",
+        "delivered",
+        "leased",
+        "recently_verified",
+    }
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        item: dict[str, object] = {}
+        for field in ACCOUNT_LIST_FIELDS:
+            value = raw.get(field)
+            if field in boolean_fields:
+                item[field] = _account_bool(value)
+            elif value is None:
+                item[field] = ""
+            elif isinstance(value, (str, int, float, bool)):
+                item[field] = value
+            else:
+                item[field] = str(value)
+        item["email"] = str(item.get("email") or "")[:320]
+        item["last_error"] = str(item.get("last_error") or "")[:1200]
+        item["failure_kind"] = str(item.get("failure_kind") or "")[:120]
+        items.append(item)
+
+    summary_source = payload.get("summary")
+    summary_source = summary_source if isinstance(summary_source, dict) else {}
+    summary = {
+        key: _account_count(summary_source.get(key))
+        for key in ("total", "ready", "unverified", "invalid", "delivered", "leased")
+    }
+    total = _account_count(payload.get("total"), summary["total"])
+    if not summary["total"] and total:
+        summary["total"] = total
+    page = _account_count(payload.get("page"), int(requested["page"])) or 1
+    page_size = _account_count(payload.get("page_size"), int(requested["page_size"])) or int(
+        requested["page_size"]
+    )
+    pages = _account_count(payload.get("pages"))
+    if not pages:
+        pages = max(1, (total + page_size - 1) // page_size) if total else 1
+    return {
+        "ok": True,
+        "items": items,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "pages": pages,
+        "summary": summary,
+    }
+
+
+def load_admin_accounts(query: dict) -> dict:
+    requested = account_list_query(query)
+    forwarded = {key: value for key, value in requested.items() if key != "q"}
+    forwarded["search"] = requested["q"]
+    path = f"/api/internal/accounts?{urlencode(forwarded)}"
+    payload = console_json_get(path, timeout_seconds=15)
+    return sanitize_account_list_response(payload, requested)
 
 
 def console_auto_replenish_request(*, method: str = "GET", payload: dict | None = None) -> dict:
@@ -2233,6 +2375,25 @@ def page_shell(
     .admin-tab{{min-height:36px;border-radius:6px 6px 0 0;background:transparent;color:var(--muted);border:1px solid transparent;border-bottom:0;padding:0 14px;font-size:.82rem}}
     .admin-tab.active,.admin-tab:hover{{background:#fff;color:var(--ink);border-color:var(--rule)}}
     .admin-tab-panel[hidden]{{display:none}}
+    .accounts-toolbar{{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap;margin-top:16px}}
+    .accounts-toolbar label{{display:grid;gap:5px;margin:0;color:var(--muted);font-size:.74rem}}
+    .accounts-toolbar select{{min-width:150px;min-height:38px;border:1px solid var(--rule);border-radius:6px;background:#fff;color:var(--ink);padding:8px 10px;font-size:.82rem}}
+    .accounts-toolbar .pagination{{margin-left:auto}}
+    .accounts-feedback{{margin-top:12px}}
+    .accounts-feedback:empty{{display:none}}
+    .accounts-table table{{min-width:1280px}}
+    .account-email{{display:block;color:var(--ink);font-weight:700;word-break:break-all}}
+    .account-id{{display:block;margin-top:5px;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;font-size:.74rem}}
+    .account-badge{{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:4px 9px;font-size:.72rem;font-weight:700;white-space:nowrap}}
+    .account-badge::before{{content:"";width:5px;height:5px;border-radius:50%;background:currentColor}}
+    .account-badge.ready,.account-badge.alive{{color:var(--good);background:var(--good-bg)}}
+    .account-badge.unverified,.account-badge.leased{{color:var(--warn);background:var(--warn-bg)}}
+    .account-badge.invalid,.account-badge.dead{{color:var(--bad);background:var(--bad-bg)}}
+    .account-badge.delivered{{color:#2563a8;background:rgba(37,99,168,.10)}}
+    .account-badge.neutral{{color:var(--muted);background:#f1efeb}}
+    .account-detail{{display:block;margin-top:6px;color:var(--muted);font-size:.74rem;line-height:1.45;overflow-wrap:anywhere}}
+    .account-error{{max-width:340px;color:var(--bad);font-size:.76rem;line-height:1.45;overflow-wrap:anywhere}}
+    .account-error.none{{color:var(--muted)}}
     .table-tools{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:16px}}
     .search-input{{width:min(360px,100%);min-height:38px;padding:9px 11px;font-size:.84rem}}
     .segmented{{display:inline-flex;border:1px solid var(--rule);border-radius:6px;background:#fff;overflow:hidden}}
@@ -4183,6 +4344,7 @@ def admin_page(
   <button class="admin-tab active" type="button" data-admin-tab="upload" role="tab" aria-selected="true">上传生成</button>
   <button class="admin-tab" type="button" data-admin-tab="cards" role="tab" aria-selected="false">预发行卡</button>
   <button class="admin-tab" type="button" data-admin-tab="inventory" role="tab" aria-selected="false">自动补货</button>
+  <button class="admin-tab" type="button" data-admin-tab="accounts" role="tab" aria-selected="false">账户列表</button>
   <button class="admin-tab" type="button" data-admin-tab="list" role="tab" aria-selected="false">交付列表</button>
   <button class="admin-tab" type="button" data-admin-tab="claims" role="tab" aria-selected="false">最近提取</button>
   <button class="admin-tab" type="button" data-admin-tab="announcement" role="tab" aria-selected="false">公告设置</button>
@@ -4230,6 +4392,51 @@ def admin_page(
 <section class="admin-tab-panel" data-admin-panel="inventory" hidden>
 {auto_replenish_panel}
 </section>
+<section class="admin-tab-panel" data-admin-panel="accounts" hidden>
+<p class="lead">查看 Console 账号池的脱敏状态。此页面不会读取或展示密码、SSO、access token、refresh token 等凭据。</p>
+<section class="admin-summary" aria-label="账户统计">
+  <div class="stat"><span class="k">总账号</span><span id="accountsSummaryTotal" class="v">-</span></div>
+  <div class="stat"><span class="k">可交付</span><span id="accountsSummaryReady" class="v">-</span></div>
+  <div class="stat"><span class="k">未验活</span><span id="accountsSummaryUnverified" class="v">-</span></div>
+  <div class="stat"><span class="k">已失效</span><span id="accountsSummaryInvalid" class="v">-</span></div>
+  <div class="stat"><span class="k">已交付</span><span id="accountsSummaryDelivered" class="v">-</span></div>
+  <div class="stat"><span class="k">当前占用</span><span id="accountsSummaryLeased" class="v">-</span></div>
+</section>
+<div class="accounts-toolbar">
+  <label>搜索账号
+    <input id="accountsSearch" class="search-input" placeholder="邮箱或账号 ID" autocomplete="off">
+  </label>
+  <label>状态筛选
+    <select id="accountsStatusFilter">
+      <option value="all">全部状态</option>
+      <option value="ready">可交付</option>
+      <option value="unverified">未验活</option>
+      <option value="invalid">已失效</option>
+      <option value="delivered">已交付</option>
+      <option value="leased">当前占用</option>
+    </select>
+  </label>
+  <button id="accountsRefresh" class="secondary compact" type="button">刷新列表</button>
+  <span id="accountsCount" class="table-count">尚未加载</span>
+  <div class="pagination" aria-label="账户列表分页">
+    <button id="accountsPrevPage" class="secondary compact" type="button">上一页</button>
+    <span id="accountsPageInfo" class="table-count">第 1/1 页</span>
+    <button id="accountsNextPage" class="secondary compact" type="button">下一页</button>
+    <select id="accountsPageSize" aria-label="账户列表每页条数">
+      <option value="10">10 / 页</option>
+      <option value="25" selected>25 / 页</option>
+      <option value="50">50 / 页</option>
+      <option value="100">100 / 页</option>
+      <option value="200">200 / 页</option>
+    </select>
+  </div>
+</div>
+<div id="accountsFeedback" class="accounts-feedback" role="status" aria-live="polite"></div>
+<div class="admin-table accounts-table"><table>
+  <thead><tr><th style="width:19%">账号</th><th style="width:10%">库存状态</th><th style="width:11%">CPA 凭据</th><th style="width:10%">账号存活</th><th style="width:14%">最近验活</th><th style="width:13%">注册时间</th><th style="width:23%">失败原因</th></tr></thead>
+  <tbody id="accountsRows"><tr><td colspan="7">打开账户列表后加载数据</td></tr></tbody>
+</table></div>
+</section>
 <section class="admin-tab-panel" data-admin-panel="list" hidden>
 {summary_html}
 {table_tools}
@@ -4260,11 +4467,15 @@ function openAdminTab(name, updateHash=true){{
     history.replaceState(null, document.title, clean);
   }}
 }}
-adminTabs.forEach((btn) => btn.addEventListener('click', () => openAdminTab(btn.dataset.adminTab || 'upload')));
+adminTabs.forEach((btn) => btn.addEventListener('click', () => {{
+  const target = btn.dataset.adminTab || 'upload';
+  openAdminTab(target);
+  if(target === 'accounts') loadAccounts();
+}}));
 document.querySelectorAll('[data-admin-tab-open]').forEach((btn) => {{
   btn.addEventListener('click', () => openAdminTab(btn.dataset.adminTabOpen || 'upload'));
 }});
-const initialAdminTab = location.hash === '#announcement' ? 'announcement' : location.hash === '#claims' ? 'claims' : location.hash === '#inventory' ? 'inventory' : location.hash === '#cards' ? 'cards' : location.hash === '#list' ? 'list' : 'upload';
+const initialAdminTab = location.hash === '#announcement' ? 'announcement' : location.hash === '#claims' ? 'claims' : location.hash === '#accounts' ? 'accounts' : location.hash === '#inventory' ? 'inventory' : location.hash === '#cards' ? 'cards' : location.hash === '#list' ? 'list' : 'upload';
 openAdminTab(initialAdminTab, false);
 if('scrollRestoration' in history) history.scrollRestoration = 'manual';
 if(!location.hash) window.addEventListener('load', () => setTimeout(() => window.scrollTo(0, 0), 0));
@@ -4318,6 +4529,149 @@ if(uploadForm){{
     }}
   }});
 }}
+const accountsSearch = document.querySelector('#accountsSearch');
+const accountsStatusFilter = document.querySelector('#accountsStatusFilter');
+const accountsRefresh = document.querySelector('#accountsRefresh');
+const accountsRows = document.querySelector('#accountsRows');
+const accountsFeedback = document.querySelector('#accountsFeedback');
+const accountsCount = document.querySelector('#accountsCount');
+const accountsPrevPage = document.querySelector('#accountsPrevPage');
+const accountsNextPage = document.querySelector('#accountsNextPage');
+const accountsPageInfo = document.querySelector('#accountsPageInfo');
+const accountsPageSize = document.querySelector('#accountsPageSize');
+const accountsSummaryFields = {{
+  total: document.querySelector('#accountsSummaryTotal'),
+  ready: document.querySelector('#accountsSummaryReady'),
+  unverified: document.querySelector('#accountsSummaryUnverified'),
+  invalid: document.querySelector('#accountsSummaryInvalid'),
+  delivered: document.querySelector('#accountsSummaryDelivered'),
+  leased: document.querySelector('#accountsSummaryLeased'),
+}};
+let accountsPage = 1;
+let accountsPages = 1;
+let accountsLoaded = false;
+let accountsLoading = false;
+let accountsReloadPending = false;
+let accountsSearchTimer = null;
+function accountPrimaryStatus(item){{
+  const inventory = String(item.inventory_status || '').toLowerCase();
+  const inventoryLabels = {{ready:'可交付',unverified:'未验活',invalid:'已失效',delivered:'已交付',leased:'当前占用'}};
+  if(inventoryLabels[inventory]) return [inventory, inventoryLabels[inventory]];
+  if(item.delivered) return ['delivered', '已交付'];
+  if(item.leased) return ['leased', '当前占用'];
+  const lifecycle = String(item.lifecycle_status || '').toLowerCase();
+  const validity = String(item.validity_status || '').toLowerCase();
+  if(['invalid','expired','disabled','dead'].includes(lifecycle) || ['invalid','expired','dead'].includes(validity)){{
+    return ['invalid', '已失效'];
+  }}
+  if(item.credential_ready && item.account_alive) return ['ready', '可交付'];
+  return ['unverified', '未验活'];
+}}
+function accountBadge(kind, label){{
+  return '<span class="account-badge '+adminEsc(kind || 'neutral')+'">'+adminEsc(label || '-')+'</span>';
+}}
+function renderAccountRows(items){{
+  if(!accountsRows) return;
+  if(!items.length){{
+    accountsRows.innerHTML = '<tr><td colspan="7">没有符合条件的账号</td></tr>';
+    return;
+  }}
+  accountsRows.innerHTML = items.map((item) => {{
+    const state = accountPrimaryStatus(item);
+    const cpaReady = !!(item.credential_ready || item.recently_verified || state[0] === 'ready');
+    const cpaKind = cpaReady ? 'ready' : (String(item.cpa_status || '').toLowerCase() === 'failed' ? 'invalid' : 'unverified');
+    const cpaLabel = cpaReady ? '凭据就绪' : (item.cpa_status || '未就绪');
+    const checkedAt = item.probe_checked_at || item.last_checked_at || '-';
+    const hasProbe = !!(item.probe_checked_at || item.last_checked_at);
+    const aliveKind = item.account_alive ? 'alive' : (hasProbe ? 'dead' : 'neutral');
+    const aliveLabel = item.account_alive ? '存活' : (hasProbe ? '未通过' : '未验活');
+    const stateDetail = [item.status, item.lifecycle_status, item.validity_status, item.plan_state].filter(Boolean).join(' · ') || '-';
+    const failure = [item.failure_kind, item.last_error].filter(Boolean).join(' · ');
+    const failureClass = failure ? 'account-error' : 'account-error none';
+    return '<tr>'+
+      '<td><span class="account-email">'+adminEsc(item.email || '-')+'</span><span class="account-id">ID '+adminEsc(item.id || '-')+'</span></td>'+
+      '<td>'+accountBadge(state[0], state[1])+'<span class="account-detail">'+adminEsc(stateDetail)+'</span></td>'+
+      '<td>'+accountBadge(cpaKind, cpaLabel)+'<span class="account-detail">'+adminEsc(item.cpa_status || '-')+'</span></td>'+
+      '<td>'+accountBadge(aliveKind, aliveLabel)+'</td>'+
+      '<td>'+adminEsc(checkedAt)+'</td>'+
+      '<td>'+adminEsc(item.created_at || '-')+'</td>'+
+      '<td><div class="'+failureClass+'">'+adminEsc(failure || '无错误记录')+'</div></td>'+
+    '</tr>';
+  }}).join('');
+}}
+function renderAccountSummary(summary){{
+  Object.entries(accountsSummaryFields).forEach(([name, node]) => {{
+    if(node) node.textContent = String(Number(summary && summary[name]) || 0);
+  }});
+}}
+async function loadAccounts(force=false){{
+  if(accountsLoading){{
+    if(force) accountsReloadPending = true;
+    return;
+  }}
+  if(accountsLoaded && !force) return;
+  accountsLoading = true;
+  if(accountsRefresh){{accountsRefresh.disabled = true; accountsRefresh.textContent = '加载中...';}}
+  if(accountsFeedback) accountsFeedback.innerHTML = '<div class="note warn">正在从 Console 加载脱敏账户状态...</div>';
+  try{{
+    const params = new URLSearchParams({{
+      platform: 'grok',
+      q: String(accountsSearch ? accountsSearch.value : '').trim(),
+      status: String(accountsStatusFilter ? accountsStatusFilter.value : 'all'),
+      page: String(accountsPage),
+      page_size: String(Number(accountsPageSize ? accountsPageSize.value : 25) || 25),
+    }});
+    const response = await fetch('{ADMIN_PATH}/api/accounts?'+params.toString(), {{
+      headers: {{'Accept': 'application/json'}},
+      cache: 'no-store',
+    }});
+    const data = await response.json().catch(() => ({{error: '服务端返回了无效 JSON'}}));
+    if(!response.ok || !data.ok) throw new Error(data.error || `HTTP ${{response.status}}`);
+    accountsPage = Math.max(1, Number(data.page) || 1);
+    accountsPages = Math.max(1, Number(data.pages) || 1);
+    const total = Math.max(0, Number(data.total) || 0);
+    const pageSize = Math.max(1, Number(data.page_size) || 25);
+    const start = total ? (accountsPage - 1) * pageSize + 1 : 0;
+    const end = total ? Math.min(total, start + (Array.isArray(data.items) ? data.items.length : 0) - 1) : 0;
+    renderAccountRows(Array.isArray(data.items) ? data.items : []);
+    renderAccountSummary(data.summary || {{}});
+    if(accountsCount) accountsCount.textContent = total ? `当前显示 ${{start}}-${{end}} / ${{total}} 条` : '当前显示 0 条';
+    if(accountsPageInfo) accountsPageInfo.textContent = `第 ${{accountsPage}}/${{accountsPages}} 页`;
+    if(accountsPrevPage) accountsPrevPage.disabled = accountsPage <= 1;
+    if(accountsNextPage) accountsNextPage.disabled = accountsPage >= accountsPages;
+    if(accountsFeedback) accountsFeedback.innerHTML = '';
+    accountsLoaded = true;
+  }}catch(error){{
+    if(accountsRows) accountsRows.innerHTML = '<tr><td colspan="7">账户列表暂不可用，请稍后刷新</td></tr>';
+    if(accountsCount) accountsCount.textContent = '加载失败';
+    if(accountsFeedback) accountsFeedback.innerHTML = '<div class="note err">账户列表暂不可用：'+adminEsc(error && error.message ? error.message : error)+'</div>';
+    if(accountsPrevPage) accountsPrevPage.disabled = true;
+    if(accountsNextPage) accountsNextPage.disabled = true;
+    accountsLoaded = false;
+  }}finally{{
+    accountsLoading = false;
+    if(accountsRefresh){{accountsRefresh.disabled = false; accountsRefresh.textContent = '刷新列表';}}
+    if(accountsReloadPending){{
+      accountsReloadPending = false;
+      loadAccounts(true);
+    }}
+  }}
+}}
+if(accountsSearch){{
+  accountsSearch.addEventListener('input', () => {{
+    clearTimeout(accountsSearchTimer);
+    accountsSearchTimer = setTimeout(() => {{accountsPage = 1; loadAccounts(true);}}, 280);
+  }});
+}}
+if(accountsStatusFilter) accountsStatusFilter.addEventListener('change', () => {{accountsPage = 1; loadAccounts(true);}});
+if(accountsRefresh) accountsRefresh.addEventListener('click', () => loadAccounts(true));
+if(accountsPrevPage) accountsPrevPage.addEventListener('click', () => {{
+  if(accountsPage > 1){{accountsPage -= 1; loadAccounts(true);}}
+}});
+if(accountsNextPage) accountsNextPage.addEventListener('click', () => {{
+  if(accountsPage < accountsPages){{accountsPage += 1; loadAccounts(true);}}
+}});
+if(accountsPageSize) accountsPageSize.addEventListener('change', () => {{accountsPage = 1; loadAccounts(true);}});
 const adminSearch = document.querySelector('#adminSearch');
 const adminCount = document.querySelector('#adminCount');
 const adminRows = Array.from(document.querySelectorAll('#adminRows tr[data-status]'));
@@ -4597,6 +4951,7 @@ if(claimsPageSizeSelect){{
 }}
 applyAdminFilter();
 applyClaimsFilter();
+if(initialAdminTab === 'accounts') loadAccounts();
 if(window.history && window.history.replaceState && (location.search.includes('result=') || location.search.includes('results=') || location.search.includes('notice='))){{
   window.history.replaceState(null, document.title, '{ADMIN_PATH}');
 }}
@@ -5040,6 +5395,16 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
                 extra_headers=clear_client_cookie_headers(),
             )
             return
+        if path == f"{ADMIN_PATH}/api/accounts":
+            if not is_admin(self):
+                self.send_json(
+                    {"ok": False, "error": "请先登录。"},
+                    HTTPStatus.UNAUTHORIZED,
+                    {"Cache-Control": "no-store, max-age=0"},
+                )
+                return
+            self.handle_admin_accounts(parsed)
+            return
         if path == f"{ADMIN_PATH}/export.csv":
             if not is_admin(self):
                 self.send_html(login_page("请先登录。"), HTTPStatus.UNAUTHORIZED)
@@ -5079,6 +5444,22 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
             self.serve_download(parsed)
             return
         self.send_html(user_page("页面不存在。"), HTTPStatus.NOT_FOUND)
+
+    def handle_admin_accounts(self, parsed) -> None:
+        try:
+            payload = load_admin_accounts(parse_qs(parsed.query, keep_blank_values=True))
+        except Exception as exc:
+            message = str(exc).strip()[:500] or "Console 暂时不可用"
+            self.send_json(
+                {"ok": False, "error": f"无法加载 Console 账户列表：{message}"},
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"Cache-Control": "no-store, max-age=0"},
+            )
+            return
+        self.send_json(
+            payload,
+            extra_headers={"Cache-Control": "no-store, max-age=0"},
+        )
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
