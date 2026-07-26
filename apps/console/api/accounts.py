@@ -42,6 +42,11 @@ from ._shared import (
 )
 
 from . import _delivery_runtime
+from ._account_migration import (
+    MAX_MIGRATION_ACCOUNTS,
+    build_migration_document,
+    import_migration_document,
+)
 
 
 router = APIRouter(tags=["accounts"])
@@ -633,6 +638,71 @@ def api_internal_accounts(
         page=page,
         page_size=page_size,
     )
+
+
+@router.get("/api/internal/accounts/export")
+def api_internal_accounts_export(
+    request: Request,
+    search: str = Query("", max_length=320),
+    status: str = Query(
+        "all",
+        pattern="^(all|ready|unverified|invalid|delivered|leased|active|inactive)$",
+    ),
+    platform: str = Query("grok", max_length=64),
+) -> dict[str, Any]:
+    try:
+        _delivery_runtime.check_internal_bearer(request.headers.get("Authorization", ""))
+    except Exception as exc:
+        _raise_delivery_error(exc)
+        raise
+    first = _internal_account_list(
+        search=search,
+        status=status,
+        platform=platform,
+        page=1,
+        page_size=200,
+    )
+    total = int(first.get("total") or 0)
+    if total > MAX_MIGRATION_ACCOUNTS:
+        raise HTTPException(status_code=413, detail="too many accounts to export")
+    account_ids = [int(item["id"]) for item in first.get("items") or []]
+    for page in range(2, int(first.get("pages") or 0) + 1):
+        result = _internal_account_list(
+            search=search,
+            status=status,
+            platform=platform,
+            page=page,
+            page_size=200,
+        )
+        account_ids.extend(int(item["id"]) for item in result.get("items") or [])
+    document = build_migration_document(
+        account_ids,
+        selection={
+            "platform": platform,
+            "status": status,
+            "search": search,
+        },
+    )
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return {
+        "ok": True,
+        "filename": f"grok-account-migration-{document['count']}-{stamp}.json",
+        "document": document,
+    }
+
+
+@router.post("/api/internal/accounts/import")
+def api_internal_accounts_import(
+    request: Request,
+    payload: dict[str, Any],
+    dry_run: bool = Query(False),
+) -> dict[str, Any]:
+    try:
+        _delivery_runtime.check_internal_bearer(request.headers.get("Authorization", ""))
+    except Exception as exc:
+        _raise_delivery_error(exc)
+        raise
+    return import_migration_document(payload, dry_run=dry_run)
 
 
 @router.post("/api/internal/accounts/{account_id}/model-test")

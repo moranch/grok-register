@@ -441,6 +441,93 @@ class DynamicCardTests(unittest.TestCase):
             extra_headers={"Cache-Control": "no-store, max-age=0"},
         )
 
+    def test_admin_account_migration_export_forwards_filters(self):
+        document = {
+            "schema": gate.ACCOUNT_MIGRATION_SCHEMA,
+            "count": 1,
+            "accounts": [
+                {
+                    "email": "migration@example.com",
+                    "sso": "sso-secret",
+                    "extra_json": '{"access_token":"access-secret"}',
+                }
+            ],
+        }
+        with patch.object(
+            gate,
+            "console_json_get",
+            return_value={
+                "ok": True,
+                "filename": "grok-account-migration-1.json",
+                "document": document,
+            },
+        ) as get:
+            filename, raw = gate.load_admin_account_export(
+                {"platform": ["grok"], "status": ["ready"], "q": ["migration"]}
+            )
+
+        requested = get.call_args.args[0]
+        self.assertIn("/api/internal/accounts/export?", requested)
+        self.assertIn("status=ready", requested)
+        self.assertIn("search=migration", requested)
+        self.assertEqual(filename, "grok-account-migration-1.json")
+        exported = json.loads(raw)
+        self.assertEqual(exported["schema"], gate.ACCOUNT_MIGRATION_SCHEMA)
+        # This is an explicit administrator download, so credentials must be
+        # preserved in the migration package rather than silently stripped.
+        self.assertEqual(exported["accounts"][0]["sso"], "sso-secret")
+        self.assertIn("access-secret", exported["accounts"][0]["extra_json"])
+
+    def test_admin_account_migration_import_returns_only_summary(self):
+        document = {
+            "schema": gate.ACCOUNT_MIGRATION_SCHEMA,
+            "accounts": [{"email": "migration@example.com", "sso": "secret"}],
+        }
+        console_result = {
+            "ok": True,
+            "dry_run": False,
+            "source_count": 2,
+            "unique_count": 1,
+            "duplicates_removed": 1,
+            "inserted": 1,
+            "updated": 0,
+            "unchanged": 0,
+            "backup": "/workspace/apps/console/runtime/backups/before.db",
+            "access_token": "must-not-leak",
+        }
+        with patch.object(gate, "console_json_post", return_value=console_result) as post:
+            result = gate.import_admin_accounts(document, dry_run=False)
+
+        post.assert_called_once_with(
+            "/api/internal/accounts/import?dry_run=false",
+            document,
+            timeout_seconds=90,
+        )
+        self.assertEqual(result["backup"], "before.db")
+        self.assertEqual(result["duplicates_removed"], 1)
+        self.assertNotIn("access_token", json.dumps(result))
+        self.assertNotIn("must-not-leak", json.dumps(result))
+
+    def test_admin_account_migration_import_handler_supports_preview(self):
+        document = {
+            "schema": gate.ACCOUNT_MIGRATION_SCHEMA,
+            "accounts": [{"email": "migration@example.com", "sso": "secret"}],
+        }
+        handler = SimpleNamespace(
+            read_body=lambda: json.dumps(document).encode(),
+            send_json=Mock(),
+        )
+        parsed = gate.urlparse(f"{gate.ADMIN_PATH}/api/accounts/import?dry_run=true")
+        expected = {"ok": True, "dry_run": True, "inserted": 1}
+        with patch.object(gate, "import_admin_accounts", return_value=expected) as imported:
+            gate.DownloadGateHandler.handle_admin_accounts_import(handler, parsed)
+
+        imported.assert_called_once_with(document, dry_run=True)
+        handler.send_json.assert_called_once_with(
+            expected,
+            extra_headers={"Cache-Control": "no-store, max-age=0"},
+        )
+
     def test_admin_page_contains_account_list_search_filters_and_pagination(self):
         handler = SimpleNamespace(headers={"Host": "127.0.0.1:18787"}, server=SimpleNamespace(server_port=18787))
         status = {
@@ -460,6 +547,13 @@ class DynamicCardTests(unittest.TestCase):
         self.assertIn('id="accountsNextPage"', page)
         self.assertIn('id="accountsPageSize"', page)
         self.assertIn('id="accountsModelInput"', page)
+        self.assertIn('id="accountsExport"', page)
+        self.assertIn('id="accountsImportFile"', page)
+        self.assertIn('id="accountsImportPreview"', page)
+        self.assertIn('id="accountsImport"', page)
+        self.assertIn("/api/accounts/export?", page)
+        self.assertIn("/api/accounts/import?dry_run=", page)
+        self.assertIn("系统会先自动备份数据库", page)
         self.assertIn("data-account-model-test", page)
         self.assertIn("模型测试", page)
         self.assertIn("不会改变取件库存判定", page)

@@ -46,7 +46,7 @@ ADMIN_PATH = normalize_admin_path(os.environ.get("DOWNLOAD_GATE_ADMIN_PATH", "/d
 INTERNAL_API_TOKEN = os.environ.get("DOWNLOAD_GATE_INTERNAL_TOKEN", "").strip()
 CONSOLE_URL = os.environ.get("DOWNLOAD_GATE_CONSOLE_URL", "").strip().rstrip("/")
 CONSOLE_TIMEOUT_SECONDS = max(int(os.environ.get("DOWNLOAD_GATE_CONSOLE_TIMEOUT", "120") or 120), 5)
-APP_VERSION = "2026.07.26.03"
+APP_VERSION = "2026.07.26.04"
 CLAIM_TTL_SECONDS = 24 * 60 * 60
 BATCH_DOWNLOAD_TTL_SECONDS = 10 * 60
 MAX_BATCH_KEYS = 20
@@ -86,6 +86,8 @@ SUB2API_DATA_TYPE = "sub2api-data"
 SUB2API_DATA_VERSION = 1
 GROKCLI2API_VARIANT = "grokcli2api"
 GROKCLI2API_VARIANT_ALIASES = {"grokcli", "grokcli2api", "grokcli-2api"}
+ACCOUNT_MIGRATION_SCHEMA = "grok-register.account-migration.v1"
+MAX_ACCOUNT_MIGRATION_ITEMS = 5000
 ACCOUNT_LIST_STATUSES = {"all", "ready", "unverified", "invalid", "delivered", "leased"}
 ACCOUNT_LIST_FIELDS = (
     "id",
@@ -1293,6 +1295,60 @@ def run_admin_account_model_test(account_id: int, model: str) -> dict:
     return {"ok": True, "test": result}
 
 
+def load_admin_account_export(query: dict) -> tuple[str, bytes]:
+    requested = account_list_query(query)
+    forwarded = {
+        "platform": requested["platform"],
+        "status": requested["status"],
+        "search": requested["q"],
+    }
+    payload = console_json_get(
+        f"/api/internal/accounts/export?{urlencode(forwarded)}",
+        timeout_seconds=30,
+    )
+    document = payload.get("document")
+    if not payload.get("ok") or not isinstance(document, dict):
+        raise RuntimeError("Console account export response is invalid")
+    accounts = document.get("accounts")
+    if document.get("schema") != ACCOUNT_MIGRATION_SCHEMA or not isinstance(accounts, list):
+        raise RuntimeError("Console returned an unsupported account migration")
+    if not 1 <= len(accounts) <= MAX_ACCOUNT_MIGRATION_ITEMS:
+        raise RuntimeError("Console returned an invalid account migration size")
+    raw = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise RuntimeError("account migration export is too large")
+    filename = safe_filename(
+        str(payload.get("filename") or f"grok-account-migration-{len(accounts)}.json")
+    )
+    return filename, raw
+
+
+def import_admin_accounts(document: dict, *, dry_run: bool = False) -> dict:
+    if not isinstance(document, dict) or document.get("schema") != ACCOUNT_MIGRATION_SCHEMA:
+        raise ValueError("不支持的账号迁移文件")
+    accounts = document.get("accounts")
+    if not isinstance(accounts, list) or not 1 <= len(accounts) <= MAX_ACCOUNT_MIGRATION_ITEMS:
+        raise ValueError("账号迁移文件为空或数量超过限制")
+    payload = console_json_post(
+        f"/api/internal/accounts/import?dry_run={'true' if dry_run else 'false'}",
+        document,
+        timeout_seconds=90,
+    )
+    if not payload.get("ok"):
+        raise RuntimeError("Console account import failed")
+    return {
+        "ok": True,
+        "dry_run": _account_bool(payload.get("dry_run")),
+        "source_count": _account_count(payload.get("source_count")),
+        "unique_count": _account_count(payload.get("unique_count")),
+        "duplicates_removed": _account_count(payload.get("duplicates_removed")),
+        "inserted": _account_count(payload.get("inserted")),
+        "updated": _account_count(payload.get("updated")),
+        "unchanged": _account_count(payload.get("unchanged")),
+        "backup": Path(str(payload.get("backup") or "")).name,
+    }
+
+
 def console_auto_replenish_request(*, method: str = "GET", payload: dict | None = None) -> dict:
     if INTERNAL_API_TOKEN:
         return console_json_request(
@@ -2442,6 +2498,11 @@ def page_shell(
     .account-error.none{{color:var(--muted)}}
     .model-test-cell{{display:grid;gap:7px;min-width:180px}}
     .model-test-cell button{{justify-self:start;min-height:30px;padding:0 10px;font-size:.72rem}}
+    .account-migration-panel{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px;padding:12px 14px;border:1px solid var(--rule);background:#fff}}
+    .account-migration-copy{{display:grid;gap:3px;min-width:220px;margin-right:auto}}
+    .account-migration-copy strong{{font-size:.84rem}}
+    .account-migration-copy span{{color:var(--muted);font-size:.72rem;line-height:1.4}}
+    .account-migration-panel input[type=file]{{max-width:290px;font-size:.76rem}}
     .table-tools{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:16px}}
     .search-input{{width:min(360px,100%);min-height:38px;padding:9px 11px;font-size:.84rem}}
     .segmented{{display:inline-flex;border:1px solid var(--rule);border-radius:6px;background:#fff;overflow:hidden}}
@@ -4467,6 +4528,7 @@ def admin_page(
   <label>手动测试模型
     <input id="accountsModelInput" class="model-input" value="grok-4.5" maxlength="100" autocomplete="off">
   </label>
+  <button id="accountsExport" class="secondary compact" type="button">导出当前筛选</button>
   <button id="accountsRefresh" class="secondary compact" type="button">刷新列表</button>
   <span id="accountsCount" class="table-count">尚未加载</span>
   <div class="pagination" aria-label="账户列表分页">
@@ -4481,6 +4543,15 @@ def admin_page(
       <option value="200">200 / 页</option>
     </select>
   </div>
+</div>
+<div class="account-migration-panel">
+  <div class="account-migration-copy">
+    <strong>账号迁移导入</strong>
+    <span>导出包包含密码、SSO 和 OAuth Token；导入会自动按账号主体、SSO、邮箱去重，并在写入前备份数据库。</span>
+  </div>
+  <input id="accountsImportFile" type="file" accept=".json,application/json">
+  <button id="accountsImportPreview" class="secondary compact" type="button">预检导入</button>
+  <button id="accountsImport" class="compact" type="button">确认导入</button>
 </div>
 <div id="accountsFeedback" class="accounts-feedback" role="status" aria-live="polite"></div>
 <div class="admin-table accounts-table"><table>
@@ -4591,6 +4662,10 @@ const accountsNextPage = document.querySelector('#accountsNextPage');
 const accountsPageInfo = document.querySelector('#accountsPageInfo');
 const accountsPageSize = document.querySelector('#accountsPageSize');
 const accountsModelInput = document.querySelector('#accountsModelInput');
+const accountsExport = document.querySelector('#accountsExport');
+const accountsImportFile = document.querySelector('#accountsImportFile');
+const accountsImportPreview = document.querySelector('#accountsImportPreview');
+const accountsImport = document.querySelector('#accountsImport');
 const accountsSummaryFields = {{
   total: document.querySelector('#accountsSummaryTotal'),
   ready: document.querySelector('#accountsSummaryReady'),
@@ -4736,6 +4811,69 @@ if(accountsNextPage) accountsNextPage.addEventListener('click', () => {{
   if(accountsPage < accountsPages){{accountsPage += 1; loadAccounts(true);}}
 }});
 if(accountsPageSize) accountsPageSize.addEventListener('change', () => {{accountsPage = 1; loadAccounts(true);}});
+if(accountsExport) accountsExport.addEventListener('click', () => {{
+  const params = new URLSearchParams({{
+    platform: 'grok',
+    q: String(accountsSearch ? accountsSearch.value : '').trim(),
+    status: String(accountsStatusFilter ? accountsStatusFilter.value : 'all'),
+  }});
+  const anchor = document.createElement('a');
+  anchor.href = '{ADMIN_PATH}/api/accounts/export?'+params.toString();
+  anchor.download = '';
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  if(accountsFeedback) accountsFeedback.innerHTML = '<div class="note warn">正在生成账号迁移包。文件包含敏感凭据，请妥善保存。</div>';
+}});
+async function selectedAccountMigration(){{
+  const file = accountsImportFile && accountsImportFile.files ? accountsImportFile.files[0] : null;
+  if(!file) throw new Error('请先选择账号迁移 JSON 文件');
+  if(file.size > {MAX_UPLOAD_BYTES}) throw new Error('迁移文件超过大小限制');
+  const document = JSON.parse(await file.text());
+  if(!document || document.schema !== '{ACCOUNT_MIGRATION_SCHEMA}' || !Array.isArray(document.accounts)){{
+    throw new Error('不是受支持的账号迁移文件');
+  }}
+  if(document.accounts.length < 1 || document.accounts.length > {MAX_ACCOUNT_MIGRATION_ITEMS}){{
+    throw new Error('迁移文件账号数量不符合限制');
+  }}
+  return document;
+}}
+function accountImportSummary(data){{
+  return '源记录 '+Number(data.source_count || 0)+' · 去重后 '+Number(data.unique_count || 0)+
+    ' · 新增 '+Number(data.inserted || 0)+' · 更新 '+Number(data.updated || 0)+
+    ' · 未变化 '+Number(data.unchanged || 0)+' · 去重 '+Number(data.duplicates_removed || 0);
+}}
+async function runAccountImport(dryRun){{
+  const document = await selectedAccountMigration();
+  if(!dryRun && !confirm('确认导入 '+document.accounts.length+' 条账号记录？现有同账号凭据可能被更新，系统会先自动备份数据库。')) return;
+  const buttons = [accountsImportPreview, accountsImport].filter(Boolean);
+  buttons.forEach((button) => button.disabled = true);
+  if(accountsFeedback) accountsFeedback.innerHTML = '<div class="note warn">'+(dryRun ? '正在预检迁移文件...' : '正在备份数据库并导入账号...')+'</div>';
+  try{{
+    const response = await fetch('{ADMIN_PATH}/api/accounts/import?dry_run='+(dryRun ? 'true' : 'false'), {{
+      method: 'POST',
+      headers: {{'Accept':'application/json','Content-Type':'application/json'}},
+      body: JSON.stringify(document),
+    }});
+    const data = await response.json().catch(() => ({{error:'服务端返回了无效 JSON'}}));
+    if(!response.ok || !data.ok) throw new Error(data.error || `HTTP ${{response.status}}`);
+    if(!dryRun) await loadAccounts(true);
+    const backup = data.backup ? ' · 备份 '+String(data.backup) : '';
+    if(accountsFeedback) accountsFeedback.innerHTML = '<div class="note ok">'+adminEsc((dryRun ? '预检完成：' : '导入完成：')+accountImportSummary(data)+backup)+'</div>';
+  }}finally{{
+    buttons.forEach((button) => button.disabled = false);
+  }}
+}}
+if(accountsImportPreview) accountsImportPreview.addEventListener('click', () => {{
+  runAccountImport(true).catch((error) => {{
+    if(accountsFeedback) accountsFeedback.innerHTML = '<div class="note err">预检失败：'+adminEsc(error && error.message ? error.message : error)+'</div>';
+  }});
+}});
+if(accountsImport) accountsImport.addEventListener('click', () => {{
+  runAccountImport(false).catch((error) => {{
+    if(accountsFeedback) accountsFeedback.innerHTML = '<div class="note err">导入失败：'+adminEsc(error && error.message ? error.message : error)+'</div>';
+  }});
+}});
 if(accountsRows) accountsRows.addEventListener('click', async (event) => {{
   const button = event.target.closest('[data-account-model-test]');
   if(!button || button.disabled) return;
@@ -5458,6 +5596,20 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def send_json_download(self, data: bytes, filename: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("X-DownloadGate-Version", APP_VERSION)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        self.send_header(
+            "Content-Disposition",
+            f"attachment; filename*=UTF-8''{quote(filename)}",
+        )
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def redirect(self, location: str, *, cookie_action: str = "", status: int = 302) -> None:
         self.send_response(status)
         if cookie_action == "make":
@@ -5503,6 +5655,16 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
                 )
                 return
             self.handle_admin_accounts(parsed)
+            return
+        if path == f"{ADMIN_PATH}/api/accounts/export":
+            if not is_admin(self):
+                self.send_json(
+                    {"ok": False, "error": "请先登录。"},
+                    HTTPStatus.UNAUTHORIZED,
+                    {"Cache-Control": "no-store, max-age=0"},
+                )
+                return
+            self.handle_admin_accounts_export(parsed)
             return
         if path == f"{ADMIN_PATH}/export.csv":
             if not is_admin(self):
@@ -5552,6 +5714,63 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
             self.send_json(
                 {"ok": False, "error": f"无法加载 Console 账户列表：{message}"},
                 HTTPStatus.SERVICE_UNAVAILABLE,
+                {"Cache-Control": "no-store, max-age=0"},
+            )
+            return
+        self.send_json(
+            payload,
+            extra_headers={"Cache-Control": "no-store, max-age=0"},
+        )
+
+    def handle_admin_accounts_export(self, parsed) -> None:
+        try:
+            filename, data = load_admin_account_export(
+                parse_qs(parsed.query, keep_blank_values=True)
+            )
+        except Exception as exc:
+            message = str(exc).strip()[:500] or "Console 暂时不可用"
+            self.send_json(
+                {"ok": False, "error": f"账号导出失败：{message}"},
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"Cache-Control": "no-store, max-age=0"},
+            )
+            return
+        self.send_json_download(data, filename)
+
+    def handle_admin_accounts_import(self, parsed) -> None:
+        try:
+            document = json.loads(self.read_body().decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            self.send_json(
+                {"ok": False, "error": f"迁移文件 JSON 无效：{exc}"},
+                HTTPStatus.BAD_REQUEST,
+                {"Cache-Control": "no-store, max-age=0"},
+            )
+            return
+        dry_run = (parse_qs(parsed.query).get("dry_run") or ["false"])[0].lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        try:
+            payload = import_admin_accounts(document, dry_run=dry_run)
+        except ValueError as exc:
+            self.send_json(
+                {"ok": False, "error": str(exc)},
+                HTTPStatus.BAD_REQUEST,
+                {"Cache-Control": "no-store, max-age=0"},
+            )
+            return
+        except Exception as exc:
+            message = str(exc).strip()[:500] or "Console 暂时不可用"
+            status = (
+                HTTPStatus.UNPROCESSABLE_ENTITY
+                if any(marker in message for marker in ("HTTP 409", "HTTP 413", "HTTP 422"))
+                else HTTPStatus.SERVICE_UNAVAILABLE
+            )
+            self.send_json(
+                {"ok": False, "error": f"账号导入失败：{message}"},
+                status,
                 {"Cache-Control": "no-store, max-age=0"},
             )
             return
@@ -5610,10 +5829,12 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
                 path,
             )
         )
+        is_account_import = path == f"{ADMIN_PATH}/api/accounts/import"
         if (
             path
             in {"/api/claim", "/api/claim-batch", f"{ADMIN_PATH}/auto-replenish"}
             or is_account_model_test
+            or is_account_import
         ):
             self._do_POST()
             return
@@ -5627,6 +5848,16 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == f"{ADMIN_PATH}/login":
             self.handle_login()
+            return
+        if parsed.path == f"{ADMIN_PATH}/api/accounts/import":
+            if not is_admin(self):
+                self.send_json(
+                    {"ok": False, "error": "请先登录。"},
+                    HTTPStatus.UNAUTHORIZED,
+                    {"Cache-Control": "no-store, max-age=0"},
+                )
+                return
+            self.handle_admin_accounts_import(parsed)
             return
         account_model_test = re.fullmatch(
             re.escape(ADMIN_PATH) + r"/api/accounts/([1-9][0-9]*)/model-test",

@@ -167,6 +167,14 @@ class InternalAccountInventoryTests(unittest.TestCase):
                     accounts_api.InternalAccountModelTest(model="grok-4.5"),
                 )
             self.assertEqual(model_denied.exception.status_code, 401)
+            with self.assertRaises(HTTPException) as export_denied:
+                accounts_api.api_internal_accounts_export(
+                    _request("Bearer wrong"),
+                    search="",
+                    status="ready",
+                    platform="grok",
+                )
+            self.assertEqual(export_denied.exception.status_code, 401)
 
         with patch.object(_shared, "DOWNLOAD_GATE_INTERNAL_TOKEN", ""):
             with self.assertRaises(HTTPException) as unavailable:
@@ -261,6 +269,29 @@ class InternalAccountInventoryTests(unittest.TestCase):
             "password-secret-",
         ):
             self.assertNotIn(secret, serialized)
+
+    def test_explicit_migration_export_is_filtered_and_import_can_preview(self):
+        ids = self._seed_inventory()
+        with patch.object(_shared, "DOWNLOAD_GATE_INTERNAL_TOKEN", "internal-secret"):
+            exported = accounts_api.api_internal_accounts_export(
+                _request("Bearer internal-secret"),
+                search="",
+                status="ready",
+                platform="grok",
+            )
+            preview = accounts_api.api_internal_accounts_import(
+                _request("Bearer internal-secret"),
+                exported["document"],
+                dry_run=True,
+            )
+
+        self.assertTrue(exported["ok"])
+        self.assertEqual(exported["document"]["count"], 1)
+        self.assertEqual(exported["document"]["accounts"][0]["source_id"], ids["ready"])
+        self.assertIn("access-super-secret", exported["document"]["accounts"][0]["extra_json"])
+        self.assertTrue(preview["dry_run"])
+        self.assertEqual(preview["unchanged"], 1)
+        self.assertEqual(preview["inserted"], 0)
 
     def test_ready_rules_match_delivery_stock_snapshot(self):
         now = _shared.now_iso()
