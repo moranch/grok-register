@@ -46,7 +46,7 @@ ADMIN_PATH = normalize_admin_path(os.environ.get("DOWNLOAD_GATE_ADMIN_PATH", "/d
 INTERNAL_API_TOKEN = os.environ.get("DOWNLOAD_GATE_INTERNAL_TOKEN", "").strip()
 CONSOLE_URL = os.environ.get("DOWNLOAD_GATE_CONSOLE_URL", "").strip().rstrip("/")
 CONSOLE_TIMEOUT_SECONDS = max(int(os.environ.get("DOWNLOAD_GATE_CONSOLE_TIMEOUT", "120") or 120), 5)
-APP_VERSION = "2026.07.26.07"
+APP_VERSION = "2026.07.26.08"
 CLAIM_TTL_SECONDS = 24 * 60 * 60
 BATCH_DOWNLOAD_TTL_SECONDS = 10 * 60
 MAX_BATCH_KEYS = 20
@@ -2062,19 +2062,29 @@ def generate_card_key(length: int = CARD_KEY_DEFAULT_LENGTH) -> str:
     return "DG-" + "-".join(groups)
 
 
-def generate_available_card_key(manifest: dict, reserved: set[str] | None = None) -> str:
-    used = existing_card_keys(manifest)
-    blocked = {normalize_key(key) for key in (reserved or set()) if normalize_key(key)}
+def generate_available_card_key_from_used(used: set[str]) -> str:
+    """Generate one key against a precomputed normalized key set.
+
+    Bulk issuance calls this repeatedly while extending ``used``.  Avoiding a
+    full manifest scan for every card keeps generation linear as card history
+    grows.
+    """
     for length in CARD_KEY_LENGTHS:
         for _ in range(300):
             key = generate_card_key(length)
-            if key not in used and key not in blocked:
+            if key not in used:
                 return key
     for _ in range(20):
         key = generate_card_key(CARD_KEY_LENGTHS[-1] + CARD_KEY_GROUP_SIZE)
-        if key not in used and key not in blocked:
+        if key not in used:
             return key
     raise RuntimeError("生成唯一卡密失败：随机空间连续撞重，请重试")
+
+
+def generate_available_card_key(manifest: dict, reserved: set[str] | None = None) -> str:
+    used = existing_card_keys(manifest)
+    used.update(normalize_key(key) for key in (reserved or set()) if normalize_key(key))
+    return generate_available_card_key_from_used(used)
 
 
 def generate_unique_card_key(manifest: dict) -> str:
@@ -2109,8 +2119,10 @@ def issue_cards(
     required_model = normalize_card_required_model(platform, required_model)
     cards = manifest.setdefault("cards", {})
     issued: list[str] = []
+    used = existing_card_keys(manifest)
     for _ in range(count):
-        key = generate_unique_card_key(manifest)
+        key = generate_available_card_key_from_used(used)
+        used.add(key)
         cards[key] = {
             "key": key,
             "status": "issued",
@@ -3912,11 +3924,16 @@ def admin_results_card(
 </section>"""
 
 
-def admin_result_from_bundle(handler: BaseHTTPRequestHandler, bundle_id: str) -> dict | None:
+def admin_result_from_bundle(
+    handler: BaseHTTPRequestHandler,
+    bundle_id: str,
+    *,
+    manifest: dict | None = None,
+) -> dict | None:
     bundle_id = str(bundle_id or "").strip()
     if not bundle_id:
         return None
-    manifest = load_manifest()
+    manifest = manifest if isinstance(manifest, dict) else load_manifest()
     bundle = manifest.get("bundles", {}).get(bundle_id)
     if not bundle:
         return None
@@ -3932,7 +3949,12 @@ def admin_result_from_bundle(handler: BaseHTTPRequestHandler, bundle_id: str) ->
     return result
 
 
-def admin_results_from_ids(handler: BaseHTTPRequestHandler, bundle_ids: list[str]) -> list[dict]:
+def admin_results_from_ids(
+    handler: BaseHTTPRequestHandler,
+    bundle_ids: list[str],
+    *,
+    manifest: dict | None = None,
+) -> list[dict]:
     results: list[dict] = []
     seen: set[str] = set()
     for bundle_id in bundle_ids:
@@ -3940,7 +3962,7 @@ def admin_results_from_ids(handler: BaseHTTPRequestHandler, bundle_ids: list[str
         if not bundle_id or bundle_id in seen:
             continue
         seen.add(bundle_id)
-        result = admin_result_from_bundle(handler, bundle_id)
+        result = admin_result_from_bundle(handler, bundle_id, manifest=manifest)
         if result:
             results.append(result)
     return results
@@ -4120,14 +4142,15 @@ def admin_page(
   <div class="stat"><span class="k">领取失败</span><span class="v">{card_counts['failed']}</span></div>
   <div class="stat"><span class="k">已作废</span><span class="v">{card_counts['void']}</span></div>
 </section>
-<form class="panel upload-panel" method="post" action="{ADMIN_PATH}/cards/issue">
+<form id="issueCardsForm" class="panel upload-panel" method="post" action="{ADMIN_PATH}/cards/issue">
   <div class="panel-title"><span>批量生成预发行空卡</span><small>领取时才分配账号</small></div>
   <div class="grid">
     <label>数量<input name="count" type="number" min="1" max="{MAX_ISSUE_CARDS}" value="10" required></label>
     <label>批次<input name="batch" maxlength="80" placeholder="例如：7月第二批"></label>
     <label>目标平台<select name="platform" required>{platform_options}</select></label>
   </div>
-  <button class="full" type="submit">生成预发行卡密</button>
+  <button id="issueCardsButton" class="full" type="submit">生成预发行卡密</button>
+  <div id="issueCardsFeedback"></div>
 </form>
 <form class="panel upload-panel" method="post" action="{ADMIN_PATH}/cards/bulk"
       onsubmit="return confirm('确认批量处理这些卡密？作废后将立即无法领取。已领取卡会保留交付审计记录。')">
@@ -4146,7 +4169,7 @@ def admin_page(
   <div class="note warn">作废会立即阻止领取和原下载链接；删除模式只隐藏并清理未领取卡，已领取卡保留交付记录用于防重复。</div>
   <button class="danger full" type="submit">执行批量销卡</button>
 </form>
-{issued_result}
+<div id="issuedCardsResult">{issued_result}</div>
 <div class="admin-table"><table>
   <thead><tr><th>卡密</th><th>平台</th><th>状态</th><th>批次</th><th>发行时间</th><th>领取时间 / 最近错误</th></tr></thead>
   <tbody>{card_rows or '<tr><td colspan="6">暂无卡密记录</td></tr>'}</tbody>
@@ -4447,7 +4470,7 @@ def admin_page(
             for item in bundles
             if item.get("id") and not item.get("replaced_by")
         ][:10]
-        recent_results = admin_results_from_ids(handler, recent_ids)
+        recent_results = admin_results_from_ids(handler, recent_ids, manifest=manifest)
         result_html = admin_results_card(
             recent_results,
             mini_text="最近生成卡密",
@@ -4663,6 +4686,57 @@ if(uploadForm){{
       if(uploadHint) uploadHint.innerHTML = '<div class="note err">上传失败：'+adminEsc(e.message)+'</div>';
     }}finally{{
       if(uploadBtn){{uploadBtn.disabled = false; uploadBtn.textContent = oldText;}}
+    }}
+  }});
+}}
+const issueCardsForm = document.querySelector('#issueCardsForm');
+const issueCardsButton = document.querySelector('#issueCardsButton');
+const issueCardsFeedback = document.querySelector('#issueCardsFeedback');
+const issuedCardsResult = document.querySelector('#issuedCardsResult');
+function renderIssuedCards(data){{
+  const keys = Array.isArray(data && data.keys) ? data.keys.map((key) => String(key || '')).filter(Boolean) : [];
+  if(!keys.length) return '';
+  const batch = adminEsc(data.batch || '-');
+  const platform = adminEsc(data.platform || 'grok');
+  const keyText = adminEsc(keys.join('\\n'));
+  return '<section class="card result">'+
+    '<div class="hd"><div><span class="mini">批量预发行完成</span><div class="bigkey">'+batch+'</div></div>'+
+    '<span class="tag">'+platform+' · '+keys.length+' 张</span></div>'+
+    '<label>卡密列表<textarea id="issuedCardKeys" rows="10" readonly onclick="this.select()">'+keyText+'</textarea></label>'+
+    '<button id="copyIssuedCardKeys" type="button">复制全部卡密</button>'+
+    '</section>';
+}}
+if(issueCardsForm){{
+  issueCardsForm.addEventListener('submit', async (event) => {{
+    event.preventDefault();
+    const oldText = issueCardsButton ? issueCardsButton.textContent : '';
+    if(issueCardsButton){{issueCardsButton.disabled = true; issueCardsButton.textContent = '生成中...';}}
+    if(issueCardsFeedback) issueCardsFeedback.innerHTML = '<div class="note warn">正在生成卡密并写入清单...</div>';
+    try{{
+      const response = await fetch(issueCardsForm.action, {{
+        method: 'POST',
+        body: new URLSearchParams(new FormData(issueCardsForm)),
+        headers: {{'X-Requested-With':'fetch','Accept':'application/json'}},
+      }});
+      const raw = await response.text();
+      let data = null;
+      try{{data = JSON.parse(raw);}}catch(_error){{
+        throw new Error(`HTTP ${{response.status}} 返回非 JSON 响应`);
+      }}
+      if(!response.ok || !data.ok) throw new Error(data.error || `HTTP ${{response.status}}`);
+      if(issuedCardsResult){{
+        issuedCardsResult.innerHTML = renderIssuedCards(data);
+        const copyIssuedCardKeys = issuedCardsResult.querySelector('#copyIssuedCardKeys');
+        if(copyIssuedCardKeys) copyIssuedCardKeys.addEventListener('click', () => {{
+          const keyList = issuedCardsResult.querySelector('#issuedCardKeys');
+          if(keyList) copyText(keyList.value, copyIssuedCardKeys);
+        }});
+      }}
+      if(issueCardsFeedback) issueCardsFeedback.innerHTML = '<div class="note ok">已生成 '+Number(data.count || 0)+' 张卡密；无需等待页面重新加载。</div>';
+    }}catch(error){{
+      if(issueCardsFeedback) issueCardsFeedback.innerHTML = '<div class="note err">生成失败：'+adminEsc(error && error.message ? error.message : error)+'</div>';
+    }}finally{{
+      if(issueCardsButton){{issueCardsButton.disabled = false; issueCardsButton.textContent = oldText;}}
     }}
   }});
 }}
@@ -5912,6 +5986,12 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == f"{ADMIN_PATH}/cards/issue":
             if not is_admin(self):
+                if self.headers.get("X-Requested-With") == "fetch":
+                    self.send_json(
+                        {"ok": False, "error": "请先登录。"},
+                        HTTPStatus.UNAUTHORIZED,
+                    )
+                    return
                 self.send_html(login_page("请先登录。"), HTTPStatus.UNAUTHORIZED)
                 return
             self.handle_issue_cards()
@@ -6059,6 +6139,10 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
         self.send_html(login_page("密码错误。"), HTTPStatus.UNAUTHORIZED)
 
     def handle_issue_cards(self) -> None:
+        wants_json = (
+            self.headers.get("X-Requested-With") == "fetch"
+            or "application/json" in (self.headers.get("Accept") or "")
+        )
         params = parse_qs(self.read_body().decode("utf-8", errors="replace"))
         try:
             count = int((params.get("count") or ["0"])[0])
@@ -6080,16 +6164,34 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
             )
             save_manifest(manifest)
         except Exception as exc:
+            if wants_json:
+                self.send_json(
+                    {"ok": False, "error": f"生成预发行卡失败：{exc}"},
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
             notice = quote(f"生成预发行卡失败：{exc}", safe="")
             self.redirect(f"{ADMIN_PATH}?notice={notice}#cards", status=303)
             return
+        normalized_platform = normalize_card_platform(platform)
+        if wants_json:
+            self.send_json(
+                {
+                    "ok": True,
+                    "count": len(keys),
+                    "keys": keys,
+                    "batch": batch,
+                    "platform": normalized_platform,
+                }
+            )
+            return
         notice = quote(
-            f"已生成 {len(keys)} 张 {normalize_card_platform(platform)} 预发行卡，批次：{batch}",
+            f"已生成 {len(keys)} 张 {normalized_platform} 预发行卡，批次：{batch}",
             safe="",
         )
         self.redirect(
             f"{ADMIN_PATH}?notice={notice}&issued_batch={quote(batch, safe='')}"
-            f"&issued_platform={quote(normalize_card_platform(platform), safe='')}#cards",
+            f"&issued_platform={quote(normalized_platform, safe='')}#cards",
             status=303,
         )
 

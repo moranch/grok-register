@@ -125,6 +125,52 @@ class DynamicCardTests(unittest.TestCase):
             self.assertEqual(manifest["cards"][key]["bundle_id"], "")
             self.assertNotIn(key, manifest["keys"])
 
+    def test_bulk_issue_scans_existing_keys_once(self):
+        manifest = gate.load_manifest()
+        manifest["cards"] = {
+            f"DG-OLD-{index:08d}": {"key": f"DG-OLD-{index:08d}", "status": "issued"}
+            for index in range(500)
+        }
+        with patch.object(
+            gate,
+            "existing_card_keys",
+            wraps=gate.existing_card_keys,
+        ) as existing_card_keys:
+            keys = gate.issue_cards(manifest, 100, "fast-batch")
+
+        self.assertEqual(len(keys), 100)
+        self.assertEqual(existing_card_keys.call_count, 1)
+
+    def test_bulk_issue_rejects_collision_with_key_generated_in_same_batch(self):
+        manifest = gate.load_manifest()
+        with patch.object(
+            gate,
+            "generate_card_key",
+            side_effect=["DG-TEST-0001", "DG-TEST-0001", "DG-TEST-0002"],
+        ):
+            keys = gate.issue_cards(manifest, 2, "collision-batch")
+
+        self.assertEqual(keys, ["DG-TEST-0001", "DG-TEST-0002"])
+        self.assertEqual(len(manifest["cards"]), 2)
+
+    def test_issue_cards_fetch_returns_json_without_admin_page_redirect(self):
+        handler = SimpleNamespace(
+            headers={"X-Requested-With": "fetch", "Accept": "application/json"},
+            read_body=Mock(return_value=b"count=3&batch=fast-batch&platform=grok"),
+            send_json=Mock(),
+            redirect=Mock(),
+        )
+
+        gate.DownloadGateHandler.handle_issue_cards(handler)
+
+        payload = handler.send_json.call_args.args[0]
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["count"], 3)
+        self.assertEqual(payload["batch"], "fast-batch")
+        self.assertEqual(payload["platform"], "grok")
+        self.assertEqual(len(payload["keys"]), 3)
+        handler.redirect.assert_not_called()
+
     def test_grokcli_variant_is_kept_with_bundle_and_removed_with_bundle(self):
         bundle_id = "bundle-with-grokcli"
         manifest = gate.load_manifest()
@@ -554,6 +600,10 @@ class DynamicCardTests(unittest.TestCase):
         self.assertIn('id="accountsImportFile"', page)
         self.assertIn('id="accountsImportPreview"', page)
         self.assertIn('id="accountsImport"', page)
+        self.assertIn('id="issueCardsForm"', page)
+        self.assertIn('id="issueCardsButton"', page)
+        self.assertIn('id="issuedCardsResult"', page)
+        self.assertIn("无需等待页面重新加载", page)
         self.assertIn("/api/accounts/export?", page)
         self.assertIn("/api/accounts/import?dry_run=", page)
         self.assertIn("系统会先自动备份数据库", page)
