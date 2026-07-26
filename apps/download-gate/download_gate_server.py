@@ -46,7 +46,7 @@ ADMIN_PATH = normalize_admin_path(os.environ.get("DOWNLOAD_GATE_ADMIN_PATH", "/d
 INTERNAL_API_TOKEN = os.environ.get("DOWNLOAD_GATE_INTERNAL_TOKEN", "").strip()
 CONSOLE_URL = os.environ.get("DOWNLOAD_GATE_CONSOLE_URL", "").strip().rstrip("/")
 CONSOLE_TIMEOUT_SECONDS = max(int(os.environ.get("DOWNLOAD_GATE_CONSOLE_TIMEOUT", "120") or 120), 5)
-APP_VERSION = "2026.07.25.05"
+APP_VERSION = "2026.07.26.01"
 CLAIM_TTL_SECONDS = 24 * 60 * 60
 BATCH_DOWNLOAD_TTL_SECONDS = 10 * 60
 MAX_BATCH_KEYS = 20
@@ -84,6 +84,8 @@ GROK_OIDC_SCOPE = "openid profile email offline_access grok-cli:access api:acces
 GROK_AUTH_REGISTRY_KEY = f"{GROK_OIDC_ISSUER}::{GROK_OIDC_CLIENT_ID}"
 SUB2API_DATA_TYPE = "sub2api-data"
 SUB2API_DATA_VERSION = 1
+GROKCLI2API_VARIANT = "grokcli2api"
+GROKCLI2API_VARIANT_ALIASES = {"grokcli", "grokcli2api", "grokcli-2api"}
 
 
 def normalize_card_platform(value: str | None) -> str:
@@ -516,6 +518,16 @@ def bundle_json_path(bundle_id: str) -> Path | None:
     return JSON_DIR / f"{bundle_id}.json"
 
 
+def bundle_variant_json_path(bundle_id: str, variant: str) -> Path | None:
+    bundle_id = str(bundle_id or "").strip()
+    normalized_variant = str(variant or "").strip().lower()
+    if not bundle_id or not all(ch.isalnum() or ch in "-_" for ch in bundle_id):
+        return None
+    if normalized_variant != GROKCLI2API_VARIANT:
+        return None
+    return JSON_DIR / f"{bundle_id}.{normalized_variant}.json"
+
+
 def bundle_payload_path(bundle_id: str, bundle: dict | None = None) -> Path | None:
     bundle = bundle if isinstance(bundle, dict) else {}
     json_path = bundle_json_path(bundle_id)
@@ -596,7 +608,11 @@ def delete_bundle_from_manifest(
 
     if delete_zip:
         for target_id in target_ids:
-            for payload_path in (bundle_zip_path(target_id), bundle_json_path(target_id)):
+            for payload_path in (
+                bundle_zip_path(target_id),
+                bundle_json_path(target_id),
+                bundle_variant_json_path(target_id, GROKCLI2API_VARIANT),
+            ):
                 if payload_path and payload_path.exists():
                     payload_path.unlink()
     return deleted
@@ -611,7 +627,14 @@ def clear_orphan_zips(manifest: dict) -> int:
         if zip_path.name not in active_zip_names:
             zip_path.unlink()
             deleted += 1
-    active_json_names = {f"{bundle_id}.json" for bundle_id in bundles}
+    active_json_names = {
+        name
+        for bundle_id in bundles
+        for name in (
+            f"{bundle_id}.json",
+            f"{bundle_id}.{GROKCLI2API_VARIANT}.json",
+        )
+    }
     JSON_DIR.mkdir(parents=True, exist_ok=True)
     for json_path in JSON_DIR.glob("*.json"):
         if json_path.name not in active_json_names:
@@ -748,6 +771,100 @@ def cockpit_auth_payload(document: dict) -> dict:
     if source.get("last_refresh") not in (None, ""):
         entry["create_time"] = source["last_refresh"]
     return {GROK_AUTH_REGISTRY_KEY: entry}
+
+
+def grokcli_2api_payload(document: dict) -> dict:
+    """Build the native grokcli-2api auth export wrapper for one account.
+
+    grokcli-2api 2.x accepts an ``auth`` map and deliberately preserves SSO and
+    registration-password metadata.  Those fields allow its token maintainer to
+    recover an account when a refresh token is revoked instead of immediately
+    removing it from the pool.
+    """
+    cpa = cpa_import_payload(document)
+    source = cpa if cpa is not document else document
+    credentials = document.get("credentials") if isinstance(document.get("credentials"), dict) else {}
+    access_token = str(source.get("access_token") or credentials.get("access_token") or "").strip()
+    refresh_token = str(source.get("refresh_token") or credentials.get("refresh_token") or "").strip()
+    if not access_token:
+        raise ValueError("CPA JSON 缺少 access_token，无法生成 GrokCLI-2API 导入文件")
+
+    email = str(source.get("email") or document.get("email") or credentials.get("email") or "").strip()
+    subject = str(
+        source.get("sub")
+        or document.get("sub")
+        or document.get("account_id")
+        or credentials.get("sub")
+        or ""
+    ).strip()
+    entry: dict[str, object] = {
+        "key": access_token,
+        "access_token": access_token,
+        "auth_mode": "oidc",
+        "email": email,
+        "principal_type": "User",
+        "oidc_issuer": GROK_OIDC_ISSUER,
+        "oidc_client_id": GROK_OIDC_CLIENT_ID,
+        "source": "grok-register-download-gate",
+    }
+    if refresh_token:
+        entry["refresh_token"] = refresh_token
+    id_token = str(source.get("id_token") or credentials.get("id_token") or "").strip()
+    if id_token:
+        entry["id_token"] = id_token
+    if subject:
+        entry["user_id"] = subject
+        entry["principal_id"] = subject
+    if source.get("expired") not in (None, ""):
+        entry["expires_at"] = source["expired"]
+    if source.get("last_refresh") not in (None, ""):
+        entry["create_time"] = source["last_refresh"]
+    if source.get("base_url") not in (None, ""):
+        entry["base_url"] = source["base_url"]
+
+    sso = str(
+        document.get("sso")
+        or document.get("sso_cookie")
+        or credentials.get("sso")
+        or credentials.get("sso_cookie")
+        or source.get("sso")
+        or source.get("sso_cookie")
+        or ""
+    ).strip()
+    if sso.lower().startswith("sso="):
+        sso = sso.split("=", 1)[1].strip()
+    if sso:
+        entry["sso"] = sso
+        entry["sso_cookie"] = sso
+
+    password = str(
+        document.get("password")
+        or document.get("register_password")
+        or credentials.get("password")
+        or credentials.get("register_password")
+        or ""
+    ).strip()
+    if password:
+        entry["password"] = password
+        entry["register_password"] = password
+
+    account_key = f"{GROK_OIDC_ISSUER}::{subject or GROK_OIDC_CLIENT_ID}"
+    return {
+        "ok": True,
+        "auth": {account_key: entry},
+        "count": 1,
+        "exported_at": time.time(),
+    }
+
+
+def grokcli_2api_filename(document: dict) -> str:
+    cpa = cpa_import_payload(document)
+    source = cpa if cpa is not document else document
+    identity = str(source.get("email") or source.get("sub") or "account").strip()
+    return safe_filename(
+        f"grokcli-2api-auth-{identity}.json",
+        "grokcli-2api-auth-account.json",
+    )
 
 
 def sub2api_payload(document: dict) -> dict:
@@ -1084,6 +1201,29 @@ def write_dynamic_bundle_json_atomic(manifest: dict, card: dict, document: dict)
     finally:
         if temp_path.exists():
             temp_path.unlink()
+
+    variants: dict[str, dict] = {}
+    grokcli_path = bundle_variant_json_path(bundle_id, GROKCLI2API_VARIANT)
+    try:
+        grokcli_document = grokcli_2api_payload(document)
+        grokcli_raw = json.dumps(grokcli_document, ensure_ascii=False, indent=2).encode("utf-8")
+        if grokcli_path is None:
+            raise ValueError("GrokCLI-2API 交付路径无效")
+        grokcli_temp_path = JSON_DIR / f".{bundle_id}.{GROKCLI2API_VARIANT}.{secrets.token_hex(6)}.tmp"
+        try:
+            grokcli_temp_path.write_bytes(grokcli_raw)
+            os.replace(grokcli_temp_path, grokcli_path)
+        finally:
+            if grokcli_temp_path.exists():
+                grokcli_temp_path.unlink()
+        variants[GROKCLI2API_VARIANT] = {
+            "format": "grokcli-2api-auth-map-v1",
+            "file_name": grokcli_2api_filename(document),
+            "size": grokcli_path.stat().st_size,
+        }
+    except (OSError, ValueError):
+        if grokcli_path and grokcli_path.exists():
+            grokcli_path.unlink()
     existing_bundle = manifest.setdefault("bundles", {}).get(bundle_id)
     existing_bundle = existing_bundle if isinstance(existing_bundle, dict) else {}
     platform = normalize_card_platform(card.get("platform") or document.get("platform"))
@@ -1106,6 +1246,7 @@ def write_dynamic_bundle_json_atomic(manifest: dict, card: dict, document: dict)
         "identities": [delivery_identity_from_json(export_document, filename=filename)],
         "errors": [],
         "warnings": [],
+        "variants": variants,
         "bound_client": str(existing_bundle.get("bound_client") or ""),
         "bound_at": str(existing_bundle.get("bound_at") or ""),
         "bound_ip": str(existing_bundle.get("bound_ip") or ""),
@@ -2193,7 +2334,7 @@ def user_page(message: str = "", *, initial_key: str = "") -> bytes:
     initial_value = html.escape(initial_key)
     announcement = load_announcement()
     pool_closed = bool(announcement.get("pool_closed"))
-    default_key_hint = "当前号池为空，未激活卡密暂不可取件；已取件用户可在有效期内继续下载。" if pool_closed else "单卡可分别下载 CPA、Sub2API 或 Cockpit；多卡会按三种格式分目录合并下载。"
+    default_key_hint = "当前号池为空，未激活卡密暂不可取件；已取件用户可在有效期内继续下载。" if pool_closed else "单卡可分别下载 CPA、Sub2API、Cockpit 或 GrokCLI-2API；多卡会按四种格式分目录合并下载。"
     pool_closed_js = "true" if pool_closed else "false"
     pool_closed_message_js = json.dumps(pool_closed_message(), ensure_ascii=False)
     pool_closed_notice_html = (
@@ -2315,7 +2456,7 @@ def user_page(message: str = "", *, initial_key: str = "") -> bytes:
     }
     body.pickup-page .pickup-facts {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(4, minmax(0, 1fr));
       border-top: 1px solid var(--rule);
       border-bottom: 1px solid var(--rule);
     }
@@ -2544,7 +2685,7 @@ def user_page(message: str = "", *, initial_key: str = "") -> bytes:
     }
     body.pickup-page .claim-actions {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 10px;
       margin-top: 18px;
     }
@@ -2553,7 +2694,8 @@ def user_page(message: str = "", *, initial_key: str = "") -> bytes:
     }
     body.pickup-page #claimBtn,
     body.pickup-page #claimSubBtn,
-    body.pickup-page #claimCockpitBtn {
+    body.pickup-page #claimCockpitBtn,
+    body.pickup-page #claimGrokCliBtn {
       width: 100%;
       min-height: 48px;
       margin-top: 0;
@@ -2571,19 +2713,22 @@ def user_page(message: str = "", *, initial_key: str = "") -> bytes:
       background: #1d4ed8;
     }
     body.pickup-page #claimSubBtn,
-    body.pickup-page #claimCockpitBtn {
+    body.pickup-page #claimCockpitBtn,
+    body.pickup-page #claimGrokCliBtn {
       border: 1px solid var(--accent);
       background: #fff;
       color: var(--accent);
       box-shadow: none;
     }
     body.pickup-page #claimSubBtn:hover,
-    body.pickup-page #claimCockpitBtn:hover {
+    body.pickup-page #claimCockpitBtn:hover,
+    body.pickup-page #claimGrokCliBtn:hover {
       background: #eff6ff;
     }
     body.pickup-page #claimBtn:disabled,
     body.pickup-page #claimSubBtn:disabled,
-    body.pickup-page #claimCockpitBtn:disabled {
+    body.pickup-page #claimCockpitBtn:disabled,
+    body.pickup-page #claimGrokCliBtn:disabled {
       background: #93a9d8;
       color: #fff;
       box-shadow: none;
@@ -2943,13 +3088,14 @@ def user_page(message: str = "", *, initial_key: str = "") -> bytes:
   </style>"""
     body = f"""
 <div class="pickup-intro">
-  <p class="pickup-lead">粘贴卡密或取件链接即可领取账号文件。CPA、Sub2API 与 Cockpit 是三种独立格式，但都来自同一个已验活账号。</p>
+  <p class="pickup-lead">粘贴卡密或取件链接即可领取账号文件。CPA、Sub2API、Cockpit 与 GrokCLI-2API 是四种独立格式，但都来自同一个已验活账号。</p>
   <span class="pickup-version">v{APP_VERSION}</span>
 </div>
 <section class="pickup-facts" aria-label="取件规则">
   <div class="pickup-fact"><span>CPA</span><strong>CPA-xai-邮箱.json</strong></div>
   <div class="pickup-fact"><span>Sub2API</span><strong>SUB2API-grok-邮箱.json</strong></div>
   <div class="pickup-fact"><span>Cockpit</span><strong>auth.json</strong></div>
+  <div class="pickup-fact"><span>GrokCLI-2API</span><strong>grokcli-2api-auth-邮箱.json</strong></div>
 </section>
 <section id="livePool" class="live-pool" aria-label="实时号池状态">
   <div class="live-pool-main">
@@ -2972,7 +3118,7 @@ def user_page(message: str = "", *, initial_key: str = "") -> bytes:
         <strong id="pickupFormTitle">输入卡密领取文件</strong>
         <span>支持卡密、完整取件链接，以及带 key 参数的链接。</span>
       </div>
-      <small class="lookup-format">CPA / Sub2API / Cockpit / ZIP</small>
+      <small class="lookup-format">CPA / Sub2API / Cockpit / GrokCLI-2API / ZIP</small>
     </div>
     <div class="key-field">
       <div class="field-label-row">
@@ -2989,9 +3135,10 @@ def user_page(message: str = "", *, initial_key: str = "") -> bytes:
       <button id="claimBtn" type="button" onclick="claim('cpa')">下载 CPA JSON</button>
       <button id="claimSubBtn" type="button" onclick="claim('sub2api')">下载 Sub2API JSON</button>
       <button id="claimCockpitBtn" type="button" onclick="claim('cockpit')">下载 Cockpit auth.json</button>
+      <button id="claimGrokCliBtn" type="button" onclick="claim('grokcli2api')">下载 GrokCLI-2API JSON</button>
     </div>
     <div id="hint" aria-live="polite">{note}</div>
-    <div class="lookup-footnote">选择所需格式后会自动下载；领取成功后结果区仍可分别下载另一个格式。</div>
+    <div class="lookup-footnote">选择所需格式后会自动下载；领取成功后结果区仍可分别下载其他格式。</div>
   </section>
   <aside class="pickup-side" aria-label="领取说明">
     <h2 class="pickup-side-title">领取说明</h2>
@@ -2999,7 +3146,7 @@ def user_page(message: str = "", *, initial_key: str = "") -> bytes:
     <div class="guide-list">
       <div class="guide-item">
         <span class="guide-index">01</span>
-        <div class="guide-copy"><strong>三种格式分开下载</strong><span>CPA、Sub2API 和 Cockpit 是三个独立文件，但对应同一个账号且不重复消耗库存。</span></div>
+        <div class="guide-copy"><strong>四种格式分开下载</strong><span>四个文件对应同一个账号且不重复消耗库存；GrokCLI-2API JSON 可直接在其管理台“账号导入”中上传。</span></div>
       </div>
       <div class="guide-item">
         <span class="guide-index">02</span>
@@ -3022,6 +3169,7 @@ const q = document.querySelector('#q');
 const claimBtn = document.querySelector('#claimBtn');
 const claimSubBtn = document.querySelector('#claimSubBtn');
 const claimCockpitBtn = document.querySelector('#claimCockpitBtn');
+const claimGrokCliBtn = document.querySelector('#claimGrokCliBtn');
 const claimActions = document.querySelector('#claimActions');
 const res = document.querySelector('#res');
 const hint = document.querySelector('#hint');
@@ -3036,6 +3184,7 @@ const livePoolRule = document.querySelector('#livePoolRule');
 const defaultClaimText = claimBtn ? claimBtn.textContent : '下载 CPA JSON';
 const defaultSubClaimText = claimSubBtn ? claimSubBtn.textContent : '下载 Sub2API JSON';
 const defaultCockpitClaimText = claimCockpitBtn ? claimCockpitBtn.textContent : '下载 Cockpit auth.json';
+const defaultGrokCliClaimText = claimGrokCliBtn ? claimGrokCliBtn.textContent : '下载 GrokCLI-2API JSON';
 const poolClosed = {pool_closed_js};
 const poolClosedMessage = {pool_closed_message_js};
 let livePoolKnown = false;
@@ -3127,6 +3276,7 @@ function setClaimButtonMode(isBatch){{
   if(claimActions) claimActions.classList.toggle('is-batch', isBatch);
   if(claimSubBtn) claimSubBtn.hidden = isBatch;
   if(claimCockpitBtn) claimCockpitBtn.hidden = isBatch;
+  if(claimGrokCliBtn) claimGrokCliBtn.hidden = isBatch;
 }}
 function closePoolClosedModal(){{
   if(poolClosedModal) poolClosedModal.hidden = true;
@@ -3158,28 +3308,28 @@ function updateKeyHint(){{
       ? `已识别 <strong>${{keys.length}}</strong> 个卡密。当前号池为空：未激活卡密暂不可取件；已取件卡密可合并下载。`
       : (noVerifiedStock
           ? `已识别 <strong>${{keys.length}}</strong> 个卡密。近期验活库存为 0：新卡暂不可领取，已领取卡密仍可合并下载。`
-          : `已识别 <strong>${{keys.length}}</strong> 个卡密，每个账号的 CPA、Sub2API 与 Cockpit 文件会分目录合并成 1 个 ZIP。`);
-    setClaimButtonText('批量下载三格式 ZIP');
+          : `已识别 <strong>${{keys.length}}</strong> 个卡密，每个账号的 CPA、Sub2API、Cockpit 与 GrokCLI-2API 文件会分目录合并成 1 个 ZIP。`);
+    setClaimButtonText('批量下载四格式 ZIP');
   }}else if(keys.length === 1){{
     keyCountHint.innerHTML = poolClosed
       ? '已识别 <strong>1</strong> 个卡密。当前号池为空：未激活卡密暂不可取件；已取件卡密可下载。'
       : (noVerifiedStock
           ? '已识别 <strong>1</strong> 个卡密。近期验活库存为 0：新卡暂不可领取，已领取卡密仍可下载。'
-          : '已识别 <strong>1</strong> 个卡密，请分别选择 CPA、Sub2API 或 Cockpit。');
+          : '已识别 <strong>1</strong> 个卡密，请分别选择 CPA、Sub2API、Cockpit 或 GrokCLI-2API。');
     setClaimButtonText(defaultClaimText);
   }}else{{
     keyCountHint.textContent = poolClosed
       ? poolClosedMessage
       : (noVerifiedStock
           ? '近期验活库存为 0；新卡暂不可领取，已领取卡密仍可重新下载。'
-          : '单卡可分别下载 CPA、Sub2API 或 Cockpit；多卡会按三种格式分目录合并下载。');
+          : '单卡可分别下载 CPA、Sub2API、Cockpit 或 GrokCLI-2API；多卡会按四种格式分目录合并下载。');
     setClaimButtonText(defaultClaimText);
   }}
   return keys;
 }}
 function trigger(url, name){{setTimeout(()=>{{window.location.assign(url);}},250);}}
 async function claim(downloadKind='cpa'){{
-  if((claimBtn && claimBtn.disabled) || (claimSubBtn && claimSubBtn.disabled) || (claimCockpitBtn && claimCockpitBtn.disabled)) return;
+  if((claimBtn && claimBtn.disabled) || (claimSubBtn && claimSubBtn.disabled) || (claimCockpitBtn && claimCockpitBtn.disabled) || (claimGrokCliBtn && claimGrokCliBtn.disabled)) return;
   const keys = updateKeyHint();
   const value = keys[0] || '';
   q.value = keys.join('\\n');
@@ -3187,18 +3337,22 @@ async function claim(downloadKind='cpa'){{
   performClaim(keys, downloadKind);
 }}
 async function performClaim(keys, downloadKind='cpa'){{
-  if((claimBtn && claimBtn.disabled) || (claimSubBtn && claimSubBtn.disabled) || (claimCockpitBtn && claimCockpitBtn.disabled)) return;
+  if((claimBtn && claimBtn.disabled) || (claimSubBtn && claimSubBtn.disabled) || (claimCockpitBtn && claimCockpitBtn.disabled) || (claimGrokCliBtn && claimGrokCliBtn.disabled)) return;
   const value = keys[0] || '';
   const oldText = claimBtn ? claimBtn.textContent : '';
   const oldSubText = claimSubBtn ? claimSubBtn.textContent : '';
   const oldCockpitText = claimCockpitBtn ? claimCockpitBtn.textContent : '';
+  const oldGrokCliText = claimGrokCliBtn ? claimGrokCliBtn.textContent : '';
   const batch = keys.length > 1;
   const activeButton = batch || downloadKind === 'cpa'
     ? claimBtn
-    : (downloadKind === 'sub2api' ? claimSubBtn : claimCockpitBtn);
+    : (downloadKind === 'sub2api'
+        ? claimSubBtn
+        : (downloadKind === 'cockpit' ? claimCockpitBtn : claimGrokCliBtn));
   if(claimBtn){{claimBtn.disabled = true; claimBtn.setAttribute('aria-busy', 'true');}}
   if(claimSubBtn){{claimSubBtn.disabled = true; claimSubBtn.setAttribute('aria-busy', 'true');}}
   if(claimCockpitBtn){{claimCockpitBtn.disabled = true; claimCockpitBtn.setAttribute('aria-busy', 'true');}}
+  if(claimGrokCliBtn){{claimGrokCliBtn.disabled = true; claimGrokCliBtn.setAttribute('aria-busy', 'true');}}
   if(activeButton) activeButton.textContent = '正在分配';
   hint.innerHTML='<div class="note warn">正在分配近期已验活账号并生成文件...</div>';res.innerHTML='';
   try{{
@@ -3216,17 +3370,17 @@ async function performClaim(keys, downloadKind='cpa'){{
         ? '<div class="note warn">部分卡密领取成功并已开始下载；失败项：'+partialErrors.map(esc).join('；')+'</div>'
         : '<div class="note ok">批量卡密有效，已合并打包并开始下载。</div>';
       res.innerHTML = `<article class="card result">
-        <div class="hd"><div class="result-heading"><small>领取成功</small><strong>已合并 ${{esc(r.key_count)}} 个卡密</strong></div><span class="tag">CPA + Sub2API + Cockpit ZIP</span></div>
+        <div class="hd"><div class="result-heading"><small>领取成功</small><strong>已合并 ${{esc(r.key_count)}} 个卡密</strong></div><span class="tag">CPA + Sub2API + Cockpit + GrokCLI-2API ZIP</span></div>
         <div class="rows">
           <div class="row"><span class="k">文件名</span><span class="v">${{esc(r.zip_name)}}</span></div>
-          <div class="row"><span class="k">交付类型</span><span class="v">CPA、Sub2API 与 Cockpit 分目录批量 ZIP</span></div>
+          <div class="row"><span class="k">交付类型</span><span class="v">CPA、Sub2API、Cockpit 与 GrokCLI-2API 分目录批量 ZIP</span></div>
           <div class="row"><span class="k">文件数</span><span class="v">${{r.file_count}}</span></div>
           <div class="row"><span class="k">大小</span><span class="v">${{esc(r.size_text)}}</span></div>
           <div class="row row-wide"><span class="k">卡密</span><span class="v">${{keyHtml}}</span></div>
           <div class="row row-wide"><span class="k">链接有效</span><span class="v">临时链接约 10 分钟；原卡密仍按首次领取后 24 小时有效</span></div>
         </div>
         <div class="downloads">
-          <div class="note warn">每个卡密目录内分别存放 cpa/、sub2api/ 和 cockpit/ 三种文件。</div>
+          <div class="note warn">每个卡密目录内分别存放 cpa/、sub2api/、cockpit/ 和 grokcli-2api/ 四种文件。</div>
           <div class="download-actions">
             <a class="btn" href="${{esc(r.download_url)}}" download>下载合并 ZIP</a>
             <button class="secondary" type="button" data-copy="${{esc(r.download_url)}}" onclick="copyText(this.dataset.copy,this)">复制下载链接</button>
@@ -3244,21 +3398,26 @@ async function performClaim(keys, downloadKind='cpa'){{
     const cockpitDownload = r.cockpit_download_url
       ? `<a class="btn secondary" href="${{esc(r.cockpit_download_url)}}" download="auth.json">下载 Cockpit auth.json</a>`
       : '';
+    const grokcliDownload = r.grokcli_download_url
+      ? `<a class="btn secondary" href="${{esc(r.grokcli_download_url)}}" download="${{esc(r.grokcli_file_name || 'grokcli-2api-auth-account.json')}}">下载 GrokCLI-2API JSON</a>`
+      : '';
     const selectedDownloads = {{
       cpa: {{url:r.download_url, name:downloadName, label:'CPA JSON'}},
       sub2api: {{url:r.sub_download_url, name:r.sub_file_name || 'SUB2API-grok-account.json', label:'Sub2API JSON'}},
-      cockpit: {{url:r.cockpit_download_url, name:r.cockpit_file_name || 'auth.json', label:'Cockpit auth.json'}}
+      cockpit: {{url:r.cockpit_download_url, name:r.cockpit_file_name || 'auth.json', label:'Cockpit auth.json'}},
+      grokcli2api: {{url:r.grokcli_download_url, name:r.grokcli_file_name || 'grokcli-2api-auth-account.json', label:'GrokCLI-2API JSON'}}
     }};
     const selected = selectedDownloads[downloadKind] && selectedDownloads[downloadKind].url
       ? selectedDownloads[downloadKind]
       : selectedDownloads.cpa;
     hint.innerHTML='<div class="note ok">卡密有效，已开始下载 '+esc(selected.label)+'。24 小时内可凭同一卡密重新下载。</div>';
     res.innerHTML = `<article class="card result">
-      <div class="hd"><div class="result-heading"><small>领取成功</small><strong>卡密 ${{esc(r.key)}}</strong></div><span class="tag">${{r.sub_download_url ? 'CPA / Sub2API / Cockpit' : (r.download_format === 'json' ? 'JSON 文件' : 'ZIP 文件')}}</span></div>
+      <div class="hd"><div class="result-heading"><small>领取成功</small><strong>卡密 ${{esc(r.key)}}</strong></div><span class="tag">${{r.sub_download_url ? 'CPA / Sub2API / Cockpit / GrokCLI-2API' : (r.download_format === 'json' ? 'JSON 文件' : 'ZIP 文件')}}</span></div>
       <div class="rows">
         <div class="row"><span class="k">CPA 文件名</span><span class="v">${{esc(downloadName)}}</span></div>
         <div class="row"><span class="k">Sub2API 文件名</span><span class="v">${{esc(r.sub_file_name || '-')}}</span></div>
         <div class="row"><span class="k">Cockpit 文件名</span><span class="v">${{esc(r.cockpit_file_name || 'auth.json')}}</span></div>
+        <div class="row"><span class="k">GrokCLI-2API 文件名</span><span class="v">${{esc(r.grokcli_file_name || '-')}}</span></div>
         <div class="row"><span class="k">文件数</span><span class="v">${{r.file_count}}</span></div>
         <div class="row"><span class="k">大小</span><span class="v">${{esc(r.size_text)}}</span></div>
         <div class="row"><span class="k">取件时间</span><span class="v">${{esc(r.bound_at || '刚刚')}}</span></div>
@@ -3270,6 +3429,7 @@ async function performClaim(keys, downloadKind='cpa'){{
           <a class="btn" href="${{esc(r.download_url)}}" download>${{downloadLabel}}</a>
           ${{subDownload}}
           ${{cockpitDownload}}
+          ${{grokcliDownload}}
           <button class="secondary" type="button" data-copy="${{esc(r.download_url)}}" onclick="copyText(this.dataset.copy,this)">复制下载链接</button>
         </div>
       </div>
@@ -3281,6 +3441,7 @@ async function performClaim(keys, downloadKind='cpa'){{
     if(claimBtn){{claimBtn.disabled = false; claimBtn.textContent = oldText; claimBtn.removeAttribute('aria-busy');}}
     if(claimSubBtn){{claimSubBtn.disabled = false; claimSubBtn.textContent = oldSubText || defaultSubClaimText; claimSubBtn.removeAttribute('aria-busy');}}
     if(claimCockpitBtn){{claimCockpitBtn.disabled = false; claimCockpitBtn.textContent = oldCockpitText || defaultCockpitClaimText; claimCockpitBtn.removeAttribute('aria-busy');}}
+    if(claimGrokCliBtn){{claimGrokCliBtn.disabled = false; claimGrokCliBtn.textContent = oldGrokCliText || defaultGrokCliClaimText; claimGrokCliBtn.removeAttribute('aria-busy');}}
     updateKeyHint();
   }}
 }}
@@ -4762,6 +4923,27 @@ def build_batch_zip_bytes(manifest: dict, batch: dict) -> bytes:
                         f"{folder}/cockpit/auth.json", used_names
                     )
                     target.writestr(cockpit_name, cockpit_raw)
+                    grokcli_path = bundle_variant_json_path(bundle_id, GROKCLI2API_VARIANT)
+                    if grokcli_path and grokcli_path.exists():
+                        grokcli_raw = grokcli_path.read_bytes()
+                        variant_meta = (
+                            bundle.get("variants", {}).get(GROKCLI2API_VARIANT, {})
+                            if isinstance(bundle.get("variants"), dict)
+                            else {}
+                        )
+                        grokcli_file_name = safe_filename(
+                            str(variant_meta.get("file_name") or grokcli_2api_filename(document)),
+                            "grokcli-2api-auth-account.json",
+                        )
+                    else:
+                        grokcli_raw = json.dumps(
+                            grokcli_2api_payload(document), ensure_ascii=False, indent=2
+                        ).encode("utf-8")
+                        grokcli_file_name = grokcli_2api_filename(document)
+                    grokcli_name = unique_zip_member_name(
+                        f"{folder}/grokcli-2api/{grokcli_file_name}", used_names
+                    )
+                    target.writestr(grokcli_name, grokcli_raw)
                 else:
                     arcname = unique_zip_member_name(f"{folder}/{member_name}", used_names)
                     target.writestr(arcname, raw)
@@ -5648,6 +5830,8 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
         sub_download_url = ""
         sub_file_name = ""
         cockpit_download_url = ""
+        grokcli_download_url = ""
+        grokcli_file_name = ""
         if download_format == "json" and normalize_card_platform(bundle.get("platform")) == "grok":
             sub_path = bundle_download_path(bundle_id, bundle)
             sub_path += f"?format=sub2api&key={quote(key, safe='')}"
@@ -5663,6 +5847,18 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
             cockpit_path = bundle_download_path(bundle_id, bundle)
             cockpit_path += f"?format=cockpit&key={quote(key, safe='')}"
             cockpit_download_url = absolute_url(self, cockpit_path)
+            grokcli_path = bundle_download_path(bundle_id, bundle)
+            grokcli_path += f"?format={GROKCLI2API_VARIANT}&key={quote(key, safe='')}"
+            grokcli_download_url = absolute_url(self, grokcli_path)
+            variant_meta = (
+                bundle.get("variants", {}).get(GROKCLI2API_VARIANT, {})
+                if isinstance(bundle.get("variants"), dict)
+                else {}
+            )
+            grokcli_file_name = safe_filename(
+                str(variant_meta.get("file_name") or "grokcli-2api-auth-account.json"),
+                "grokcli-2api-auth-account.json",
+            )
         expires_text = bundle_expires_text(bundle)
         self.send_json(
             {
@@ -5680,6 +5876,8 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
                 "sub_file_name": sub_file_name,
                 "cockpit_download_url": cockpit_download_url,
                 "cockpit_file_name": "auth.json" if cockpit_download_url else "",
+                "grokcli_download_url": grokcli_download_url,
+                "grokcli_file_name": grokcli_file_name,
                 "bound_at": bundle.get("bound_at") or "",
                 "expires_at": expires_text,
             },
@@ -5729,7 +5927,7 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
 
         batch = create_batch_download(items)
         total_files = sum(
-            3
+            4
             if bundle_payload_path(item["bundle_id"], item["bundle"])
             and bundle_payload_path(item["bundle_id"], item["bundle"]).suffix.lower() == ".json"
             and normalize_card_platform(item["bundle"].get("platform")) == "grok"
@@ -5859,7 +6057,32 @@ class DownloadGateHandler(BaseHTTPRequestHandler):
         data = payload_path.read_bytes()
         filename = bundle_download_name(bundle_id, bundle)
         variant = str((query.get("format") or [""])[0]).strip().lower()
-        if variant == "cockpit":
+        if variant in GROKCLI2API_VARIANT_ALIASES:
+            if payload_path.suffix.lower() != ".json" or normalize_card_platform(bundle.get("platform")) != "grok":
+                self.send_html(user_page("该交付文件不支持 GrokCLI-2API 格式。"), HTTPStatus.BAD_REQUEST, client_headers)
+                return
+            variant_path = bundle_variant_json_path(bundle_id, GROKCLI2API_VARIANT)
+            variant_meta = (
+                bundle.get("variants", {}).get(GROKCLI2API_VARIANT, {})
+                if isinstance(bundle.get("variants"), dict)
+                else {}
+            )
+            try:
+                document = json.loads(data.decode("utf-8-sig"))
+                if variant_path and variant_path.exists():
+                    data = variant_path.read_bytes()
+                else:
+                    data = json.dumps(
+                        grokcli_2api_payload(document), ensure_ascii=False, indent=2
+                    ).encode("utf-8")
+                filename = safe_filename(
+                    str(variant_meta.get("file_name") or grokcli_2api_filename(document)),
+                    "grokcli-2api-auth-account.json",
+                )
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
+                self.send_html(user_page(f"生成 GrokCLI-2API 导入文件失败：{exc}"), HTTPStatus.INTERNAL_SERVER_ERROR, client_headers)
+                return
+        elif variant == "cockpit":
             if payload_path.suffix.lower() != ".json" or normalize_card_platform(bundle.get("platform")) != "grok":
                 self.send_html(user_page("该交付文件不支持 Cockpit 格式。"), HTTPStatus.BAD_REQUEST, client_headers)
                 return

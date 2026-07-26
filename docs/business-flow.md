@@ -26,7 +26,20 @@
     - Grok2API：Web SSO Auth
     - CLIProxyAPI（CPA）：`xai-<email>.json`
     - Sub2API：`SUB2API-grok-<email>.json`
-14. 控制台持续解析日志，显示当前轮次、成功数、失败数、最近邮箱和错误。
+14. DownloadGate 在账号交付时从同一份权威凭据派生四种互不重复消耗库存的下载格式：
+    - CPA flat JSON
+    - Sub2API DataPayload
+    - Cockpit `auth.json`
+    - GrokCLI-2API 2.x `auth` map（保留 refresh token、SSO 与注册密码，供下游续期自愈）
+15. 控制台持续解析日志，显示当前轮次、成功数、失败数、最近邮箱和错误。
+
+## GrokCLI-2API 取件文件怎么用
+
+- 取件页选择“下载 GrokCLI-2API JSON”。
+- 在 grokcli-2api 管理台的账号导入区上传该文件；其 2.x Go 接口
+  `/admin/api/accounts/import-file` 与 `/admin/api/accounts/import-files` 都接受这种 `auth` map。
+- 批量取件 ZIP 会把该格式放进每张卡密目录的 `grokcli-2api/` 子目录。
+- 老取件记录没有保存 SSO/注册密码时仍可导入并依靠 access/refresh token 使用；新取件记录会额外保留自愈字段。
 
 ## SSO、Device Flow 与 CPA 的边界
 

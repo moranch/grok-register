@@ -34,6 +34,7 @@
 - 在注册浏览器销毁前完成 xAI device-code OAuth
 - 写本地结果
 - 原子写入 Grok2API / CPA / Sub2API Auth，并推送到 sink
+- 为 DownloadGate 保留可派生 GrokCLI-2API `auth` map 的 SSO/OAuth 恢复字段
 
 ### 3. network-gateway
 
@@ -85,5 +86,6 @@
 4. 成功后将 `sso` 追加写入本地文件并生成 Grok2API Web Auth
 5. 复用刚完成 `CreateUserAndSession` 的浏览器执行 device-flow
 6. OAuth 成功后生成 CPA 与 Sub2API Auth；无 OAuth 权限时只隔离 OAuth 交付资格
-7. 同时把 `sso` 推送到内置 `grok2api`
-8. `console` 持续从日志解析实时状态并展示
+7. DownloadGate 首次取件时原子绑定账号，并派生 CPA / Sub2API / Cockpit / GrokCLI-2API 四种格式
+8. 同时把 `sso` 推送到内置 `grok2api`
+9. `console` 持续从日志解析实时状态并展示

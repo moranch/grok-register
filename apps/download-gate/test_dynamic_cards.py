@@ -125,6 +125,29 @@ class DynamicCardTests(unittest.TestCase):
             self.assertEqual(manifest["cards"][key]["bundle_id"], "")
             self.assertNotIn(key, manifest["keys"])
 
+    def test_grokcli_variant_is_kept_with_bundle_and_removed_with_bundle(self):
+        bundle_id = "bundle-with-grokcli"
+        manifest = gate.load_manifest()
+        manifest["bundles"][bundle_id] = {
+            "id": bundle_id,
+            "variants": {gate.GROKCLI2API_VARIANT: {}},
+        }
+        primary = gate.bundle_json_path(bundle_id)
+        variant = gate.bundle_variant_json_path(bundle_id, gate.GROKCLI2API_VARIANT)
+        orphan = gate.JSON_DIR / "orphan.grokcli2api.json"
+        primary.write_text("{}", encoding="utf-8")
+        variant.write_text("{}", encoding="utf-8")
+        orphan.write_text("{}", encoding="utf-8")
+
+        self.assertEqual(gate.clear_orphan_zips(manifest), 1)
+        self.assertTrue(primary.exists())
+        self.assertTrue(variant.exists())
+        self.assertFalse(orphan.exists())
+
+        self.assertEqual(gate.delete_bundle_from_manifest(manifest, bundle_id), 1)
+        self.assertFalse(primary.exists())
+        self.assertFalse(variant.exists())
+
     def test_bulk_card_parser_accepts_keys_links_and_deduplicates(self):
         parsed = gate.parse_card_keys_input(
             "DG-AAAA-BBBB-CCCC\n"
@@ -270,13 +293,16 @@ class DynamicCardTests(unittest.TestCase):
         self.assertIn("/api/pool-summary", page)
         self.assertIn("cockpit_download_url", page)
         self.assertIn("sub_download_url", page)
+        self.assertIn("grokcli_download_url", page)
         self.assertIn('download="auth.json"', page)
         self.assertIn("下载 CPA JSON", page)
         self.assertIn("下载 Sub2API JSON", page)
         self.assertIn("下载 Cockpit auth.json", page)
-        self.assertIn("CPA、Sub2API 与 Cockpit 是三种独立格式", page)
+        self.assertIn("下载 GrokCLI-2API JSON", page)
+        self.assertIn("CPA、Sub2API、Cockpit 与 GrokCLI-2API 是四种独立格式", page)
         self.assertIn('id="claimSubBtn"', page)
         self.assertIn('id="claimCockpitBtn"', page)
+        self.assertIn('id="claimGrokCliBtn"', page)
         self.assertNotIn('name="required_model"', page)
         self.assertIn("账号存活验证通过", page)
         self.assertIn("领取仅使用近期已验证库存", page)
@@ -362,7 +388,8 @@ class DynamicCardTests(unittest.TestCase):
             "account_id": "acct-1",
             "email": "user@example.com",
             "sso": "sso-secret",
-            "credentials": {"sso": "sso-secret"},
+            "password": "register-password",
+            "credentials": {"sso": "sso-secret", "password": "register-password"},
             "cpa_auth": {
                 "type": "xai",
                 "auth_kind": "oauth",
@@ -415,6 +442,23 @@ class DynamicCardTests(unittest.TestCase):
         self.assertNotIn("headers", payload)
         self.assertNotIn("account_id", payload)
         self.assertNotIn("credentials", payload)
+        grokcli_path = gate.bundle_variant_json_path(first_id, gate.GROKCLI2API_VARIANT)
+        self.assertIsNotNone(grokcli_path)
+        self.assertTrue(grokcli_path.exists())
+        grokcli = json.loads(grokcli_path.read_text(encoding="utf-8"))
+        self.assertEqual(grokcli["count"], 1)
+        self.assertEqual(len(grokcli["auth"]), 1)
+        grokcli_entry = next(iter(grokcli["auth"].values()))
+        self.assertEqual(grokcli_entry["access_token"], "access-secret")
+        self.assertEqual(grokcli_entry["refresh_token"], "refresh-secret")
+        self.assertEqual(grokcli_entry["sso"], "sso-secret")
+        self.assertEqual(grokcli_entry["sso_cookie"], "sso-secret")
+        self.assertEqual(grokcli_entry["password"], "register-password")
+        self.assertEqual(grokcli_entry["register_password"], "register-password")
+        self.assertEqual(
+            first_bundle["variants"][gate.GROKCLI2API_VARIANT]["file_name"],
+            "grokcli-2api-auth-user_example.com.json",
+        )
 
     def test_existing_delivery_zip_is_migrated_to_flat_cpa_json(self):
         manifest = gate.load_manifest()
@@ -626,15 +670,17 @@ class DynamicCardTests(unittest.TestCase):
         self.assertEqual(source_path.read_bytes(), source_before)
         with gate.zipfile.ZipFile(gate.io.BytesIO(data)) as archive:
             names = archive.namelist()
-            self.assertEqual(len(names), 3)
+            self.assertEqual(len(names), 4)
             cpa_name = next(name for name in names if "/cpa/" in name)
             sub_name = next(name for name in names if "/sub2api/" in name)
             cockpit_name = next(name for name in names if name.endswith("/cockpit/auth.json"))
+            grokcli_name = next(name for name in names if "/grokcli-2api/" in name)
             self.assertTrue(cpa_name.endswith(gate.bundle_download_name(bundle_id, bundle)))
             self.assertTrue(sub_name.endswith("/sub2api/SUB2API-grok-batch_example.com.json"))
             cpa = json.loads(archive.read(cpa_name))
             sub = json.loads(archive.read(sub_name))
             cockpit = json.loads(archive.read(cockpit_name))
+            grokcli = json.loads(archive.read(grokcli_name))
         self.assertEqual(cpa["email"], "batch@example.com")
         self.assertEqual(sub["type"], gate.SUB2API_DATA_TYPE)
         self.assertEqual(sub["accounts"][0]["credentials"]["access_token"], cpa["access_token"])
@@ -644,6 +690,11 @@ class DynamicCardTests(unittest.TestCase):
         self.assertEqual(entry["refresh_token"], cpa["refresh_token"])
         self.assertEqual(entry["user_id"], cpa["sub"])
         self.assertEqual(entry["principal_id"], cpa["sub"])
+        grokcli_entry = next(iter(grokcli["auth"].values()))
+        self.assertEqual(grokcli["count"], 1)
+        self.assertEqual(grokcli_entry["access_token"], cpa["access_token"])
+        self.assertEqual(grokcli_entry["refresh_token"], cpa["refresh_token"])
+        self.assertEqual(grokcli_entry["user_id"], cpa["sub"])
 
     def test_cockpit_auth_payload_is_single_official_registry_account(self):
         source = {
@@ -675,6 +726,51 @@ class DynamicCardTests(unittest.TestCase):
         self.assertEqual(entry["expires_at"], "2026-07-23T00:00:00Z")
         self.assertEqual(entry["oidc_issuer"], gate.GROK_OIDC_ISSUER)
         self.assertEqual(entry["oidc_client_id"], gate.GROK_OIDC_CLIENT_ID)
+
+    def test_grokcli_2api_payload_preserves_recovery_credentials(self):
+        source = {
+            "account_id": "subject-2",
+            "email": "grokcli@example.com",
+            "sso": "sso=sso-cookie-value",
+            "credentials": {
+                "password": "registered-password",
+                "sso": "sso-cookie-value",
+            },
+            "cpa_auth": {
+                "type": "xai",
+                "access_token": "access-token",
+                "refresh_token": "refresh-token",
+                "id_token": "id-token",
+                "email": "grokcli@example.com",
+                "sub": "subject-2",
+                "expired": "2026-07-23T00:00:00Z",
+                "last_refresh": "2026-07-22T18:00:00Z",
+            },
+        }
+        original = json.loads(json.dumps(source))
+
+        payload = gate.grokcli_2api_payload(source)
+
+        self.assertEqual(source, original)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(set(payload["auth"]), {"https://auth.x.ai::subject-2"})
+        entry = payload["auth"]["https://auth.x.ai::subject-2"]
+        self.assertEqual(entry["key"], "access-token")
+        self.assertEqual(entry["access_token"], "access-token")
+        self.assertEqual(entry["refresh_token"], "refresh-token")
+        self.assertEqual(entry["id_token"], "id-token")
+        self.assertEqual(entry["sso"], "sso-cookie-value")
+        self.assertEqual(entry["sso_cookie"], "sso-cookie-value")
+        self.assertEqual(entry["password"], "registered-password")
+        self.assertEqual(entry["register_password"], "registered-password")
+        self.assertEqual(entry["auth_mode"], "oidc")
+        self.assertEqual(entry["oidc_issuer"], gate.GROK_OIDC_ISSUER)
+        self.assertEqual(entry["oidc_client_id"], gate.GROK_OIDC_CLIENT_ID)
+        self.assertEqual(
+            gate.grokcli_2api_filename(source),
+            "grokcli-2api-auth-grokcli_example.com.json",
+        )
 
     def test_sub2api_payload_is_single_grok_data_account(self):
         source = {
