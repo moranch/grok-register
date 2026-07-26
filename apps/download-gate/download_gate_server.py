@@ -46,7 +46,7 @@ ADMIN_PATH = normalize_admin_path(os.environ.get("DOWNLOAD_GATE_ADMIN_PATH", "/d
 INTERNAL_API_TOKEN = os.environ.get("DOWNLOAD_GATE_INTERNAL_TOKEN", "").strip()
 CONSOLE_URL = os.environ.get("DOWNLOAD_GATE_CONSOLE_URL", "").strip().rstrip("/")
 CONSOLE_TIMEOUT_SECONDS = max(int(os.environ.get("DOWNLOAD_GATE_CONSOLE_TIMEOUT", "120") or 120), 5)
-APP_VERSION = "2026.07.26.05"
+APP_VERSION = "2026.07.26.06"
 CLAIM_TTL_SECONDS = 24 * 60 * 60
 BATCH_DOWNLOAD_TTL_SECONDS = 10 * 60
 MAX_BATCH_KEYS = 20
@@ -4528,6 +4528,7 @@ def admin_page(
   <label>手动测试模型
     <input id="accountsModelInput" class="model-input" value="grok-4.5" maxlength="100" autocomplete="off">
   </label>
+  <button id="accountsExportTop" class="secondary compact" type="button">导出当前筛选</button>
   <button id="accountsRefresh" class="secondary compact" type="button">刷新列表</button>
   <span id="accountsCount" class="table-count">尚未加载</span>
   <div class="pagination" aria-label="账户列表分页">
@@ -4662,6 +4663,7 @@ const accountsNextPage = document.querySelector('#accountsNextPage');
 const accountsPageInfo = document.querySelector('#accountsPageInfo');
 const accountsPageSize = document.querySelector('#accountsPageSize');
 const accountsModelInput = document.querySelector('#accountsModelInput');
+const accountsExportTop = document.querySelector('#accountsExportTop');
 const accountsExport = document.querySelector('#accountsExport');
 const accountsImportFile = document.querySelector('#accountsImportFile');
 const accountsImportPreview = document.querySelector('#accountsImportPreview');
@@ -4811,7 +4813,7 @@ if(accountsNextPage) accountsNextPage.addEventListener('click', () => {{
   if(accountsPage < accountsPages){{accountsPage += 1; loadAccounts(true);}}
 }});
 if(accountsPageSize) accountsPageSize.addEventListener('change', () => {{accountsPage = 1; loadAccounts(true);}});
-if(accountsExport) accountsExport.addEventListener('click', () => {{
+function exportFilteredAccounts() {{
   const params = new URLSearchParams({{
     platform: 'grok',
     q: String(accountsSearch ? accountsSearch.value : '').trim(),
@@ -4824,6 +4826,9 @@ if(accountsExport) accountsExport.addEventListener('click', () => {{
   anchor.click();
   anchor.remove();
   if(accountsFeedback) accountsFeedback.innerHTML = '<div class="note warn">正在生成账号迁移包。文件包含敏感凭据，请妥善保存。</div>';
+}}
+[accountsExportTop, accountsExport].filter(Boolean).forEach((button) => {{
+  button.addEventListener('click', exportFilteredAccounts);
 }});
 async function selectedAccountMigration(){{
   const file = accountsImportFile && accountsImportFile.files ? accountsImportFile.files[0] : null;

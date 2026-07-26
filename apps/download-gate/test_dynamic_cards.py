@@ -547,6 +547,7 @@ class DynamicCardTests(unittest.TestCase):
         self.assertIn('id="accountsNextPage"', page)
         self.assertIn('id="accountsPageSize"', page)
         self.assertIn('id="accountsModelInput"', page)
+        self.assertIn('id="accountsExportTop"', page)
         self.assertIn('id="accountsExport"', page)
         self.assertIn('id="accountsImportFile"', page)
         self.assertIn('id="accountsImportPreview"', page)
