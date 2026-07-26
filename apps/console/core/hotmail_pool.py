@@ -419,6 +419,32 @@ class HotmailPool:
             "updated_at": state.get("updated_at", ""),
         }
 
+    def export_credential(self, email: str) -> str:
+        """Return one current credential in the canonical four-part format.
+
+        The status snapshot intentionally excludes secrets.  Callers use this
+        on demand after authentication so passwords and refresh tokens are not
+        included in the three-second status polling response.
+        """
+        target = str(email or "").strip().lower()
+        if not target:
+            raise KeyError("email is required")
+        with self._lock, self._file_lock():
+            account = next(
+                (
+                    item
+                    for item in load_credentials(self.credentials_path)
+                    if item["email"].lower() == target
+                ),
+                None,
+            )
+        if not account:
+            raise KeyError("account not found")
+        return (
+            f"{account['email']}----{account['password']}----"
+            f"{account['client_id']}----{account['refresh_token']}"
+        )
+
     def _update_refresh_token(self, account: dict[str, str], new_token: str) -> None:
         if not new_token or new_token == account.get("refresh_token"):
             return

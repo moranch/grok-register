@@ -30,6 +30,23 @@ class HotmailPoolTests(unittest.TestCase):
             )
             self.assertEqual(len(load_credentials(path)), 1)
 
+    def test_export_credential_returns_one_current_four_part_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mail.txt"
+            path.write_text(
+                "first@outlook.com----pass-1----client-1----refresh-1\n"
+                "second@outlook.com----pass-2----client-2----refresh-2\n",
+                encoding="utf-8",
+            )
+            pool = HotmailPool(path)
+
+            self.assertEqual(
+                pool.export_credential("SECOND@outlook.com"),
+                "second@outlook.com----pass-2----client-2----refresh-2",
+            )
+            with self.assertRaises(KeyError):
+                pool.export_credential("missing@outlook.com")
+
     def test_consumed_main_address_moves_to_plus_alias(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mail.txt"

@@ -16,7 +16,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from ._shared import (
@@ -65,6 +65,10 @@ class HotmailReserveRequest(BaseModel):
 class HotmailReleaseRequest(BaseModel):
     alias: str = Field(..., min_length=3, max_length=320)
     consumed: bool = False
+
+
+class HotmailCredentialRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
 
 
 def _hotmail_row(mbox_id: int):
@@ -228,6 +232,29 @@ def api_hotmail_verifications(
     check_auth(request)
     pool = _hotmail_pool_from_row(_hotmail_row(mbox_id))
     return {"ok": True, **pool.verification_status(alias)}
+
+
+@router.post("/{mbox_id}/hotmail/credential")
+def api_hotmail_credential(
+    request: Request,
+    response: Response,
+    mbox_id: int,
+    payload: HotmailCredentialRequest,
+) -> dict[str, Any]:
+    """Return one credential on demand without exposing secrets in pool polling."""
+    check_auth(request)
+    pool = _hotmail_pool_from_row(_hotmail_row(mbox_id))
+    try:
+        credential = pool.export_credential(payload.email)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="邮箱账户不存在") from exc
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return {
+        "ok": True,
+        "email": payload.email,
+        "credential": credential,
+        "format": "email----password----ClientID----refresh_token",
+    }
 
 
 @router.post("/{mbox_id}/hotmail/probe")
